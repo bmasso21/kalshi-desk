@@ -62,6 +62,8 @@ DEFAULTS = {
         "max_spread": 0.06,
         "quote_ttl_sec": 600,           # each quote expires on its own after this (re-placed 60s before; keeps queue priority)
         "max_volume_24h": 0,            # skip markets that traded more than this in 24h (0 = no limit)
+        "select_by": "trading",         # "trading" = pick by estimated trading edge, rewards as a bonus; "rewards" = by reward per $
+        "min_spread": 0.02,             # trading-first: skip markets with a tighter spread than this
         "exit_step_in": True,           # at the inventory cap, the reducing quote steps 1c inside the spread (if >= 2c wide)
     },
     # --- limits that scale with the account (see app/scaling.py); tiers default to scaling.DEFAULT_TIERS ---

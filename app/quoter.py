@@ -145,6 +145,16 @@ class Quoter:
         return None
 
     # ---------------------------------------------------------- selection --
+    def _series_fee(self, client, series: str) -> dict:
+        cache = self.__dict__.setdefault("_fee_cache", {})
+        if series not in cache:
+            try:
+                s_ = client.series(series) or {}
+                cache[series] = {"fee_type": s_.get("fee_type") or "quadratic", "fee_multiplier": float(s_.get("fee_multiplier") or 1)}
+            except Exception:
+                return {"fee_type": "quadratic_with_maker_fees", "fee_multiplier": 1.0}     # unknown -> assume the costlier case
+        return cache[series]
+
     def refresh_programs(self):
         self.selected, msg = self.select(self.e.client)
         self.programs_ts = time.time()
@@ -175,15 +185,29 @@ class Quoter:
         c = self.cfg
         size = int(d(c["size"]))
         rules = {k: c.get(k) for k in ("pull_hours", "max_spread", "min_mid", "max_mid")}
+        trading_first = (c.get("select_by") or "trading") == "trading"
         rows, info = mm.rank_markets(client, rules, (size,), time.time(), prefilter=True,
-                                     min_pool=float(c.get("min_daily_reward") or 0), max_rps=4)
-        picked = mm.pick_for_quoter(rows, size, int(c["max_markets"]), float(c["max_capital"]),
-                                    float(c.get("max_volume_24h") or 0))
+                                     min_pool=0.0 if trading_first else float(c.get("min_daily_reward") or 0), max_rps=4)
+        if trading_first:
+            picked = mm.pick_trading_first(rows, size, int(c["max_markets"]), float(c["max_capital"]),
+                                           float(c.get("min_spread") or 0.02), float(c.get("max_volume_24h") or 0),
+                                           fee_of=lambda st: self._series_fee(client, st))
+        else:
+            picked = mm.pick_for_quoter(rows, size, int(c["max_markets"]), float(c["max_capital"]),
+                                        float(c.get("max_volume_24h") or 0))
         k = str(size)
         chosen = [{"ticker": r["ticker"], "daily_reward": d(r["daily"]), "est_daily": d(r["sizes"][k]["est_daily"]),
                    "share": d((r["sizes"][k]["share_yes"] + r["sizes"][k]["share_no"]) / 2),
-                   "capital": d(r["sizes"][k]["capital"]), "title": r.get("title"), "sub": r.get("sub")} for r in picked]
+                   "capital": d(r["sizes"][k]["capital"]), "title": r.get("title"), "sub": r.get("sub"),
+                   "edge_cents": (round(100 * r["trading"]["score"], 2) if r.get("trading") else None),
+                   "spread_cents": round(100 * (r.get("spread") or 0), 1)} for r in picked]
         paying = sum(1 for r in rows if r["sizes"][k]["est_daily"] > 0)
+        if trading_first:
+            return chosen, (f"TRADING-FIRST: {info['programs']} programs; {len(rows)} markets pass the filters; picked {len(chosen)} with "
+                            f"spread >= {float(c.get('min_spread') or 0.02):.2f} and a positive estimated edge before rewards "
+                            f"(capital ${sum(x['capital'] for x in chosen):.2f} of ${c['max_capital']}): "
+                            + ", ".join(f"{x['ticker']} (edge {x['edge_cents']}c/contract, spread {x['spread_cents']}c, "
+                                        f"bonus ~${x['est_daily']:.2f}/d)" for x in chosen))
         return chosen, (f"{info['programs']} active programs; {len(info['pools'])} pools >= ${c['min_daily_reward']}/day; "
                         f"{len(rows)} pass the filters; {paying} would pay you >= Kalshi's $1 minimum at {size} contracts; "
                         f"quoting {len(chosen)} (capital ${sum(x['capital'] for x in chosen):.2f} of ${c['max_capital']}): "

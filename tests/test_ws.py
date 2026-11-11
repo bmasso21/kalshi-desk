@@ -192,7 +192,7 @@ def run(keytype: str, base_port: int):
 
     # --- feed-driven quoter (demo mock) ---------------------------------------------
     rest.state.S["positions"].clear()
-    cfg.update({"quoter": {"enabled": True, "min_daily_reward": 5, "max_markets": 5, "size": 10, "refresh_sec": 30}})
+    cfg.update({"quoter": {"enabled": True, "select_by": "rewards", "min_daily_reward": 5, "max_markets": 5, "size": 10, "refresh_sec": 30}})
     q = eng.quoter
     q.start()
     check("quoter rests both sides", wait(lambda: set(q.quotes.get("KXA-1", {})) == {"yes", "no"}, 10), q.snapshot()["events"][:3])

@@ -134,6 +134,15 @@ blend behind the *hourly* markets, not what the daily markets settle on, so v2.1
 - The quoter's market picker now uses the same scoring (it used a simpler size ratio).
 - Backtester: filled/expired orders are dropped from the matching loop (same results, much faster on long runs).
 
+### Trading first, rewards as a bonus (v3.3)
+- **Pass/fail** for every paper run is its **trading P&L alone** under strict fills; rewards are reported separately as a
+  bonus. A run shows AHEAD/BEHIND until it has 5 days and 30 fills, then PASS/FAIL.
+- **The quoter picks markets by estimated trading edge** (Settings -> *Pick markets by*; default): spread at least
+  *Min spread* (2c) and `half the spread - maker fee - 0.25 x yesterday's price move` above zero. Ranked by that edge;
+  estimated reward only breaks ties. A market needs no reward to qualify (the candidate list is still the ~6,500 markets
+  that have a reward program). *Reward payout* restores the old ranking.
+- The edge figure is a rough screen, not a forecast; the paper test (preset "trading-first picks") measures the real result.
+
 ### Limits that scale with the account (v3.2) - Settings
 Tick *Scale limits with the account* and every dollar limit becomes a percentage of the account's value (cash +
 positions), taken once each morning or when you press *Recalculate now*:

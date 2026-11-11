@@ -305,8 +305,64 @@ def rank_markets(client, q: dict, sizes, now: float, prefilter: bool = False, mi
                      "spread": round(ya - yb, 4) if yb and ya else None,
                      "depth_yes": round(sum(c for _, c in yes_lv), 2), "depth_no": round(sum(c for _, c in no_lv), 2),
                      "close_ts": iso_ts(m.get("close_time")), "quoter_ok": ok, "why_not": why,
-                     "volume_24h": fnum(m.get("volume_24h_fp") or m.get("volume_24h")), "sizes": per})
+                     "volume_24h": fnum(m.get("volume_24h_fp") or m.get("volume_24h")),
+                     "last": fnum(m.get("last_price_dollars")) or None, "prev": fnum(m.get("previous_price_dollars")) or None,
+                     "sizes": per})
     return rows, {"programs": len(progs), "pages": pages, "pools": pools, "live": live}
+
+
+MOVE_WEIGHT = 0.25
+
+
+def trading_score(r: dict, fee_type: str | None = "quadratic", fee_mult: float = 1.0) -> dict:
+    """Estimated trading edge per contract for a maker who joins both best bids, BEFORE any reward:
+         half the spread (what one side of a round trip captures)
+       - the maker fee per contract at the mid (0 on most series)
+       - 0.25 x how far the price moved since the previous day's close (a proxy for getting run over)
+    A rough screen, not a forecast: the paper test measures what actually happens."""
+    yb, ya = r.get("yes_bid") or 0.0, r.get("yes_ask") or 0.0
+    if not (0 < yb < ya < 1):
+        return {"score": -1.0, "half_spread": 0.0, "fee": 0.0, "move": 0.0}
+    mid = (yb + ya) / 2
+    half = (ya - yb) / 2
+    fe = float(fee(round(mid, 2), 100, fee_type or "quadratic", fee_mult or 1, maker=True)) / 100
+    prev = r.get("prev")
+    move = abs(mid - prev) if prev else 0.0
+    return {"score": round(half - fe - MOVE_WEIGHT * move, 5), "half_spread": round(half, 4), "fee": round(fe, 4), "move": round(move, 4)}
+
+
+def pick_trading_first(rows: list[dict], size: int, max_markets: int, max_capital: float, min_spread: float = 0.02,
+                       max_volume_24h: float = 0, fee_of=None, per_series: int = 0) -> list[dict]:
+    """Trading edge first, rewards as the tie-breaker / bonus. A market qualifies only if its spread is at least
+    `min_spread` and its estimated trading edge per contract (trading_score) is positive WITHOUT rewards; qualifying
+    markets are ranked by that edge, then by estimated reward per $ of capital. Markets need no reward to be picked."""
+    k = str(size)
+    cands = []
+    for r in rows:
+        sz = (r.get("sizes") or {}).get(k) or {}
+        if not r.get("quoter_ok") or not sz.get("capital") or (r.get("spread") or 0) < min_spread - EPS:
+            continue
+        if max_volume_24h and (r.get("volume_24h") or 0) > max_volume_24h:
+            continue
+        ft = fee_of(r["series"]) if fee_of else {}
+        ts_ = trading_score(r, (ft or {}).get("fee_type"), (ft or {}).get("fee_multiplier") or 1.0)
+        if ts_["score"] <= 0:
+            continue
+        cands.append((ts_["score"], (sz.get("est_daily") or 0) / sz["capital"], r, ts_))
+    cands.sort(key=lambda x: (-x[0], -x[1]))
+    out, used, seen = [], 0.0, {}
+    for sc, _, r, ts_ in cands:
+        if len(out) >= max_markets:
+            break
+        if per_series and seen.get(r["series"], 0) >= per_series:
+            continue
+        c = r["sizes"][k]["capital"]
+        if used + c > max_capital + EPS:
+            continue
+        used += c
+        seen[r["series"]] = seen.get(r["series"], 0) + 1
+        out.append({**r, "trading": ts_})
+    return out
 
 
 def pick_for_quoter(rows: list[dict], size: int, max_markets: int, max_capital: float, max_volume_24h: float = 0) -> list[dict]:
@@ -597,6 +653,7 @@ PRESETS = [
     {"name": "1c behind the best bid", "offset_ticks": 1},
     {"name": "pull after fills / bursts", "pull_after_fill_min": 10, "burst_contracts": 200, "burst_pull_min": 10},
     {"name": "exit: step 1c inside at the inventory cap", "exit_step_in": True},
+    {"name": "trading-first picks (spread >= 2c, edge before rewards)", "select_by": "trading", "min_spread": 0.02},
 ]
 
 
@@ -651,6 +708,12 @@ class Shadow:
         k = str(size if str(size) in {str(s) for s in sc["summary"]["sizes"]} else sc["summary"]["sizes"][0])
         rows = scanner.rows(sc["id"], int(k), limit=100000)
         mv = float(p.get("max_volume_24h") or 0)
+        if p.get("select_by") == "trading":
+            picked = pick_trading_first(rows, int(k), int(p["n_markets"]), 1e12, float(p.get("min_spread") or 0.02), mv,
+                                        per_series=int(p["per_series"]))
+            if not picked:
+                raise RuntimeError("no market passes the trading-first screen (spread >= min, positive edge before rewards)")
+            return sc, k, picked
         picked, per_series = [], {}
         for r in rows:
             if r["sizes"][k]["est_daily"] <= 0 or (mv and r.get("volume_24h", 0) > mv):
@@ -670,7 +733,7 @@ class Shadow:
             p = {"name": "custom", "n_markets": 20, "size": 10, "poll_sec": 15, "max_days": 21, "max_inventory": 30,
                  "pull_hours": 6, "jump_cents": 4, "cooldown_min": 10, "refresh_sec": 15, "min_mid": 0.15, "max_mid": 0.85,
                  "max_spread": 0.06, "requeue_sec": 60, "per_series": 3, "offset_ticks": 0, "max_volume_24h": 0,
-                 "pull_after_fill_min": 0, "burst_contracts": 0, "burst_pull_min": 10, "exit_step_in": False, **params}
+                 "pull_after_fill_min": 0, "burst_contracts": 0, "burst_pull_min": 10, "exit_step_in": False, "select_by": "rewards", "min_spread": 0.02, **params}
             sc, k, picked = self._pick(scanner, p)
             fee_types: dict[str, dict] = {}
             for r in picked:
@@ -994,6 +1057,7 @@ def report(wdb, run_id: int | None = None, live: Shadow | None = None, now: floa
             "reward": round(tot["reward"], 2), "fills": int(tot["fills"]), "contracts": round(tot["contracts"], 2),
             "cost": round(tot["cost"], 2), "fees": round(tot["fees"], 2), "value": round(tot["value"], 2),
             "trading_pnl": round(trading, 2), "net": round(tot["reward"] + trading, 2),
+            "trading_per_day": round(trading / days, 2),
             "reward_per_day": round(tot["reward"] / days, 2), "net_per_day": round((tot["reward"] + trading) / days, 2),
             "edge_at_fill_cents": round(100 * edge_sum[0] / edge_sum[1], 2) if edge_sum[1] else None,
             "markout_cents": {f"{h // 60}m": (round(100 * v[0] / v[1], 2) if v[1] else None) for h, v in mk_sum.items()},
@@ -1004,7 +1068,14 @@ def report(wdb, run_id: int | None = None, live: Shadow | None = None, now: floa
             "markets": per,
         }
     params = json.loads(run["params"])
-    return {"run_id": run_id, "name": params.get("name") or f"run #{run_id}", "started": run["ts"], "stopped": run["stopped_ts"], "status": run["status"], "note": run["note"],
+    # Pass/fail is on TRADING alone (strict fills): rewards are a bonus on top, never what makes a strategy pass.
+    tq = out_models["queue"]["trading_pnl"]
+    enough = days >= 5 and out_models["queue"]["fills"] >= 30
+    verdict = {"basis": "trading P&L under strict fills, rewards excluded", "enough_data": enough,
+               "status": ("pass" if tq >= 0 else "fail") if enough else ("ahead" if tq >= 0 else "behind"),
+               "trading_pnl": tq, "bonus_rewards": out_models["queue"]["reward"],
+               "needs": None if enough else "at least 5 days and 30 fills"}
+    return {"run_id": run_id, "verdict": verdict, "name": params.get("name") or f"run #{run_id}", "started": run["ts"], "stopped": run["stopped_ts"], "status": run["status"], "note": run["note"],
             "days": round(days, 3), "params": json.loads(run["params"]), "markets": len(markets),
             "scan_est_daily": round(sum(m.get("scan_est_daily") or 0 for m in markets.values()), 2),
             "models": out_models}

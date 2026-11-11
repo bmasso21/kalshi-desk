@@ -180,7 +180,7 @@ def run(keytype: str):
     check("cancelled order adds $0 spend", after == before, (before, after))
 
     # quoter
-    cfg.update({"quoter": {"enabled": True, "min_daily_reward": 5, "max_markets": 5, "size": 10}})
+    cfg.update({"quoter": {"enabled": True, "select_by": "rewards", "min_daily_reward": 5, "max_markets": 5, "size": 10}})
     q = eng.quoter
     q.cycle()
     snap = c.get("/api/quoter").json()

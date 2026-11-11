@@ -250,6 +250,9 @@ def integration_tests(tmp):
     sh._persist()
     rep = mm.report(wdb, rid, now=clock["t"] + 7200)
     m = rep["models"]["queue"]
+    check("verdict is on trading alone, rewards listed as a bonus; early runs are only 'ahead'/'behind'",
+          rep["verdict"]["status"] == "ahead" and rep["verdict"]["enough_data"] is False and rep["verdict"]["trading_pnl"] == m["trading_pnl"]
+          and rep["verdict"]["bonus_rewards"] == m["reward"] and "rewards excluded" in rep["verdict"]["basis"], rep["verdict"])
     check("report: fills, contracts and cost", m["fills"] == 1 and m["contracts"] == 10 and close(m["cost"], 5.0), m)
     check("report: inventory marked to mid, net = rewards + trading", close(m["value"], 10 * 0.51) and close(m["net"], round(m["reward"] + m["trading_pnl"], 2), 0.011), m)
     check("report: markout vs mid after fill (mid .51 vs price .50 -> +1c)", close(m["markout_cents"]["60m"], 1.0), m["markout_cents"])
@@ -268,7 +271,7 @@ def integration_tests(tmp):
     ids = sh3.start_set(sc, {"n_markets": 5, "size": 10, "poll_sec": 10, "per_series": 3})
     names = [json.loads(r["params"])["name"] for r in wdb.query(f"SELECT params FROM mm_runs WHERE id IN ({','.join(map(str, ids))}) ORDER BY id")]
     check("variant set: quiet-market preset skipped when no market qualifies (mock volume 500)",
-          len(ids) == 4 and not any("quiet" in n for n in names) and any("quiet" in x for x in sh3.last_skipped), (names, sh3.last_skipped))
+          len(ids) == 5 and not any("quiet" in n for n in names) and any("quiet" in x for x in sh3.last_skipped), (names, sh3.last_skipped))
     clock["t"] += 10
     sh3.step()
     off = next(r for r in sh3.runs.values() if r.p.get("offset_ticks"))
@@ -281,7 +284,7 @@ def integration_tests(tmp):
                             "count_fp": "250.00", "taker_book_side": "ask"}]
     sh3.step()
     tr_calls = [c_ for c_ in mock.state.calls[calls_before:] if c_[1].endswith("/markets/trades")]
-    check("shared feed: one trades request per market per poll for all runs", len(tr_calls) == 1, tr_calls)
+    check("shared feed: one trades request per market per poll for all runs", len(tr_calls) == len({c_[2].split("&")[0] for c_ in tr_calls}) and 1 <= len(tr_calls) <= 2, tr_calls)
     pull = next(r for r in sh3.runs.values() if r.p.get("pull_after_fill_min"))
     ps = pull.sims[("KXA-1", "queue")].s
     check("every run fills from the same trade", all(r.sims[("KXA-1", "queue")].s["pos_yes"] == 10 for r in sh3.runs.values()))
@@ -290,9 +293,9 @@ def integration_tests(tmp):
     check("pull variant: YES side paused after its fill", ps["side_pause"].get("yes", 0) > clock["t"] and ps["fill_pauses"] >= 1, ps)
     check("baseline keeps quoting after the same trade", "yes" in base_run.sims[("KXA-1", "queue")].s["quotes"])
     reps = [mm.report(wdb, i, live=sh3, now=clock["t"]) for i in ids]
-    check("reports per run carry the variant name", all(r["name"] for r in reps) and len(reps) == 4)
+    check("reports per run carry the variant name", all(r["name"] for r in reps) and len(reps) == 5)
     sh3.stop(ids[0])
-    check("stop one run keeps the others", ids[0] not in sh3.runs and len(sh3.runs) == 3
+    check("stop one run keeps the others", ids[0] not in sh3.runs and len(sh3.runs) == 4
           and wdb.query("SELECT status FROM mm_runs WHERE id=?", (ids[0],))[0]["status"] == "stopped")
     sh3.stop()
     check("stop all", not sh3.runs)
@@ -327,11 +330,11 @@ def integration_tests(tmp):
     check("a second run can start alongside (offset clamped to 5)", r2.status_code == 200 and r2.json()["params"]["offset_ticks"] == 5
           and len(app.state.mm[1].runs) == 2, r2.text)
     r3 = c.post("/api/mm/shadow/start_set", headers=H, json={"n_markets": 5})
-    check("variant set via API (quiet preset skipped on the mock)", r3.status_code == 200 and len(r3.json()["ids"]) == 4 and r3.json()["skipped"], r3.text)
+    check("variant set via API (quiet preset skipped on the mock)", r3.status_code == 200 and len(r3.json()["ids"]) == 5 and r3.json()["skipped"], r3.text)
     check("shadow re-places like the live quoter (quote lifetime - 60s)", r3.json()["params"]["requeue_sec"] == 540)
     time.sleep(0.5)
     j = c.get("/api/mm").json()
-    check("status lists every run", len(j["shadow"]["runs"]) == 6 and len(j["reports"]) == 6, j["shadow"])
+    check("status lists every run", len(j["shadow"]["runs"]) == 7 and len(j["reports"]) == 7, j["shadow"])
     time.sleep(0.5)
     check("shadow stop", c.post("/api/mm/shadow/stop", headers=H).status_code == 200 and not app.state.mm[1].status()["alive"])
     check("report endpoint", c.get("/api/mm/report").status_code == 200)
@@ -356,6 +359,34 @@ def backtest_prune_test():
     r = sim.run()
     check("backtester: live order list pruned (stays small)", len(sim.live) <= 2, len(sim.live))
     check("backtester: every order fills from the next trade through it (2000 bars -> 2000)", r["contracts"] == 2000 and time.time() - t0 < 5, r["contracts"])
+
+
+def trading_first_tests():
+    def row(t, yb, ya, prev=None, est=0.0, vol=0, ok=True, series=None):
+        return {"ticker": t, "series": series or t, "quoter_ok": ok, "yes_bid": yb, "yes_ask": ya, "spread": round(ya - yb, 4),
+                "prev": prev, "volume_24h": vol, "sizes": {"10": {"est_daily": est, "capital": 10.0}}}
+    a = mm.trading_score(row("A", 0.40, 0.44))
+    check("trading score: half the spread when nothing else applies", close(a["score"], 0.02) and a["fee"] == 0, a)
+    b = mm.trading_score(row("B", 0.40, 0.44), "quadratic_with_maker_fees")
+    check("trading score: maker fee comes off (0.0175 x .42 x .58 = 0.43c)", close(b["score"], 0.02 - 0.0043, 2e-4), b)
+    c_ = mm.trading_score(row("C", 0.40, 0.44, prev=0.50))
+    check("trading score: yesterday's move counts against (0.25 x 8c = 2c)", close(c_["score"], 0.0), c_)
+    rows = [row("TIGHT", 0.50, 0.51, est=9.0),                 # 1c spread: big reward but fails the spread test
+            row("WIDE", 0.40, 0.46, est=0.0),                  # 3c half-spread, no reward at all
+            row("MID", 0.40, 0.44, est=0.0),
+            row("MIDR", 0.30, 0.34, est=2.0),                  # same edge as MID, with a reward -> ranks ahead of MID
+            row("MOVED", 0.40, 0.44, prev=0.60, est=5.0),      # negative edge after the move penalty
+            row("FEE", 0.49, 0.51, est=1.0, series="SPORT"),   # 1c half-spread minus 0.44c fee
+            row("NOPE", 0.40, 0.48, ok=False)]
+    fee_of = lambda s_: {"fee_type": "quadratic_with_maker_fees", "fee_multiplier": 1.0} if s_ == "SPORT" else {"fee_type": "quadratic"}
+    pk = [r["ticker"] for r in mm.pick_trading_first(rows, 10, 10, 1000, 0.02, fee_of=fee_of)]
+    check("trading-first: ranked by edge before rewards; a reward only breaks ties; no reward needed",
+          pk == ["WIDE", "MIDR", "MID", "FEE"], pk)
+    check("trading-first: big reward cannot rescue a tight or run-over market", "TIGHT" not in pk and "MOVED" not in pk)
+    pk = [r["ticker"] for r in mm.pick_trading_first(rows, 10, 2, 1000, 0.02)]
+    check("trading-first: respects max markets", pk == ["WIDE", "MIDR"], pk)
+    pk = [r["ticker"] for r in mm.pick_trading_first(rows, 10, 10, 15, 0.02)]
+    check("trading-first: respects the capital cap", pk == ["WIDE"], pk)
 
 
 def retry_tests():
@@ -410,7 +441,7 @@ def quoter_select_tests():
     serve(create_mock({}), port)
     base = f"http://127.0.0.1:{port}/trade-api/v2"
     cfg = {"size": 10, "max_markets": 5, "max_capital": 100, "min_daily_reward": 5, "pull_hours": 6, "max_spread": 0.06,
-           "min_mid": 0.15, "max_mid": 0.85, "max_volume_24h": 0}
+           "min_mid": 0.15, "max_mid": 0.85, "max_volume_24h": 0, "select_by": "rewards"}
     q = Quoter(types.SimpleNamespace(cfg=types.SimpleNamespace(quoter=cfg)))
     t0 = time.time()
     p = mm.Pacer(10)
@@ -421,6 +452,14 @@ def quoter_select_tests():
     check("quoter select: $10/day pool picked, $0.30/day pool below the minimum ignored", [x["ticker"] for x in sel] == ["KXA-1"], msg)
     check("quoter select: estimate from Kalshi's formula", close(float(sel[0]["est_daily"]), round(10 * (10 / 210 + 10 / 210) / 2, 4), 1e-4), sel)
     check("quoter select: share and capital reported", close(float(sel[0]["share"]), 10 / 210, 1e-4) and close(float(sel[0]["capital"]), 9.8), sel)
+    cfg["select_by"] = "trading"
+    sel_t, msg_t = q.select(KalshiClient(base))
+    check("quoter trading-first: both 2c-spread markets qualify, reward or not; the rewarded one ranks first on the tie",
+          [x["ticker"] for x in sel_t] == ["KXA-1", "KXB-1"] and float(sel_t[0]["edge_cents"]) == 0.75 and "TRADING-FIRST" in msg_t, msg_t)
+    cfg["min_spread"] = 0.03
+    check("quoter trading-first: min spread 3c -> nothing qualifies", q.select(KalshiClient(base))[0] == [])
+    cfg.pop("min_spread")
+    cfg["select_by"] = "rewards"
     fm = q._fmt(sel)
     check("quoter select: UI format is plain strings", isinstance(fm[0]["capital"], str) and fm[0]["share"] == "4.8", fm)
     # background re-pick: the current list stays until the new one is ready; no overlapping re-picks
@@ -451,6 +490,7 @@ if __name__ == "__main__":
     backtest_prune_test()
     quoter_select_tests()
     retry_tests()
+    trading_first_tests()
     integration_tests(tempfile.mkdtemp())
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     if FAIL:
