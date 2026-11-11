@@ -413,9 +413,32 @@ class SimQuoter:
                            "elig_sec": 0.0, "quoted_sec": 0.0, "fills": 0, "contracts": 0.0, "quotes": {},
                            "cooldown_until": 0.0, "mid_hist": [], "last_ts": None, "jumps": 0, "settled": None,
                            "max_capital": 0.0}
+        for k, v in (("side_pause", {}), ("bursts", 0), ("fill_pauses", 0)):
+            self.s.setdefault(k, v)
 
     # fills ------------------------------------------------------------------
     def apply_trades(self, trades: list[dict]) -> list[dict]:
+        out = self._match(trades)
+        p = self.p
+        # defence: after a fill, stop bidding that side for a while (fills against informed traders come in runs)
+        pf = float(p.get("pull_after_fill_min") or 0)
+        if pf > 0:
+            for f in out:
+                self.s["side_pause"][f["side"]] = max(self.s["side_pause"].get(f["side"], 0.0), f["ts"] + pf * 60)
+                self.s["quotes"].pop(f["side"], None)
+                self.s["fill_pauses"] += 1
+        # defence: a burst of trading in the market -> pull both sides
+        bc = float(p.get("burst_contracts") or 0)
+        if bc > 0 and trades:
+            vol = sum(t.get("count") or 0.0 for t in trades)
+            if vol >= bc:
+                last = max(t.get("ts") or 0.0 for t in trades)
+                self.s["cooldown_until"] = max(self.s["cooldown_until"], last + float(p.get("burst_pull_min") or 10) * 60)
+                self.s["quotes"] = {}
+                self.s["bursts"] += 1
+        return out
+
+    def _match(self, trades: list[dict]) -> list[dict]:
         out = []
         for t in trades:
             yp, cnt, ts = t.get("yes_price"), t.get("count") or 0.0, t.get("ts") or 0.0
@@ -509,11 +532,17 @@ class SimQuoter:
             return
         size, inv = float(p.get("size", 10)), float(p.get("max_inventory", 30))
         net = s["pos_yes"] - s["pos_no"]
+        off = int(p.get("offset_ticks") or 0) * TICK          # quote this far behind the best bid
+        ylv, nlv = dict(yes_lv), dict(no_lv)
         want = {}
-        if net < inv:
-            want["yes"] = (yb, dict(yes_lv).get(yb, 0.0))
-        if -net < inv:
-            want["no"] = (nb, dict(no_lv).get(nb, 0.0))
+        if net < inv and s["side_pause"].get("yes", 0.0) <= now:
+            px = round(yb - off, 4)
+            if px >= 0.01:
+                want["yes"] = (px, ylv.get(px, 0.0))
+        if -net < inv and s["side_pause"].get("no", 0.0) <= now:
+            px = round(nb - off, 4)
+            if px >= 0.01:
+                want["no"] = (px, nlv.get(px, 0.0))
         requeue = float(p.get("requeue_sec", 60))
         for side in ("yes", "no"):
             q = s["quotes"].get(side)
@@ -544,8 +573,24 @@ class SimQuoter:
         return s["pos_yes"] * mid + s["pos_no"] * (1 - mid)
 
 
+PRESETS = [
+    {"name": "baseline (live quoter settings)"},
+    {"name": "quiet markets only (<= 10 contracts traded in 24h)", "max_volume_24h": 10},
+    {"name": "1c behind the best bid", "offset_ticks": 1},
+    {"name": "pull after fills / bursts", "pull_after_fill_min": 10, "burst_contracts": 200, "burst_pull_min": 10},
+]
+
+
+class Run:
+    def __init__(self, rid: int, p: dict, markets: dict, sims: dict, started: float):
+        self.rid, self.p, self.markets, self.sims, self.started = rid, p, markets, sims, started
+
+
 class Shadow:
-    def __init__(self, wdb, client: KalshiClient | None = None, req_per_sec: float = 4, clock=time.time, sleep=None):
+    """Paper quoter runs (variants) that share one polling loop: each market's book and trades are fetched once
+    per poll and fed to every run that holds it, so variants see identical data."""
+
+    def __init__(self, wdb, client: KalshiClient | None = None, req_per_sec: float = 6, clock=time.time, sleep=None):
         ensure_schema(wdb)
         self.db = wdb
         self.client = client or KalshiClient(PROD_URL)
@@ -553,45 +598,61 @@ class Shadow:
         self.clock = clock
         self._stop = threading.Event()
         self.thread: threading.Thread | None = None
-        self.run_id: int | None = None
-        self.p: dict = {}
-        self.markets: dict[str, dict] = {}
-        self.sims: dict[tuple[str, str], SimQuoter] = {}
+        self.runs: dict[int, Run] = {}
         self.cursor: dict[str, dict] = {}       # ticker -> {"ts": last trade ts, "seen": [ids]}
         self.mkt: dict[str, dict] = {}          # latest market objects
         self.mkt_ts = 0.0
         self.last_mid: dict[str, float] = {}
-        self.mid_written: dict[str, tuple] = {}
+        self.mid_written: dict[tuple, tuple] = {}
         self.persist_ts = 0.0
         self.state = {"running": False, "polls": 0, "errors": 0, "last_error": None, "last_poll": None, "requests": 0}
         self.lock = threading.RLock()
 
+    # compatibility helpers (single-run callers / tests)
+    @property
+    def run_id(self):
+        return max(self.runs) if self.runs else None
+
+    @property
+    def markets(self) -> dict:
+        r = self.runs.get(self.run_id)
+        return r.markets if r else {}
+
+    @property
+    def sims(self) -> dict:
+        r = self.runs.get(self.run_id)
+        return r.sims if r else {}
+
     # ---- lifecycle -----------------------------------------------------------
+    def _pick(self, scanner: Scanner, p: dict):
+        sc = scanner.latest(done_only=True)
+        if not sc:
+            raise RuntimeError("run a scan first")
+        size = int(p["size"])
+        k = str(size if str(size) in {str(s) for s in sc["summary"]["sizes"]} else sc["summary"]["sizes"][0])
+        rows = scanner.rows(sc["id"], int(k), limit=100000)
+        mv = float(p.get("max_volume_24h") or 0)
+        picked, per_series = [], {}
+        for r in rows:
+            if r["sizes"][k]["est_daily"] <= 0 or (mv and r.get("volume_24h", 0) > mv):
+                continue
+            if per_series.get(r["series"], 0) >= int(p["per_series"]):
+                continue                    # spread the study over different series
+            per_series[r["series"]] = per_series.get(r["series"], 0) + 1
+            picked.append(r)
+            if len(picked) >= int(p["n_markets"]):
+                break
+        if not picked:
+            raise RuntimeError("the latest scan has no market with an estimated reward for these settings")
+        return sc, k, picked
+
     def start(self, scanner: Scanner, params: dict) -> int:
         with self.lock:
-            if self.thread and self.thread.is_alive():
-                raise RuntimeError("a shadow run is already running; stop it first")
-            sc = scanner.latest(done_only=True)
-            if not sc:
-                raise RuntimeError("run a scan first")
-            p = {"n_markets": 20, "size": 10, "poll_sec": 10, "max_days": 21, "max_inventory": 30, "pull_hours": 6,
-                 "jump_cents": 4, "cooldown_min": 10, "refresh_sec": 15, "min_mid": 0.15, "max_mid": 0.85,
-                 "max_spread": 0.06, "requeue_sec": 60, "per_series": 3, **params}
-            size = int(p["size"])
-            k = str(size if str(size) in {str(s) for s in sc["summary"]["sizes"]} else sc["summary"]["sizes"][0])
-            rows = scanner.rows(sc["id"], int(k), limit=100000)
-            picked, per_series = [], {}
-            for r in rows:
-                if r["sizes"][k]["est_daily"] <= 0:
-                    continue
-                if per_series.get(r["series"], 0) >= int(p["per_series"]):
-                    continue                    # spread the study over different series
-                per_series[r["series"]] = per_series.get(r["series"], 0) + 1
-                picked.append(r)
-                if len(picked) >= int(p["n_markets"]):
-                    break
-            if not picked:
-                raise RuntimeError("the latest scan has no market with an estimated reward at this size")
+            p = {"name": "custom", "n_markets": 20, "size": 10, "poll_sec": 15, "max_days": 21, "max_inventory": 30,
+                 "pull_hours": 6, "jump_cents": 4, "cooldown_min": 10, "refresh_sec": 15, "min_mid": 0.15, "max_mid": 0.85,
+                 "max_spread": 0.06, "requeue_sec": 60, "per_series": 3, "offset_ticks": 0, "max_volume_24h": 0,
+                 "pull_after_fill_min": 0, "burst_contracts": 0, "burst_pull_min": 10, **params}
+            sc, k, picked = self._pick(scanner, p)
             fee_types: dict[str, dict] = {}
             for r in picked:
                 if r["series"] not in fee_types:
@@ -607,37 +668,73 @@ class Shadow:
             for r in picked:
                 info = {"ticker": r["ticker"], "title": r["title"], "sub": r["sub"], "series": r["series"],
                         "daily": r["daily"], "target": r["target"], "df": r["df"], "scan_est_daily": r["sizes"][k]["est_daily"],
-                        "scan_capital": r["sizes"][k]["capital"], **fee_types[r["series"]]}
+                        "scan_capital": r["sizes"][k]["capital"], "volume_24h": r.get("volume_24h"), **fee_types[r["series"]]}
                 self.db.execute("INSERT OR REPLACE INTO mm_markets VALUES(?,?,?)", (rid, r["ticker"], json.dumps(info)))
             self._load(rid)
-            self._spawn()
+            self._ensure_thread()
             return rid
 
-    def resume(self) -> int | None:
-        """Continue a run that was going when the app stopped (open quotes are dropped: the real quoter's
-        orders would have expired too)."""
-        r = self.db.query("SELECT id FROM mm_runs WHERE status='running' ORDER BY id DESC LIMIT 1")
-        if not r or (self.thread and self.thread.is_alive()):
-            return None
-        self._load(r[0]["id"], resumed=True)
-        self._spawn()
-        return self.run_id
+    def start_set(self, scanner: Scanner, base: dict, presets=None) -> list[int]:
+        """Start the comparison set: every preset on top of `base` (the live quoter's settings)."""
+        sc = scanner.latest(done_only=True)
+        if not sc:
+            raise RuntimeError("run a scan first")
+        if self.clock() - sc["ts"] > 6 * 3600:
+            raise RuntimeError("the latest scan is over 6 hours old; run a new scan first (pools change daily)")
+        ids, skipped = [], []
+        for pr in (presets or PRESETS):
+            try:
+                ids.append(self.start(scanner, {**base, **pr}))
+            except RuntimeError as e:
+                skipped.append(f"{pr.get('name')}: {e}")
+        if not ids:
+            raise RuntimeError("; ".join(skipped))
+        self.last_skipped = skipped
+        return ids
 
-    def stop(self, note="stopped"):
+    def resume(self) -> list[int]:
+        """Continue runs that were going when the app stopped (open quotes are dropped: the real quoter's
+        orders would have expired too)."""
+        out = []
+        with self.lock:
+            for r in self.db.query("SELECT id FROM mm_runs WHERE status='running' ORDER BY id"):
+                if r["id"] not in self.runs:
+                    self._load(r["id"], resumed=True)
+                    out.append(r["id"])
+        if out:
+            self._ensure_thread()
+        return out
+
+    def stop(self, run_id: int | None = None, note="stopped"):
+        """Stop one run (or all when run_id is None)."""
+        with self.lock:
+            ids = list(self.runs) if run_id is None else [run_id]
+            self._persist()
+            for rid in ids:
+                if rid in self.runs:
+                    self.runs.pop(rid)
+                    self.db.execute("UPDATE mm_runs SET status='stopped', stopped_ts=?, note=? WHERE id=? AND status='running'",
+                                    (self.clock(), note, rid))
+            if not self.runs:
+                self._stop.set()
+        if not self.runs and self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout=15)
+            self.state["running"] = False
+
+    def shutdown(self):
+        """App exit: keep runs marked running so they resume after the restart."""
         self._stop.set()
         if self.thread:
             self.thread.join(timeout=15)
         with self.lock:
-            if self.run_id:
+            if self.runs:
                 self._persist()
-                if note:
-                    self.db.execute("UPDATE mm_runs SET status='stopped', stopped_ts=?, note=? WHERE id=? AND status='running'",
-                                    (self.clock(), note, self.run_id))
-            self.state["running"] = False
+        self.state["running"] = False
 
-    def shutdown(self):
-        """App exit: keep the run marked running so it resumes after the restart."""
-        self.stop(note=None)
+    def _ensure_thread(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self._spawn()
 
     def _spawn(self):
         self._stop.clear()
@@ -646,44 +743,46 @@ class Shadow:
 
     def _load(self, rid, resumed=False):
         run = self.db.query("SELECT * FROM mm_runs WHERE id=?", (rid,))[0]
-        self.run_id, self.p = rid, json.loads(run["params"])
-        self.markets = {r["ticker"]: json.loads(r["info"]) for r in self.db.query("SELECT * FROM mm_markets WHERE run_id=?", (rid,))}
+        p = json.loads(run["params"])
+        markets = {r["ticker"]: json.loads(r["info"]) for r in self.db.query("SELECT * FROM mm_markets WHERE run_id=?", (rid,))}
         st = {(r["ticker"], r["model"]): json.loads(r["state"]) for r in self.db.query("SELECT * FROM mm_state WHERE run_id=?", (rid,))}
         now = self.clock()
-        self.sims, self.cursor = {}, {}
-        for t, info in self.markets.items():
+        sims = {}
+        for t, info in markets.items():
             for m in MODELS:
                 s = st.get((t, m))
                 if s is not None and resumed:
                     s["quotes"], s["last_ts"], s["mid_hist"] = {}, None, []
-                    self.cursor[t] = s.pop("_cursor", None) or {"ts": now, "seen": []}
-                self.sims[(t, m)] = SimQuoter(info, self.p, m, s)
-            if t not in self.cursor:
-                self.cursor[t] = {"ts": now, "seen": []}
-            if resumed:
+                    s.pop("_cursor", None)
+                sims[(t, m)] = SimQuoter(info, p, m, s)
+            if resumed or t not in self.cursor:
                 self.cursor[t] = {"ts": now, "seen": []}     # trades while we were down never met a live quote
+        self.runs[rid] = Run(rid, p, markets, sims, run["ts"])
         self.mkt_ts = 0.0
-        self.state.update(running=True, polls=0, errors=0, last_error=None)
+        self.state.update(running=True)
 
     # ---- loop ------------------------------------------------------------------
+    def poll_sec(self) -> float:
+        return min((float(r.p.get("poll_sec", 15)) for r in self.runs.values()), default=15.0)
+
     def loop(self):
-        poll = float(self.p.get("poll_sec", 10))
         while not self._stop.is_set():
             t0 = time.time()
             try:
                 with self.lock:
-                    run = self.db.query("SELECT ts FROM mm_runs WHERE id=?", (self.run_id,))
-                    if run and self.clock() - run[0]["ts"] > float(self.p.get("max_days", 21)) * 86400:
-                        self._persist()
-                        self.db.execute("UPDATE mm_runs SET status='done', stopped_ts=?, note='max_days reached' WHERE id=?",
-                                        (self.clock(), self.run_id))
-                        self.state["running"] = False
-                        return
+                    for rid, r in list(self.runs.items()):
+                        if self.clock() - r.started > float(r.p.get("max_days", 21)) * 86400:
+                            self._persist()
+                            self.runs.pop(rid)
+                            self.db.execute("UPDATE mm_runs SET status='done', stopped_ts=?, note='max_days reached' WHERE id=?",
+                                            (self.clock(), rid))
+                    if not self.runs:
+                        break
                     self.step()
             except Exception as e:
                 self.state["errors"] += 1
                 self.state["last_error"] = f"{time.strftime('%H:%M:%S')} {e}"[:300]
-            self._stop.wait(max(1.0, poll - (time.time() - t0)))
+            self._stop.wait(max(1.0, self.poll_sec() - (time.time() - t0)))
         self.state["running"] = False
 
     def _trades(self, t: str) -> list[dict]:
@@ -707,19 +806,23 @@ class Shadow:
 
     def step(self):
         now = self.clock()
-        tickers = sorted(self.markets)
-        if now - self.mkt_ts > 300 or not self.mkt:
-            for m in self.client.markets(status=None, tickers=tickers, exclude_combos=False):
-                self.mkt[m["ticker"]] = m
+        holders: dict[str, list[Run]] = {}
+        for r in self.runs.values():
+            for t in r.markets:
+                holders.setdefault(t, []).append(r)
+        tickers = sorted(holders)
+        if now - self.mkt_ts > 300 or any(t not in self.mkt for t in tickers):
+            for i in range(0, len(tickers), 100):
+                for m in self.client.markets(status=None, tickers=tickers[i:i + 100], exclude_combos=False):
+                    self.mkt[m["ticker"]] = m
+                self.state["requests"] += 1
             self.mkt_ts = now
-            self.state["requests"] += 1
         books = {}
         for i in range(0, len(tickers), 20):
             books.update(self.client.orderbooks(tickers[i:i + 20]))
             self.state["requests"] += 1
-        max_dt = 3 * float(self.p.get("poll_sec", 10))
-        fills = []
-        mids = []
+        max_dt = 3 * self.poll_sec()
+        fills, mids = [], []
         for t in tickers:
             m = self.mkt.get(t) or {}
             ob = books.get(t) or {}
@@ -729,22 +832,23 @@ class Shadow:
             mid = (yb + 1 - nb) / 2 if yb and nb else None
             open_ = m.get("status") == "active"
             res = m.get("result")
-            sims = [self.sims[(t, md)] for md in MODELS]
-            trades = self._trades(t) if any(s.s["quotes"] for s in sims) else self._skip_trades(t, now)
+            sims = [(r, md, r.sims[(t, md)]) for r in holders[t] for md in MODELS]
+            trades = self._trades(t) if any(sm.s["quotes"] for _, _, sm in sims) else self._skip_trades(t, now)
             prev_mid = self.last_mid.get(t, mid)
-            for md, sim in zip(MODELS, sims):
+            for r, md, sim in sims:
                 for f in sim.apply_trades(trades):
-                    fills.append((self.run_id, t, md, f["ts"], f["side"], f["price"], f["count"], f["fee"], prev_mid, f["kind"]))
+                    fills.append((r.rid, t, md, f["ts"], f["side"], f["price"], f["count"], f["fee"], prev_mid, f["kind"]))
                 sim.accrue(now, yes_lv, no_lv, open_, max_dt)
                 if res in ("yes", "no"):
                     sim.settle(res)
                 sim.requote(now, m, yes_lv, no_lv)
             if mid is not None:
                 self.last_mid[t] = mid
-                w = self.mid_written.get(t)
-                if not w or abs(w[1] - mid) > EPS or now - w[0] >= 300:
-                    mids.append((self.run_id, t, now, mid, yb, 1 - nb))
-                    self.mid_written[t] = (now, mid)
+                for r in holders[t]:
+                    w = self.mid_written.get((r.rid, t))
+                    if not w or abs(w[1] - mid) > EPS or now - w[0] >= 300:
+                        mids.append((r.rid, t, now, mid, yb, 1 - nb))
+                        self.mid_written[(r.rid, t)] = (now, mid)
         with self.db.lock:
             if fills:
                 self.db.conn.executemany("INSERT INTO mm_fills VALUES(?,?,?,?,?,?,?,?,?,?)", fills)
@@ -757,26 +861,28 @@ class Shadow:
             self._persist()
 
     def _skip_trades(self, t, now) -> list:
-        """No quote was resting, so no trade could fill us: just move the cursor (saves a request)."""
+        """No quote was resting in any run, so no trade could fill us: just move the cursor (saves a request)."""
         self.cursor[t] = {"ts": now, "seen": []}
         return []
 
     def _persist(self):
         now = self.clock()
         rows = []
-        for (t, m), sim in self.sims.items():
-            s = dict(sim.s)
-            s["_cursor"] = self.cursor.get(t)
-            s["_mid"] = self.last_mid.get(t)
-            rows.append((self.run_id, t, m, json.dumps(s), now))
-        with self.db.lock:
-            self.db.conn.executemany("INSERT OR REPLACE INTO mm_state VALUES(?,?,?,?,?)", rows)
-            self.db.conn.commit()
+        for r in self.runs.values():
+            for (t, m), sim in r.sims.items():
+                s = dict(sim.s)
+                s["_mid"] = self.last_mid.get(t)
+                rows.append((r.rid, t, m, json.dumps(s), now))
+        if rows:
+            with self.db.lock:
+                self.db.conn.executemany("INSERT OR REPLACE INTO mm_state VALUES(?,?,?,?,?)", rows)
+                self.db.conn.commit()
         self.persist_ts = now
 
     # ---- report ------------------------------------------------------------------
     def status(self) -> dict:
-        return {**self.state, "run_id": self.run_id, "markets": len(self.markets),
+        return {**self.state, "run_id": self.run_id, "runs": sorted(self.runs),
+                "markets": len({t for r in self.runs.values() for t in r.markets}),
                 "alive": bool(self.thread and self.thread.is_alive())}
 
 
@@ -792,9 +898,9 @@ def report(wdb, run_id: int | None = None, live: Shadow | None = None, now: floa
         return None
     run = run[0]
     now = now or time.time()
-    if live and live.run_id == run_id:
+    if live and run_id in live.runs:
         with live.lock:
-            states = {(t, m): json.loads(json.dumps(sim.s)) for (t, m), sim in live.sims.items()}
+            states = {(t, m): json.loads(json.dumps(sim.s)) for (t, m), sim in live.runs[run_id].sims.items()}
             mids_now = dict(live.last_mid)
     else:
         states, mids_now = {}, {}
@@ -839,7 +945,9 @@ def report(wdb, run_id: int | None = None, live: Shadow | None = None, now: floa
                    "trading_pnl": round(trading, 2), "net": round(s["reward"] + trading, 2),
                    "quoted_pct": round(100 * s["quoted_sec"] / s["total_sec"], 1) if s["total_sec"] else None,
                    "eligible_pct": round(100 * s["elig_sec"] / s["total_sec"], 1) if s["total_sec"] else None,
-                   "jumps": s.get("jumps", 0), "settled": s.get("settled"), "max_capital": round(s.get("max_capital", 0.0), 2)}
+                   "jumps": s.get("jumps", 0), "bursts": s.get("bursts", 0), "fill_pauses": s.get("fill_pauses", 0),
+                   "settled": s.get("settled"), "max_capital": round(s.get("max_capital", 0.0), 2),
+                   "volume_24h": info.get("volume_24h")}
             per.append(row)
             for k in ("reward", "cost", "fees", "contracts", "fills", "total_sec", "elig_sec", "quoted_sec", "jumps"):
                 tot[k] += s.get(k, 0.0)
@@ -872,10 +980,12 @@ def report(wdb, run_id: int | None = None, live: Shadow | None = None, now: floa
             "markout_cents": {f"{h // 60}m": (round(100 * v[0] / v[1], 2) if v[1] else None) for h, v in mk_sum.items()},
             "quoted_pct": round(100 * tot["quoted_sec"] / tot["total_sec"], 1) if tot["total_sec"] else None,
             "eligible_pct": round(100 * tot["elig_sec"] / tot["total_sec"], 1) if tot["total_sec"] else None,
-            "jumps": int(tot["jumps"]), "max_capital_sum": round(sum(r["max_capital"] for r in per), 2),
+            "jumps": int(tot["jumps"]), "bursts": sum(r["bursts"] for r in per), "fill_pauses": sum(r["fill_pauses"] for r in per),
+            "max_capital_sum": round(sum(r["max_capital"] for r in per), 2),
             "markets": per,
         }
-    return {"run_id": run_id, "started": run["ts"], "stopped": run["stopped_ts"], "status": run["status"], "note": run["note"],
+    params = json.loads(run["params"])
+    return {"run_id": run_id, "name": params.get("name") or f"run #{run_id}", "started": run["ts"], "stopped": run["stopped_ts"], "status": run["status"], "note": run["note"],
             "days": round(days, 3), "params": json.loads(run["params"]), "markets": len(markets),
             "scan_est_daily": round(sum(m.get("scan_est_daily") or 0 for m in markets.values()), 2),
             "models": out_models}

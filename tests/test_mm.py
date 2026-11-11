@@ -173,6 +173,25 @@ def sim_tests():
     check("gaps longer than 3 polls are not credited", close(s.s["total_sec"], 40), s.s["total_sec"])
     s.accrue(5110, YES, [(0.58, 20.0)], True, 30)
     check("no reward for snapshots excluded by thin liquidity", close(s.s["elig_sec"], 40), s.s["elig_sec"])
+    # defences
+    d1 = mm.SimQuoter(INFO, {**P, "pull_after_fill_min": 10}, "touch")
+    d1.requote(6000, MK, YES, NO)
+    d1.apply_trades([tr(6001, 0.40, 5, "ask")])
+    d1.requote(6010, MK, YES, NO)
+    check("pull after fill: filled side stays out, other side keeps quoting", "yes" not in d1.s["quotes"] and "no" in d1.s["quotes"])
+    d1.requote(6602, MK, YES, NO)
+    check("pull after fill: side returns after the pause", "yes" in d1.s["quotes"])
+    d2 = mm.SimQuoter(INFO, {**P, "offset_ticks": 1}, "queue")
+    d2.requote(7000, MK, YES, NO)
+    check("offset: 1 tick behind on both sides, queue = size at that level", d2.s["quotes"]["yes"]["px"] == 0.39 and d2.s["quotes"]["yes"]["ahead"] == 200
+          and d2.s["quotes"]["no"]["px"] == 0.57)
+    check("offset: a trade at the best bid does not fill you", not d2.apply_trades([tr(7001, 0.40, 500, "ask")]))
+    d2.accrue(7000, YES, NO, True, 30)
+    d2.accrue(7010, YES, NO, True, 30)
+    # YES: walk reaches target 100 at .40, so our .39 bid doesn't qualify (0). NO: .58 (50) then .57 (200 + our 10)
+    # -> ours qualifies, df 1.0 -> share 10/260
+    exp = 0.001 * 10 * (0 + 10 / 260) / 2
+    check("offset: scored per Kalshi's walk (YES behind the walk earns 0, NO qualifies)", close(d2.s["reward"], exp, 1e-12), (d2.s["reward"], exp))
     s.settle("no")
     check("settled market: quotes dropped, value = payout", not s.s["quotes"] and s.value(0.5) == s.s["pos_no"])
 
@@ -230,10 +249,46 @@ def integration_tests(tmp):
     # restart: resume drops open quotes and continues
     sh2 = mm.Shadow(wdb, client=KalshiClient(base), req_per_sec=50, clock=lambda: clock["t"])
     sh2._spawn = lambda: None
-    check("resume picks up the running run", sh2.resume() == rid and sh2.sims[("KXA-1", "queue")].s["pos_yes"] == 10)
+    check("resume picks up the running run", sh2.resume() == [rid] and sh2.sims[("KXA-1", "queue")].s["pos_yes"] == 10)
     check("resume drops quotes that would have expired", not sh2.sims[("KXA-1", "queue")].s["quotes"])
     sh2.stop()
     check("stop marks the run stopped", wdb.query("SELECT status FROM mm_runs WHERE id=?", (rid,))[0]["status"] == "stopped")
+
+    # several runs share one feed: same market fetched once per poll, every run fills from the same trades
+    sh3 = mm.Shadow(wdb, client=KalshiClient(base), req_per_sec=50, clock=lambda: clock["t"])
+    sh3._spawn = lambda: None
+    st["public_trades"] = []
+    ids = sh3.start_set(sc, {"n_markets": 5, "size": 10, "poll_sec": 10, "per_series": 3})
+    names = [json.loads(r["params"])["name"] for r in wdb.query(f"SELECT params FROM mm_runs WHERE id IN ({','.join(map(str, ids))}) ORDER BY id")]
+    check("variant set: quiet-market preset skipped when no market qualifies (mock volume 500)",
+          len(ids) == 3 and not any("quiet" in n for n in names) and any("quiet" in x for x in sh3.last_skipped), (names, sh3.last_skipped))
+    clock["t"] += 10
+    sh3.step()
+    off = next(r for r in sh3.runs.values() if r.p.get("offset_ticks"))
+    base_run = next(r for r in sh3.runs.values() if "baseline" in r.p["name"])
+    check("1c-behind variant quotes 1 tick below the best bid", off.sims[("KXA-1", "queue")].s["quotes"]["yes"]["px"] == 0.49
+          and base_run.sims[("KXA-1", "queue")].s["quotes"]["yes"]["px"] == 0.50, off.sims[("KXA-1", "queue")].s["quotes"])
+    calls_before = len(mock.state.calls)
+    clock["t"] += 10
+    st["public_trades"] = [{"trade_id": "y1", "ticker": "KXA-1", "created_time": iso(clock["t"] - 2), "yes_price_dollars": "0.4500",
+                            "count_fp": "250.00", "taker_book_side": "ask"}]
+    sh3.step()
+    tr_calls = [c_ for c_ in mock.state.calls[calls_before:] if c_[1].endswith("/markets/trades")]
+    check("shared feed: one trades request per market per poll for all runs", len(tr_calls) == 1, tr_calls)
+    pull = next(r for r in sh3.runs.values() if r.p.get("pull_after_fill_min"))
+    ps = pull.sims[("KXA-1", "queue")].s
+    check("every run fills from the same trade", all(r.sims[("KXA-1", "queue")].s["pos_yes"] == 10 for r in sh3.runs.values()))
+    check("pull variant: burst (250 >= 200 contracts) pulls both sides and cools down", ps["bursts"] == 1 and not ps["quotes"]
+          and ps["cooldown_until"] > clock["t"], ps)
+    check("pull variant: YES side paused after its fill", ps["side_pause"].get("yes", 0) > clock["t"] and ps["fill_pauses"] >= 1, ps)
+    check("baseline keeps quoting after the same trade", "yes" in base_run.sims[("KXA-1", "queue")].s["quotes"])
+    reps = [mm.report(wdb, i, live=sh3, now=clock["t"]) for i in ids]
+    check("reports per run carry the variant name", all(r["name"] for r in reps) and len(reps) == 3)
+    sh3.stop(ids[0])
+    check("stop one run keeps the others", ids[0] not in sh3.runs and len(sh3.runs) == 2
+          and wdb.query("SELECT status FROM mm_runs WHERE id=?", (ids[0],))[0]["status"] == "stopped")
+    sh3.stop()
+    check("stop all", not sh3.runs)
 
     # API
     from fastapi.testclient import TestClient
@@ -261,7 +316,15 @@ def integration_tests(tmp):
     check("scan rows endpoint", len(c.get("/api/mm/scan/rows?size=10&all=1").json()["rows"]) == 2)
     r = c.post("/api/mm/shadow/start", headers=H, json={"n_markets": 99, "size": 10, "poll_sec": 1})
     check("shadow start clamps params", r.status_code == 200 and r.json()["params"]["n_markets"] == 40 and r.json()["params"]["poll_sec"] == 5, r.text)
-    check("second shadow start refused while running", c.post("/api/mm/shadow/start", headers=H, json={}).status_code == 409)
+    r2 = c.post("/api/mm/shadow/start", headers=H, json={"name": "behind", "offset_ticks": 9})
+    check("a second run can start alongside (offset clamped to 5)", r2.status_code == 200 and r2.json()["params"]["offset_ticks"] == 5
+          and len(app.state.mm[1].runs) == 2, r2.text)
+    r3 = c.post("/api/mm/shadow/start_set", headers=H, json={"n_markets": 5})
+    check("variant set via API (quiet preset skipped on the mock)", r3.status_code == 200 and len(r3.json()["ids"]) == 3 and r3.json()["skipped"], r3.text)
+    check("shadow re-places like the live quoter (quote lifetime - 60s)", r3.json()["params"]["requeue_sec"] == 540)
+    time.sleep(0.5)
+    j = c.get("/api/mm").json()
+    check("status lists every run", len(j["shadow"]["runs"]) == 5 and len(j["reports"]) == 5, j["shadow"])
     time.sleep(0.5)
     check("shadow stop", c.post("/api/mm/shadow/stop", headers=H).status_code == 200 and not app.state.mm[1].status()["alive"])
     check("report endpoint", c.get("/api/mm/report").status_code == 200)

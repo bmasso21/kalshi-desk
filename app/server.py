@@ -542,9 +542,13 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     def mm_status():
         sc = mm_scanner.latest()
         if time.time() - mm_cache["ts"] > 60 or mm_cache["r"] is None:
-            mm_cache["r"], mm_cache["ts"] = mmod.report(wdb, live=mm_shadow), time.time()
-        return {"scan": sc, "scan_running": mm_scanner.running, "shadow": mm_shadow.status(), "report": mm_cache["r"],
-                "runs": wdb.query("SELECT id, ts, status, stopped_ts, note, scan_id FROM mm_runs ORDER BY id DESC LIMIT 20")}
+            ids = sorted(mm_shadow.runs) or [r["id"] for r in wdb.query("SELECT id FROM mm_runs ORDER BY id DESC LIMIT 1")]
+            mm_cache["r"] = [x for x in (mmod.report(wdb, i, live=mm_shadow) for i in ids) if x]
+            mm_cache["ts"] = time.time()
+        reps = mm_cache["r"]
+        return {"scan": sc, "scan_running": mm_scanner.running, "shadow": mm_shadow.status(), "reports": reps,
+                "report": reps[-1] if reps else None,
+                "runs": wdb.query("SELECT id, ts, status, stopped_ts, note, scan_id, params FROM mm_runs ORDER BY id DESC LIMIT 30")}
 
     @app.post("/api/mm/scan")
     def mm_scan():
@@ -563,17 +567,27 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                                                             sort if sort in ("per_capital", "daily", "pool") else "per_capital",
                                                             quoter_ok_only=not all)}
 
-    @app.post("/api/mm/shadow/start")
-    async def mm_shadow_start(request: Request):
-        b = await request.json()
+    def _mm_base(b: dict) -> dict:
         p = {"n_markets": max(1, min(40, int(b.get("n_markets") or 20))),
              "size": max(1, min(500, int(b.get("size") or cfg.quoter.get("size") or 10))),
-             "poll_sec": max(5, min(120, int(b.get("poll_sec") or 10))),
+             "poll_sec": max(5, min(120, int(b.get("poll_sec") or 15))),
              "max_days": max(1, min(60, float(b.get("max_days") or 21))),
              "per_series": max(1, min(40, int(b.get("per_series") or 3)))}
         for k in ("max_inventory", "pull_hours", "jump_cents", "cooldown_min", "refresh_sec", "min_mid", "max_mid", "max_spread"):
             p[k] = cfg.quoter.get(k)
         p["requeue_sec"] = max(60, float(cfg.quoter.get("quote_ttl_sec") or 600) - 60)   # same re-placement as the live quoter
+        return p
+
+    @app.post("/api/mm/shadow/start")
+    async def mm_shadow_start(request: Request):
+        b = await request.json()
+        p = _mm_base(b)
+        for k, lo, hi in (("offset_ticks", 0, 5), ("max_volume_24h", 0, 10 ** 9), ("pull_after_fill_min", 0, 240),
+                          ("burst_contracts", 0, 10 ** 7), ("burst_pull_min", 1, 240)):
+            if b.get(k) is not None:
+                p[k] = max(lo, min(hi, float(b[k])))
+        if b.get("name"):
+            p["name"] = str(b["name"])[:80]
         try:
             rid = mm_shadow.start(mm_scanner, p)
         except RuntimeError as e:
@@ -582,11 +596,24 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         db.audit("mm_shadow_start", json.dumps(p))
         return {"id": rid, "params": p}
 
-    @app.post("/api/mm/shadow/stop")
-    def mm_shadow_stop():
-        mm_shadow.stop()
+    @app.post("/api/mm/shadow/start_set")
+    async def mm_shadow_start_set(request: Request):
+        b = await request.json()
+        p = _mm_base(b)
+        try:
+            ids = mm_shadow.start_set(mm_scanner, p)
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
         mm_cache["ts"] = 0
-        db.audit("mm_shadow_stop", "")
+        skipped = getattr(mm_shadow, "last_skipped", [])
+        db.audit("mm_shadow_start_set", json.dumps({"ids": ids, "skipped": skipped, **p}))
+        return {"ids": ids, "skipped": skipped, "params": p}
+
+    @app.post("/api/mm/shadow/stop")
+    def mm_shadow_stop(run: int = 0):
+        mm_shadow.stop(run or None)
+        mm_cache["ts"] = 0
+        db.audit("mm_shadow_stop", str(run or "all"))
         return {"ok": True}
 
     @app.get("/api/mm/report")

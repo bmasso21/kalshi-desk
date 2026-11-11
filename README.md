@@ -125,6 +125,11 @@ blend behind the *hourly* markets, not what the daily markets settle on, so v2.1
   fills under **queue** (back of the queue; conservative) and **touch** (optimistic) models, maker fees, inventory
   marked to the mid, net, and 1/10/60-minute markouts (adverse selection). It survives app restarts (open virtual
   quotes are dropped, as real ones would expire) and stops itself after 21 days.
+- **Variant set** (v2.3.3): several paper runs side by side on one shared feed (identical data): *baseline* (live
+  quoter settings), *quiet markets only* (<= 10 contracts traded in 24h), *1c behind the best bid* (fewer informed
+  fills, but Kalshi's walk often reaches Target Size above you, which then pays nothing), and *pull after fills /
+  bursts* (stop a side 10 min after it fills; pull both sides 10 min after 200+ contracts trade in one poll).
+  Compared under both fill models; stop runs individually.
 - The liquidity program is listed through **Jan 1, 2027**; Kalshi can extend, change or end it.
 - The quoter's market picker now uses the same scoring (it used a simpler size ratio).
 - Backtester: filled/expired orders are dropped from the matching loop (same results, much faster on long runs).
