@@ -109,7 +109,8 @@ DEFAULTS = {
         "enabled": True,                # collect data only; no trading
         "sync_interval_min": 20,
         "lookback_days": 130,
-        "request_gap_sec": 0.4,
+        "request_gap_sec": 1.0,         # IEM rate-limits; it also backs off on HTTP 429
+        "backoff_sec": [20, 60, 180],
     },
     # --- scanner ----------------------------------------------------------
     "scanner": {

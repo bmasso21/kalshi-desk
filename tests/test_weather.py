@@ -334,6 +334,9 @@ def main():
                 rts = W._ts(rt) if rt else int(utc(2026, 11, 11, 12))
                 return Resp(200, NBS_HEADER + "\n" + nbs_line("KMDW", rts, rts + 6 * H, 50, ""))
             if url.endswith("/cgi-bin/request/asos.py"):
+                self.asos = getattr(self, "asos", 0) + 1
+                if self.asos in (1, 2) and getattr(self, "throttle", False):
+                    return Resp(429, "Too many requests from your IP address, slow down.")
                 return Resp(200, "station,valid,tmpf\nMDW,2026-11-10 12:00,44.0\n")
             if url.endswith("/json/cli.py"):
                 return Resp(200, js={"results": [{"valid": "2026-11-10", "high": 66, "low": 42, "product": "p"}]})
@@ -350,18 +353,21 @@ def main():
 
     class E:
         class cfg:
-            data = {"weather": {"request_gap_sec": 0}}
+            data = {"weather": {"request_gap_sec": 0, "backoff_sec": [0, 0]}}
 
         class db:
             @staticmethod
             def audit(*a):
                 pass
     sess = Sess()
+    sess.throttle = True
     col = W.WxCollector(E, W.WxStore(db2), session=sess)
     st = col.sync(now=now)
     cnt = W.WxStore(db2).counts()
     check("collector: NBS runs backfilled (404 run tolerated)", cnt["nbs_runs"] >= 20 and st["errors"] == 0, (cnt, st, col.state))
     check("collector: obs + CLI stored", cnt["obs_rows"] == 1 and cnt["cli_days"] == 1, cnt)
+    check("collector: HTTP 429 -> backs off and retries", col.state.get("throttled") == 2 and sess.asos >= 3, (col.state.get("throttled"), sess.asos))
+    check("collector: obs coverage marker advances only on success", db2.get("wx_obs_done_MDW") is not None)
     check("collector: unmapped station reported, not fetched", col.state["unmapped"] == ["XYZ"] and
           not any("XYZ" in json.dumps(c[1]) for c in sess.calls))
     check("collector: run first-seen time recorded (publish-lag check)", db2.query("SELECT count(*) n FROM wx_runs")[0]["n"] == 1)
@@ -398,7 +404,7 @@ def main():
     b = c.get("/api/weather/board?days=2").json()
     check("API board responds (no open events in synthetic past world)", b["events"] == [] and "note" in b)
     check("API eval needs the CSRF token", c.post("/api/weather/eval").status_code in (401, 403))
-    check("version 2.1.1", c.get("/api/session").status_code == 200 and __import__("app").__version__ == "2.1.1")
+    check("version 2.1.2", c.get("/api/session").status_code == 200 and __import__("app").__version__ == "2.1.2")
     check("weather collection never places orders", not app.state.engine.db.query("SELECT 1 FROM orders_log LIMIT 1"))
     del tok
 

@@ -217,9 +217,17 @@ class WxCollector:
         return (self.e.cfg.data.get("weather") or {}) if self.e else {}
 
     def _get(self, path, params, timeout=60):
-        self.state["requests"] += 1
-        time.sleep(float(self.cfg.get("request_gap_sec", 0.4)))
-        r = self.http.get(IEM + path, params=params, timeout=timeout)
+        """GET with a polite gap between requests; backs off and retries when IEM says 'too many requests'."""
+        waits = [float(x) for x in self.cfg.get("backoff_sec", [20, 60, 180])]
+        for attempt in range(len(waits) + 1):
+            self.state["requests"] += 1
+            time.sleep(float(self.cfg.get("request_gap_sec", 1.0)))
+            r = self.http.get(IEM + path, params=params, timeout=timeout)
+            if r.status_code not in (429, 503) or attempt == len(waits):
+                return r
+            self.state["throttled"] = self.state.get("throttled", 0) + 1
+            if self._stop.wait(waits[attempt]):
+                return r
         return r
 
     # ---- NBS ----
@@ -266,7 +274,7 @@ class WxCollector:
         b = dt.datetime.fromtimestamp(end, dt.timezone.utc)
         params = [("station", asos_id), ("data", "tmpf"), ("tz", "Etc/UTC"), ("format", "onlycomma"),
                   ("latlon", "no"), ("missing", "M"), ("trace", "T"), ("direct", "no"),
-                  ("report_type", "1"), ("report_type", "3"), ("report_type", "4"),
+                  ("report_type", "3"), ("report_type", "4"),      # routine + special METARs (5-min feed often has no temp)
                   ("year1", a.year), ("month1", a.month), ("day1", a.day), ("hour1", a.hour),
                   ("year2", b.year), ("month2", b.month), ("day2", b.day), ("hour2", b.hour)]
         r = self._get("/cgi-bin/request/asos.py", params, timeout=180)
@@ -353,16 +361,18 @@ class WxCollector:
                 if self._stop.is_set():
                     break
                 aid = STATIONS[c][1]
-                last = self.store.db.query("SELECT max(ts) t FROM wx_obs WHERE station=?", (aid,))[0]["t"]
-                a = max(start, (last or start) - 36 * 3600)
+                done = self.store.db.get(f"wx_obs_done_{aid}")      # contiguous coverage; advances only on success
+                a = max(start, (done or start) - 36 * 3600)
                 while a < now and not self._stop.is_set():
-                    b = min(now + 3600, a + 20 * 86400)
+                    b = min(now + 3600, a + 30 * 86400)
                     self.state["progress"] = f"obs {j + 1}/{len(clis)} {c}"
                     try:
                         stats["obs_rows"] += self.store.add_obs(self.fetch_obs(aid, a, b))
+                        self.store.db.put(f"wx_obs_done_{aid}", min(b, now))
                     except Exception as e:
                         stats["errors"] += 1
                         self.state["error"] = f"obs {c}: {e}"
+                        break                                       # resume from here next sync
                     a = b
             # 3) climate reports (this year and, early in the year, last year)
             self.state["phase"] = "climate reports"
