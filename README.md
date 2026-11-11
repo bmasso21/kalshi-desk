@@ -70,6 +70,19 @@ Settings → **Phone alerts**: paste your Pushover **user key** and an **applica
 
 **Whole machine offline.** Nothing on this computer can report that it lost power or internet. For that, create a free check at healthchecks.io (period 5 min), turn on its Pushover integration, and paste its ping URL into *Heartbeat URL*; the app pings it every minute.
 
+### Research: data warehouse + backtester (v1.4)
+**Research** tab.
+
+*Warehouse* (`warehouse.db`). Collects Kalshi **production public** market data - no key, no account access, no orders - because demo books are nearly empty. Trading stays on demo. In scope by default: the *Climate and Weather* category, last 120 days (change categories / series / lookback on the tab). Stores markets (times, result, settlement value, volume), series fee types, every public trade, hourly YES bid / YES ask / price candles, and top-of-book changes recorded live from the WebSocket feed. Kalshi moves older data to `/historical/*` endpoints after a cutoff (`GET /historical/cutoff`); the collector routes each request to the right tier and normalises the field names. Runs hourly in the background at 3 requests/second; completed markets are never re-downloaded.
+
+*Backtester*. Replays each market hour by hour. At each hourly close the strategy sees only the past (the result is hidden until settlement).
+- **Taker** orders fill at that close's ask (+ optional slippage) and pay the taker fee.
+- **Maker** orders rest at their price and only fill from later real trades, limited to each trade's size: **conservative** = a trade printed *through* your price; **optimistic** = also trades *at* your price on your counterparty's side. Results are shown under both, because nobody knows the real queue position.
+- Fees use each series' fee type, rounded up per fill. Settlement pays $1 per winning contract.
+- Reports: net P&L, fees, ROI, P&L per contract, average **closing-line value** (fill vs last trade before close), win rate, max drawdown, daily Sharpe, equity curve, and a per-series table.
+
+Built-in reference strategies: `favorite_late` (taker; favourite-longshot bias test) and `maker_join` (the quoter's logic without rewards = its adverse-selection cost). Phase 2 strategies plug into the same engine.
+
 ### Updating a running install
 Drop an empty file named `restart.request` next to `run.py`. The app cancels quoter orders, exits, and the boot task restarts it about 15 seconds later.
 

@@ -46,7 +46,7 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
   <span id="feedPill" class="pill" title="">feed …</span>
   <nav id="nav">
     <button data-t="scanner" class="on">Scanner</button><button data-t="markets">Markets</button>
-    <button data-t="rewards">Rewards</button><button data-t="portfolio">Portfolio</button><button data-t="ledger">Ledger</button><button data-t="settings">Settings</button>
+    <button data-t="rewards">Rewards</button><button data-t="portfolio">Portfolio</button><button data-t="ledger">Ledger</button><button data-t="research">Research</button><button data-t="settings">Settings</button>
   </nav>
   <span class="spacer"></span>
   <span id="scanInfo" class="mut" style="font-size:12px"></span>
@@ -96,6 +96,12 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
   <div class="card"><h3 style="margin-top:0">Audit</h3><table><tbody id="auditBody"></tbody></table></div>
 </section>
 <!-- SETTINGS -->
+<section id="t-research" class="hide">
+  <div class="card"><h3 style="margin-top:0">Data warehouse</h3><div id="whBox" class="mut">Loading…</div></div>
+  <div class="card"><h3 style="margin-top:0">Run a backtest</h3><div id="btForm"></div></div>
+  <div class="card"><h3 style="margin-top:0">Backtests</h3><table><thead><tr><th>#</th><th>When</th><th>Strategy</th><th>Status</th><th class="r">Markets</th><th>Results (conservative / optimistic fills)</th></tr></thead><tbody id="btBody"></tbody></table></div>
+  <div id="btDetail"></div>
+</section>
 <section id="t-settings" class="hide"><div id="settingsBox"></div></section>
 </main>
 <div id="toast"></div>
@@ -112,7 +118,7 @@ async function api(u,o={}){o.headers={'Content-Type':'application/json','X-Desk-
 // tabs
 document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x===b));
   document.querySelectorAll('main>section').forEach(s=>s.classList.toggle('hide',s.id!=='t-'+b.dataset.t));
-  ({scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:loadRewards,portfolio:loadPortfolio,ledger:loadLedger,settings:loadSettings})[b.dataset.t]()});
+  ({scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:loadRewards,portfolio:loadPortfolio,ledger:loadLedger,research:loadResearch,settings:loadSettings})[b.dataset.t]()});
 async function loadRewards(){try{const [q,r]=await Promise.all([api('/api/quoter'),api('/api/rewards')]);const st=q.state;
   $('#qState').innerHTML=(q.config.enabled?(st.running?'<b class="y">RUNNING</b>':'<b class="w">enabled, not running (kill switch or no key)</b>'):'<b class="mut">OFF</b>')+` · ${q.env.toUpperCase()} · ${st.resting} quotes resting · $${st.committed} committed / $${q.config.max_capital} cap`+(st.error?` · <span class="n">${esc(st.error)}</span>`:'');
   $('#qSel').innerHTML=q.selected.map(s=>`<tr><td><a href="#" onclick="openMarket('${esc(s.ticker)}');return false">${esc(s.title)}</a> <span class="mut">${esc(s.sub||'')} · ${esc(s.ticker)}</span></td><td class="r">$${esc(s.daily_reward)}</td><td class="r">${esc(s.share)}%</td><td class="r y">$${esc(s.est_daily)}</td></tr>`).join('')||'<tr><td colspan=4 class="mut">None yet (quoter off, or no pools meet your minimum)</td></tr>';
@@ -275,6 +281,40 @@ async function saveSettings(){const v=id=>+$('#'+id).value,env=$('#sEnv').value;
   if(patch.auto.enabled&&!CFG.auto.enabled&&!confirm('Turn ON auto-trading? Orders will be placed without asking you.'))return;
   if(patch.quoter.enabled&&!CFG.quoter.enabled&&!confirm(`Turn ON the liquidity quoter in ${env.toUpperCase()}? It will place and cancel resting orders automatically.`))return;
   try{const r=await api('/api/config',{method:'POST',body:patch});toast(r.authenticated?'Saved – API key is working':'Saved – no working key for '+r.config.env.toUpperCase()+' yet','ok');loadSettings();status()}catch(e){toast(e.message,'err');loadSettings();status()}}
+// research
+let STRATS=[];
+async function loadResearch(){try{const j=await api('/api/research');STRATS=j.strategies;const w=j.warehouse,c=w.counts,cf=w.config;
+  $('#whBox').innerHTML=`<div class="row" style="gap:22px">${[['Markets',c.markets],['Settled',c.settled_markets],['Trades',c.trades],['Candles',c.candles],['Live ticks',c.ticks],['Series',c.series]].map(([k,v])=>`<div><div class="mut">${k}</div><div class="big">${Number(v).toLocaleString()}</div></div>`).join('')}</div>
+   <p class="mut" style="font-size:12px">Source: Kalshi production <b>public</b> market data (no key, no account access). Trading stays on ${esc(CFG?CFG.env.toUpperCase():'')}.
+   ${w.running?'<span class="w">Syncing: '+esc(w.phase)+' '+esc(w.progress)+'</span>':'Idle.'} Last sync ${w.last_sync?new Date(w.last_sync*1000).toLocaleString()+' ('+w.last_duration+'s)':'never'}${w.error?' · <span class="n">'+esc(w.error)+'</span>':''}</p>
+   <div class="row"><label class="f" style="flex:1">Categories (comma separated)<input id="whCats" value="${esc((cf.categories||[]).join(', '))}"></label>
+   <label class="f" style="flex:1">Only series tagged (blank = all)<input id="whTags" value="${esc((cf.tags||[]).join(', '))}"></label>
+   <label class="f" style="flex:1">Extra series tickers<input id="whSer" value="${esc((cf.series||[]).join(', '))}"></label>
+   <label class="f">Lookback days<input id="whLb" type="number" value="${cf.lookback_days}" style="width:80px"></label>
+   <button class="b" onclick="saveWh()">Save scope</button><button class="b pri" onclick="api('/api/research/sync',{method:'POST'}).then(()=>{toast('Sync started');setTimeout(loadResearch,1500)})">Sync now</button></div>`;
+  if(!$('#btStrat'))$('#btForm').innerHTML=`<div class="row"><label class="f">Strategy<select id="btStrat" onchange="btDefaults()">${STRATS.map(x=>`<option>${x.name}</option>`).join('')}</select></label>
+   <label class="f" style="flex:1">Parameters (JSON)<input id="btParams" style="width:100%"></label></div><p id="btDesc" class="mut" style="font-size:12px"></p>
+   <div class="row"><label class="f">Categories<input id="btCats" placeholder="all in warehouse" style="width:200px"></label><label class="f">Series<input id="btSer" placeholder="all" style="width:160px"></label>
+   <label class="f">From<input id="btFrom" type="date"></label><label class="f">To<input id="btTo" type="date"></label><label class="f">Min volume<input id="btVol" type="number" value="0" style="width:90px"></label>
+   <label class="f">Taker slippage (¢)<input id="btSlip" type="number" value="0" step="0.5" style="width:70px"></label><button class="b pri" onclick="runBt()">Run backtest</button></div>`,btDefaults();
+  loadBts()}catch(e){toast(e.message,'err')}}
+function btDefaults(){const s=STRATS.find(x=>x.name===$('#btStrat').value);$('#btParams').value=JSON.stringify(s.defaults);$('#btDesc').textContent=s.description}
+async function saveWh(){const sp=v=>v.split(',').map(x=>x.trim()).filter(Boolean);try{await api('/api/config',{method:'POST',body:{warehouse:{categories:sp($('#whCats').value),tags:sp($('#whTags').value),series:sp($('#whSer').value),lookback_days:+$('#whLb').value}}});toast('Scope saved – click Sync now to collect','ok');loadResearch()}catch(e){toast(e.message,'err')}}
+async function runBt(){let params;try{params=JSON.parse($('#btParams').value||'{}')}catch(e){toast('Parameters must be valid JSON','err');return}
+  const sp=v=>v.split(',').map(x=>x.trim()).filter(Boolean),f={};if($('#btCats').value.trim())f.categories=sp($('#btCats').value);if($('#btSer').value.trim())f.series=sp($('#btSer').value);
+  if($('#btFrom').value)f.start_ts=Date.parse($('#btFrom').value)/1000;if($('#btTo').value)f.end_ts=Date.parse($('#btTo').value)/1000+86399;if(+$('#btVol').value)f.min_volume=+$('#btVol').value;
+  try{const r=await api('/api/backtests',{method:'POST',body:{strategy:$('#btStrat').value,params,filters:f,slippage_cents:+$('#btSlip').value}});toast('Backtest #'+r.id+' started','ok');setTimeout(loadBts,1500)}catch(e){toast(e.message,'err')}}
+const pct=v=>v==null?'–':(100*v).toFixed(1)+'%';
+async function loadBts(){const j=await api('/api/backtests');$('#btBody').innerHTML=j.backtests.map(b=>`<tr><td><a href="#" onclick="showBt(${b.id});return false">${b.id}</a></td><td>${ts(b.ts)}</td><td>${esc(b.strategy)}</td><td class="${b.status==='done'?'y':b.status==='error'?'n':'w'}">${b.status}${b.duration?' ('+b.duration+'s)':''}</td><td class="r">${b.markets_in_scope??''}</td>
+  <td style="font-size:12px">${Object.entries(b.summary||{}).map(([m,v])=>`<b>${m}</b>: ${v.markets_traded} mkts, ${v.contracts} ctr, P&amp;L <span class="${v.pnl<0?'n':'y'}">${money(v.pnl)}</span>, ROI ${pct(v.roi)}, CLV ${v.avg_clv_cents??'–'}¢`).join('<br>')}</td></tr>`).join('')||'<tr><td colspan=6 class="mut">No backtests yet</td></tr>';
+  if(j.backtests.some(b=>b.status==='running'))setTimeout(loadBts,4000)}
+function curve(c){if(!c||c.length<2)return'';const W=600,H=120,ys=c.map(x=>x[1]),mn=Math.min(0,...ys),mx=Math.max(0,...ys),sx=i=>i*W/(c.length-1),sy=v=>H-(v-mn)/((mx-mn)||1)*H;
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;height:${H}px;background:#0c0f11;border-radius:6px"><line x1="0" x2="${W}" y1="${sy(0)}" y2="${sy(0)}" stroke="#333"/><polyline fill="none" stroke="${ys[ys.length-1]<0?'var(--no)':'var(--yes)'}" stroke-width="2" points="${c.map((x,i)=>sx(i)+','+sy(x[1])).join(' ')}"/></svg>`}
+async function showBt(id){const b=await api('/api/backtests/'+id);if(b.status!=='done'){$('#btDetail').innerHTML=`<div class="card"><b>#${id}</b> ${b.status}<pre class="n" style="white-space:pre-wrap">${esc(b.error||'')}</pre></div>`;return}
+  const R=b.results;$('#btDetail').innerHTML=Object.entries(R.models).map(([m,v])=>`<div class="card"><h3 style="margin-top:0">#${id} ${esc(R.strategy)} · ${m==='through'?'conservative fills (trades through your price)':'optimistic fills (trades at your price)'}</h3>
+   <div class="row" style="gap:22px">${[['Markets traded',v.markets_traded+' / '+v.markets_simulated],['Contracts',v.contracts],['Cost',money(v.cost)],['Fees',money(v.fees)],['Net P&L',money(v.pnl)],['ROI',pct(v.roi)],['P&L / contract',(v.pnl_per_contract_cents??'–')+'¢'],['Avg CLV',(v.avg_clv_cents??'–')+'¢'],['Win rate',pct(v.win_rate_markets)],['Max drawdown',money(v.max_drawdown)],['Sharpe (daily, ann.)',v.sharpe_daily_annualized??'–']].map(([k,x])=>`<div><div class="mut">${k}</div><div class="big" style="font-size:18px">${x}</div></div>`).join('')}</div>
+   ${curve(v.equity_curve)}<div class="mut" style="font-size:12px">Params ${esc(JSON.stringify(R.params))} · filters ${esc(JSON.stringify(R.filters))} · slippage ${R.slippage_cents}¢</div>
+   <table style="margin-top:8px"><thead><tr><th>Series</th><th class="r">Markets</th><th class="r">Contracts</th><th class="r">Fees</th><th class="r">P&amp;L</th><th class="r">ROI</th><th class="r">CLV</th></tr></thead><tbody>${Object.entries(v.by_series).slice(0,40).map(([k,x])=>`<tr><td>${esc(k)}</td><td class="r">${x.markets}</td><td class="r">${x.contracts.toFixed(0)}</td><td class="r">${money(x.fees)}</td><td class="r ${x.pnl<0?'n':'y'}">${money(x.pnl)}</td><td class="r">${pct(x.roi)}</td><td class="r">${x.avg_clv_cents==null?'–':x.avg_clv_cents.toFixed(2)+'¢'}</td></tr>`).join('')}</tbody></table></div>`).join('')}
 // boot
 (async()=>{const s=await api('/api/session');TOKEN=s.token;CFG=(await api('/api/config')).config;status();loadSignals();loadCats();setInterval(status,5000);setInterval(()=>{if(!$('#t-scanner').classList.contains('hide'))loadSignals()},20000)})();
 </script>

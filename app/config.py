@@ -83,6 +83,20 @@ DEFAULTS = {
         "healthcheck_url": "",          # optional dead-man ping (e.g. healthchecks.io) every minute
         "api_url_override": "",         # testing only
     },
+    # --- research data warehouse (production PUBLIC market data, no key) ------
+    "warehouse": {
+        "enabled": True,
+        "categories": ["Climate and Weather"],
+        "tags": ["Daily temperature"],  # only series in those categories with one of these tags ([] = all)
+        "series": [],                   # extra series tickers to collect (no tag filter)
+        "lookback_days": 120,
+        "req_per_sec": 3,
+        "candle_period": 60,            # minutes (1, 60 or 1440)
+        "sync_interval_min": 60,
+        "record_ticks": True,           # top-of-book changes from the live feed
+        "max_hist_pages": 20,
+        "base_url_override": "",        # testing only
+    },
     # --- scanner ----------------------------------------------------------
     "scanner": {
         "interval_sec": 120,

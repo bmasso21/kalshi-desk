@@ -26,8 +26,16 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     cfg = cfg or Config()
     db = db or DB()
     eng = Engine(cfg, db)
+    from .backtest import STRATEGIES, Backtester
+    from .warehouse import Warehouse, WarehouseDB
+    wdb = WarehouseDB(cfg.path.parent / "warehouse.db")
+    eng.warehouse = Warehouse(eng, wdb)
+    eng.feed.listeners.append(eng.warehouse.on_feed)
+    bt = Backtester(wdb)
     app = FastAPI(title="Kalshi Desk", version=__version__)
     app.state.engine = eng
+    app.state.backtester = bt
+    app.state.wdb = wdb
     session_token = secrets.token_urlsafe(24)  # CSRF guard for state-changing calls
     prod_confirms: dict[str, float] = {}
 
@@ -35,10 +43,12 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     def _start():
         if start_engine:
             eng.start()
+            eng.warehouse.start()
             eng.alerts.startup(__version__)
 
     @app.on_event("shutdown")
     def _stop():
+        eng.warehouse.stop()
         eng.stop()
 
     @app.exception_handler(KalshiError)
@@ -116,6 +126,28 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 except Exception:
                     patch.pop(pk)
                     errors.append(f"{e} key file is not a valid private key: {p}")
+        if isinstance(patch.get("warehouse"), dict):
+            w = patch["warehouse"]
+            w.pop("base_url_override", None)         # test-only, never from the browser
+            for k in ("categories", "series", "tags"):
+                if k in w:
+                    if not isinstance(w[k], list) or not all(isinstance(x, str) and 0 < len(x) < 80 for x in w[k]):
+                        w.pop(k)
+                        errors.append(f"warehouse {k} must be a list of names")
+                    else:
+                        w[k] = [x.strip() for x in w[k] if x.strip()]
+            for k, lo, hi in (("lookback_days", 1, 730), ("req_per_sec", 0.5, 10), ("sync_interval_min", 10, 1440)):
+                if k in w:
+                    try:
+                        v = float(w[k])
+                        assert lo <= v <= hi
+                        w[k] = v
+                    except Exception:
+                        w.pop(k)
+                        errors.append(f"warehouse {k} must be between {lo} and {hi}")
+            if "candle_period" in w and int(w.get("candle_period") or 0) not in (1, 60, 1440):
+                w.pop("candle_period")
+                errors.append("candle_period must be 1, 60 or 1440")
         if isinstance(patch.get("alerts"), dict):
             al = patch["alerts"]
             for k, label in (("pushover_user", "Pushover user key"), ("pushover_token", "Pushover API token")):
@@ -193,6 +225,53 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     @app.get("/api/alerts/summary_preview")
     def alerts_summary_preview():
         return {"text": eng.alerts.summary_text()}
+
+    # ------------------------------------------------------------ research --
+    @app.get("/api/research")
+    def research():
+        return {"warehouse": eng.warehouse.status(),
+                "strategies": [{"name": k, "description": v.description, "defaults": v.defaults,
+                                "uses_maker": v.uses_maker} for k, v in STRATEGIES.items()]}
+
+    @app.post("/api/research/sync")
+    def research_sync():
+        eng.warehouse.trigger()
+        return {"ok": True}
+
+    @app.get("/api/backtests")
+    def backtests():
+        rows = wdb.query("SELECT id,ts,strategy,params,filters,status,error,duration,results FROM wh_backtests "
+                         "ORDER BY id DESC LIMIT 100")
+        for r in rows:
+            res = json.loads(r.pop("results") or "{}")
+            r["params"] = json.loads(r["params"] or "{}")
+            r["filters"] = json.loads(r["filters"] or "{}")
+            r["summary"] = {m: {k: v.get(k) for k in ("markets_traded", "fills", "contracts", "pnl", "roi", "fees",
+                                                      "avg_clv_cents", "max_drawdown", "win_rate_markets")}
+                            for m, v in (res.get("models") or {}).items()}
+            r["markets_in_scope"] = res.get("markets_in_scope")
+        return {"backtests": rows}
+
+    @app.post("/api/backtests")
+    async def backtest_run(request: Request):
+        b = await request.json()
+        if b.get("strategy") not in STRATEGIES:
+            raise HTTPException(400, "unknown strategy")
+        models = [m for m in (b.get("models") or []) if m in ("through", "touch")] or None
+        rid = bt.start(b["strategy"], b.get("params") or {}, b.get("filters") or {}, models,
+                       float(b.get("slippage_cents") or 0))
+        return {"id": rid}
+
+    @app.get("/api/backtests/{rid}")
+    def backtest_get(rid: int):
+        rows = wdb.query("SELECT * FROM wh_backtests WHERE id=?", (rid,))
+        if not rows:
+            raise HTTPException(404, "not found")
+        r = rows[0]
+        r["results"] = json.loads(r["results"] or "null")
+        r["params"] = json.loads(r["params"] or "{}")
+        r["filters"] = json.loads(r["filters"] or "{}")
+        return r
 
     # -------------------------------------------------------------- quoter --
     @app.get("/api/quoter")
