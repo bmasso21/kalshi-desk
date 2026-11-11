@@ -205,6 +205,92 @@ def allocate(rows: list[dict], size: int, budgets=BUDGETS) -> list[dict]:
     return out
 
 
+def fetch_programs(client, max_pages=200) -> tuple[list[dict], int]:
+    progs, cur, pages = [], None, 0
+    while True:
+        page = client.request("GET", "/incentive_programs", {"status": "active", "type": "liquidity", "limit": 1000, "cursor": cur})
+        progs += page.get("incentive_programs") or []
+        pages += 1
+        cur = page.get("next_cursor")
+        if not cur or pages >= max_pages:
+            return progs, pages
+
+
+def rank_markets(client, q: dict, sizes, now: float, prefilter: bool = False, min_pool: float = 0.0,
+                 progress=None) -> tuple[list[dict], dict]:
+    """Score every market with an active liquidity program at each quote size (one snapshot of the book).
+    prefilter=True (the live quoter) only fetches books for markets that pass the quoter's filters on their
+    quoted best bid/ask, which cuts the requests ~5x. Returns (rows, info)."""
+    prog = progress or (lambda msg: None)
+    prog("incentive programs")
+    progs, pages = fetch_programs(client)
+    pools = {t: v for t, v in aggregate_programs(progs, now).items() if v["daily"] >= min_pool}
+    tickers = sorted(pools)
+    mk: dict[str, dict] = {}
+    for i in range(0, len(tickers), 100):
+        prog(f"markets {i}/{len(tickers)}")
+        for m in client.markets(status=None, tickers=tickers[i:i + 100], exclude_combos=False):
+            mk[m["ticker"]] = m
+    live = [t for t in tickers if mk.get(t, {}).get("status") == "active"
+            and (mk[t].get("market_type") or "binary") == "binary"]
+    if prefilter:
+        live = [t for t in live if quoter_eligible(mk[t], q, now)[0]]
+    books: dict[str, dict] = {}
+    for i in range(0, len(live), 20):
+        if i % 400 == 0:
+            prog(f"order books {i}/{len(live)}")
+        books.update(client.orderbooks(live[i:i + 20]))
+    rows = []
+    for t in live:
+        m, v, ob = mk[t], pools[t], books.get(t) or {}
+        yes_lv, no_lv = book_levels(ob.get("yes_dollars")), book_levels(ob.get("no_dollars"))
+        yb = yes_lv[0][0] if yes_lv else 0.0
+        nb = no_lv[0][0] if no_lv else 0.0
+        ya = 1 - nb if nb else 0.0
+        ok, why = quoter_eligible({**m, "yes_bid_dollars": yb, "yes_ask_dollars": ya}, q, now)
+        per = {}
+        for sz in sizes:
+            if yb and nb:
+                sc = snapshot_score(yes_lv, no_lv, v["target"], v["df"], (yb, sz), (nb, sz))
+            else:
+                sc = {"eligible": False, "share_yes": 0.0, "share_no": 0.0, "score": 0.0}
+            est = v["daily"] * sc["score"] / 2
+            if v["max_per_account"] is not None:
+                est = min(est, v["max_per_account"] / max(1.0, v["days_left"]))
+            if est * min(v["days_left"], 31) < 1:      # Kalshi pays nothing under $1 per market program
+                est = 0.0
+            per[str(sz)] = {"share_yes": round(sc["share_yes"], 4), "share_no": round(sc["share_no"], 4),
+                            "eligible": sc["eligible"], "est_daily": round(est, 4), "capital": round(sz * (yb + nb), 2)}
+        rows.append({"ticker": t, "series": t.split("-")[0], "event": m.get("event_ticker"),
+                     "title": m.get("title"), "sub": m.get("yes_sub_title"),
+                     "daily": round(v["daily"], 4), "target": v["target"], "df": v["df"], "days_left": round(v["days_left"], 2),
+                     "max_per_account": v["max_per_account"], "yes_bid": yb, "yes_ask": ya,
+                     "mid": round((yb + ya) / 2, 4) if yb and ya else None,
+                     "spread": round(ya - yb, 4) if yb and ya else None,
+                     "depth_yes": round(sum(c for _, c in yes_lv), 2), "depth_no": round(sum(c for _, c in no_lv), 2),
+                     "close_ts": iso_ts(m.get("close_time")), "quoter_ok": ok, "why_not": why,
+                     "volume_24h": fnum(m.get("volume_24h_fp") or m.get("volume_24h")), "sizes": per})
+    return rows, {"programs": len(progs), "pages": pages, "pools": pools, "live": live}
+
+
+def pick_for_quoter(rows: list[dict], size: int, max_markets: int, max_capital: float, max_volume_24h: float = 0) -> list[dict]:
+    """Best estimated reward per $ of capital first, until max_markets or the capital cap is reached."""
+    k = str(size)
+    cands = [r for r in rows if r["quoter_ok"] and r["sizes"][k]["est_daily"] > 0 and r["sizes"][k]["capital"] > 0
+             and (not max_volume_24h or r["volume_24h"] <= max_volume_24h)]
+    cands.sort(key=lambda r: -r["sizes"][k]["est_daily"] / r["sizes"][k]["capital"])
+    out, used = [], 0.0
+    for r in cands:
+        if len(out) >= max_markets:
+            break
+        c = r["sizes"][k]["capital"]
+        if used + c > max_capital + EPS:
+            continue
+        used += c
+        out.append(r)
+    return out
+
+
 # ------------------------------------------------------------------ scan --
 class Scanner:
     def __init__(self, wdb, client: KalshiClient | None = None, req_per_sec: float = 5, clock=time.time):
@@ -242,68 +328,15 @@ class Scanner:
             q = {"pull_hours": 6, "max_spread": 0.06, "min_mid": 0.15, "max_mid": 0.85, **(params.get("quoter") or {})}
             sizes = tuple(int(s) for s in params.get("sizes") or SIZES)
             now = self.clock()
-            prog("incentive programs")
-            progs, cur, pages = [], None, 0
-            while True:
-                page = self.client.request("GET", "/incentive_programs",
-                                           {"status": "active", "type": "liquidity", "limit": 1000, "cursor": cur})
-                progs += page.get("incentive_programs") or []
-                pages += 1
-                cur = page.get("next_cursor")
-                if not cur or pages >= 200:
-                    break
-            pools = aggregate_programs(progs, now)
-            tickers = sorted(pools)
-            mk: dict[str, dict] = {}
-            for i in range(0, len(tickers), 100):
-                prog(f"markets {i}/{len(tickers)}")
-                for m in self.client.markets(status=None, tickers=tickers[i:i + 100], exclude_combos=False):
-                    mk[m["ticker"]] = m
-            live = [t for t in tickers if mk.get(t, {}).get("status") == "active"
-                    and (mk[t].get("market_type") or "binary") == "binary"]
-            books: dict[str, dict] = {}
-            for i in range(0, len(live), 20):
-                if i % 400 == 0:
-                    prog(f"order books {i}/{len(live)}")
-                books.update(self.client.orderbooks(live[i:i + 20]))
-            rows = []
-            for t in live:
-                m, v, ob = mk[t], pools[t], books.get(t) or {}
-                yes_lv, no_lv = book_levels(ob.get("yes_dollars")), book_levels(ob.get("no_dollars"))
-                yb = yes_lv[0][0] if yes_lv else 0.0
-                nb = no_lv[0][0] if no_lv else 0.0
-                ya = 1 - nb if nb else 0.0
-                ok, why = quoter_eligible({**m, "yes_bid_dollars": yb, "yes_ask_dollars": ya}, q, now)
-                per = {}
-                for s in sizes:
-                    if yb and nb:
-                        sc = snapshot_score(yes_lv, no_lv, v["target"], v["df"], (yb, s), (nb, s))
-                    else:
-                        sc = {"eligible": False, "share_yes": 0.0, "share_no": 0.0, "score": 0.0}
-                    est = v["daily"] * sc["score"] / 2
-                    if v["max_per_account"] is not None:
-                        est = min(est, v["max_per_account"] / max(1.0, v["days_left"]))
-                    if est * min(v["days_left"], 31) < 1:      # Kalshi pays nothing under $1 per market program
-                        est = 0.0
-                    per[str(s)] = {"share_yes": round(sc["share_yes"], 4), "share_no": round(sc["share_no"], 4),
-                                   "eligible": sc["eligible"], "est_daily": round(est, 4),
-                                   "capital": round(s * (yb + nb), 2)}
-                rows.append({"ticker": t, "series": t.split("-")[0], "event": m.get("event_ticker"),
-                             "title": m.get("title"), "sub": m.get("yes_sub_title"),
-                             "daily": round(v["daily"], 4), "target": v["target"], "df": v["df"], "days_left": round(v["days_left"], 2),
-                             "max_per_account": v["max_per_account"], "yes_bid": yb, "yes_ask": ya,
-                             "mid": round((yb + ya) / 2, 4) if yb and ya else None,
-                             "spread": round(ya - yb, 4) if yb and ya else None,
-                             "depth_yes": round(sum(c for _, c in yes_lv), 2), "depth_no": round(sum(c for _, c in no_lv), 2),
-                             "close_ts": iso_ts(m.get("close_time")), "quoter_ok": ok, "why_not": why,
-                             "volume_24h": fnum(m.get("volume_24h_fp") or m.get("volume_24h")), "sizes": per})
+            rows, info = rank_markets(self.client, q, sizes, now, progress=prog)
+            progs, pages, pools, live = info["programs"], info["pages"], info["pools"], info["live"]
             with self.db.lock:
                 self.db.conn.executemany("INSERT OR REPLACE INTO mm_scan_rows VALUES(?,?,?)",
                                          [(sid, r["ticker"], json.dumps(r)) for r in rows])
                 self.db.conn.commit()
             total_pool = sum(v["daily"] for v in pools.values())
             summary = {
-                "programs": len(progs), "program_pages": pages, "markets_with_programs": len(pools),
+                "programs": progs, "program_pages": pages, "markets_with_programs": len(pools),
                 "pool_daily_total": round(total_pool, 2), "active_binary": len(live),
                 "quoter_ok": sum(1 for r in rows if r["quoter_ok"]),
                 "why_not": _count(r["why_not"] for r in rows if not r["quoter_ok"]),

@@ -244,6 +244,14 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 errors.append("remote_url must look like https://<machine>.<tailnet>.ts.net")
             else:
                 patch["remote_url"] = u
+        if isinstance(patch.get("quoter"), dict):
+            qp = patch["quoter"]
+            for k, lo, hi in (("quote_ttl_sec", 120, 3600), ("max_volume_24h", 0, 10 ** 9)):
+                if k in qp:
+                    try:
+                        qp[k] = max(lo, min(hi, float(qp[k])))
+                    except (TypeError, ValueError):
+                        qp.pop(k)
         if isinstance(patch.get("warehouse"), dict):
             w = patch["warehouse"]
             w.pop("base_url_override", None)         # test-only, never from the browser
@@ -564,6 +572,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
              "per_series": max(1, min(40, int(b.get("per_series") or 3)))}
         for k in ("max_inventory", "pull_hours", "jump_cents", "cooldown_min", "refresh_sec", "min_mid", "max_mid", "max_spread"):
             p[k] = cfg.quoter.get(k)
+        p["requeue_sec"] = max(60, float(cfg.quoter.get("quote_ttl_sec") or 600) - 60)   # same re-placement as the live quoter
         try:
             rid = mm_shadow.start(mm_scanner, p)
         except RuntimeError as e:

@@ -288,10 +288,45 @@ def backtest_prune_test():
     check("backtester: every order fills from the next trade through it (2000 bars -> 2000)", r["contracts"] == 2000 and time.time() - t0 < 5, r["contracts"])
 
 
+def quoter_select_tests():
+    import types
+
+    from app.quoter import Quoter
+    rows = []
+    for i, (est, cap, vol, ok) in enumerate([(1.0, 10, 0, True), (3.0, 60, 5, True), (0.5, 2, 9999, True),
+                                             (9.0, 10, 0, False), (0.0, 1, 0, True), (2.0, 50, 0, True)]):
+        rows.append({"ticker": f"M{i}", "quoter_ok": ok, "volume_24h": vol, "sizes": {"10": {"est_daily": est, "capital": cap}}})
+    pk = [r["ticker"] for r in mm.pick_for_quoter(rows, 10, 10, 100)]
+    check("pick: best $/day per $ capital first, skips filtered and non-paying", pk == ["M2", "M0", "M1"], pk)
+    pk = [r["ticker"] for r in mm.pick_for_quoter(rows, 10, 10, 100, max_volume_24h=100)]
+    check("pick: optional 24h-volume ceiling", pk == ["M0", "M1"], pk)
+    pk = [r["ticker"] for r in mm.pick_for_quoter(rows, 10, 2, 1000)]
+    check("pick: stops at max_markets", pk == ["M2", "M0"], pk)
+    pk = [r["ticker"] for r in mm.pick_for_quoter(rows, 10, 10, 15)]
+    check("pick: never exceeds the capital cap (skips what doesn't fit)", pk == ["M2", "M0"], pk)
+
+    port = free_port()
+    serve(create_mock({}), port)
+    base = f"http://127.0.0.1:{port}/trade-api/v2"
+    cfg = {"size": 10, "max_markets": 5, "max_capital": 100, "min_daily_reward": 5, "pull_hours": 6, "max_spread": 0.06,
+           "min_mid": 0.15, "max_mid": 0.85, "max_volume_24h": 0}
+    q = Quoter(types.SimpleNamespace(cfg=types.SimpleNamespace(quoter=cfg)))
+    sel, msg = q.select(KalshiClient(base))
+    check("quoter select: $10/day pool picked, $0.30/day pool below the minimum ignored", [x["ticker"] for x in sel] == ["KXA-1"], msg)
+    check("quoter select: estimate from Kalshi's formula", close(float(sel[0]["est_daily"]), round(10 * (10 / 210 + 10 / 210) / 2, 4), 1e-4), sel)
+    check("quoter select: share and capital reported", close(float(sel[0]["share"]), 10 / 210, 1e-4) and close(float(sel[0]["capital"]), 9.8), sel)
+    fm = q._fmt(sel)
+    check("quoter select: UI format is plain strings", isinstance(fm[0]["capital"], str) and fm[0]["share"] == "4.8", fm)
+    cfg["max_capital"] = 5
+    sel, _ = q.select(KalshiClient(base))
+    check("quoter select: capital cap below one market -> quotes nothing", sel == [])
+
+
 if __name__ == "__main__":
     scoring_tests()
     sim_tests()
     backtest_prune_test()
+    quoter_select_tests()
     integration_tests(tempfile.mkdtemp())
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     if FAIL:

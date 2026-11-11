@@ -60,6 +60,8 @@ DEFAULTS = {
         "cooldown_min": 10,
         "min_mid": 0.15, "max_mid": 0.85,
         "max_spread": 0.06,
+        "quote_ttl_sec": 600,           # each quote expires on its own after this (re-placed 60s before; keeps queue priority)
+        "max_volume_24h": 0,            # skip markets that traded more than this in 24h (0 = no limit)
     },
     # --- phone alerts (Pushover) --------------------------------------------
     "alerts": {

@@ -191,6 +191,8 @@ def run(keytype: str):
           and qs["no"]["price"] == "0.4800", snap["quotes"])
     lo = [o for o in mock.state.S["orders"].values() if o["ticker"] == "KXA-1" and o["status"] == "resting"]
     check("quotes are post-only with expiry", len(lo) == 2 and all(o["post_only"] and o["expiration_time"] for o in lo), lo)
+    check("quotes live ~10 min (quote_ttl_sec) so they keep queue priority",
+          all(570 <= int(o["expiration_time"]) - time.time() <= 610 for o in lo), [o["expiration_time"] for o in lo])
     n_orders = len(mock.state.S["orders"])
     q.cycle()
     check("unchanged book -> no requote churn", len(mock.state.S["orders"]) == n_orders)

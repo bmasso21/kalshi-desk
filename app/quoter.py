@@ -7,7 +7,8 @@ or not (scored on random snapshots every second). This module:
   * stops adding to a side once net inventory hits max_inventory (YES and NO fills net out),
   * pulls quotes when the mid jumps (news) and cools down, and stops before settlement (no in-game),
   * caps total $ committed (resting quotes + inventory),
-  * gives every quote a short expiry so nothing is left resting if the app or laptop dies.
+  * gives every quote an expiry (quote_ttl_sec, default 10 min) so nothing is left resting if the app or laptop
+    dies; it is re-placed only shortly before that, so it keeps its place in the queue.
 
 The main risk is adverse selection: you mostly get filled right before the price moves against
 you. Rewards must beat that cost; judge it on the Rewards tab over weeks, not days.
@@ -119,83 +120,31 @@ class Quoter:
         return None
 
     # ---------------------------------------------------------- selection --
-    @staticmethod
-    def _side_depth(levels, target, df) -> Decimal:
-        """Qualifying liquidity on one side, per Kalshi's scoring: the Reference Price is the first
-        level (walking down from the best bid) where cumulative size reaches Target/5; orders below
-        it are discounted by df per tick (1c)."""
-        lv = sorted(((d(p), d(c)) for p, c in levels or []), key=lambda x: -x[0])
-        if not lv:
-            return Decimal(0)
-        need, cum, ref = target / 5, Decimal(0), lv[-1][0]
-        for p, c in lv:
-            cum += c
-            if cum >= need:
-                ref = p
-                break
-        tot = Decimal(0)
-        for p, c in lv:
-            ticks = max(0, int(((ref - p) * 100).to_integral_value()))
-            tot += c * (df ** ticks)
-        return tot
-
     def refresh_programs(self):
         self.selected, msg = self.select(self.e.client)
         self.programs_ts = time.time()
         self.log("select", msg)
 
     def select(self, client):
-        """Pick markets to quote. Read-only: uses only public market data."""
-        progs = client.incentives(status="active", type_="liquidity")
-        now = time.time()
-        pools: dict[str, dict] = {}
-        for p in progs:
-            start, end = _ts(p.get("start_date")), _ts(p.get("end_date"))
-            if not start or not end or end <= now or start > now:
-                continue
-            days = max(Decimal("0.0417"), d((end - start) / 86400))  # >= 1 hour
-            x = pools.setdefault(p["market_ticker"], {"daily": Decimal(0), "left_days": Decimal(0),
-                                                       "target": Decimal(0), "df": Decimal(1)})
-            x["daily"] += d(p.get("period_reward")) / 10000 / days
-            x["left_days"] = max(x["left_days"], d((end - now) / 86400))
-            x["target"] = max(x["target"], d(p.get("target_size_fp") or 0))
-            x["df"] = d(p.get("discount_factor_bps") or 10000) / 10000
-        cands = [t for t, v in pools.items() if v["daily"] >= d(self.cfg["min_daily_reward"])]
-        mk = {}
-        for i in range(0, len(cands), 100):
-            for m in client.markets(status=None, tickers=cands[i:i + 100], exclude_combos=False):
-                mk[m["ticker"]] = m
-        elig = [t for t in cands if mk.get(t) and self._eligible(mk[t])]
-        elig.sort(key=lambda t: -pools[t]["daily"])
-        elig = elig[:200]  # pools are mostly flat (~$100/d), so check plenty of books
-        books = client.orderbooks(elig) if elig else {}
-        size = float(self.cfg["size"])
-        out, skipped_small = [], 0
-        for t in elig:
-            v, ob = pools[t], books.get(t, {})
-            # Kalshi's scoring (see app/mm.py): your share of each side at the best bid, 0 if the book is
-            # too thin for the snapshot to count (it must hold Target Size on both sides).
-            yes_lv, no_lv = mm.book_levels(ob.get("yes_dollars")), mm.book_levels(ob.get("no_dollars"))
-            if not yes_lv or not no_lv:
-                continue
-            sc = mm.snapshot_score(yes_lv, no_lv, float(v["target"] or 100), float(v["df"]),
-                                   (yes_lv[0][0], size), (no_lv[0][0], size))
-            share = Decimal(str(round(sc["score"] / 2, 6)))
-            est_daily = v["daily"] * share
-            est_period = est_daily * min(v["left_days"], Decimal(31))
-            if est_period < 1:   # Kalshi pays nothing under $1.00 per market program
-                skipped_small += 1
-                continue
-            m = mk[t]
-            out.append({"ticker": t, "daily_reward": v["daily"], "est_daily": est_daily,
-                        "share": share, "title": m.get("title"), "sub": m.get("yes_sub_title")})
-        out.sort(key=lambda x: -x["est_daily"])
-        chosen = out[: int(self.cfg["max_markets"])]
-        return chosen, (f"{len(progs)} active programs; {len(cands)} pools >= ${self.cfg['min_daily_reward']}/day; "
-                           f"{len(elig)} eligible checked; {skipped_small} skipped (your share < $1 payout min); "
-                           f"quoting {len(chosen)}: "
-                           + ", ".join(f"{s['ticker']} (~${s['est_daily']:.2f}/d of ${s['daily_reward']:.0f})"
-                                       for s in chosen))
+        """Pick markets to quote. Read-only: public data only. Every market with an active liquidity program
+        that passes the quoter's filters is scored with Kalshi's formula at your quote size (app/mm.py); the
+        best estimated reward per $ of capital is taken first until `max_markets` or `max_capital`."""
+        c = self.cfg
+        size = int(d(c["size"]))
+        rules = {k: c.get(k) for k in ("pull_hours", "max_spread", "min_mid", "max_mid")}
+        rows, info = mm.rank_markets(client, rules, (size,), time.time(), prefilter=True,
+                                     min_pool=float(c.get("min_daily_reward") or 0))
+        picked = mm.pick_for_quoter(rows, size, int(c["max_markets"]), float(c["max_capital"]),
+                                    float(c.get("max_volume_24h") or 0))
+        k = str(size)
+        chosen = [{"ticker": r["ticker"], "daily_reward": d(r["daily"]), "est_daily": d(r["sizes"][k]["est_daily"]),
+                   "share": d((r["sizes"][k]["share_yes"] + r["sizes"][k]["share_no"]) / 2),
+                   "capital": d(r["sizes"][k]["capital"]), "title": r.get("title"), "sub": r.get("sub")} for r in picked]
+        paying = sum(1 for r in rows if r["sizes"][k]["est_daily"] > 0)
+        return chosen, (f"{info['programs']} active programs; {len(info['pools'])} pools >= ${c['min_daily_reward']}/day; "
+                        f"{len(rows)} pass the filters; {paying} would pay you >= Kalshi's $1 minimum at {size} contracts; "
+                        f"quoting {len(chosen)} (capital ${sum(x['capital'] for x in chosen):.2f} of ${c['max_capital']}): "
+                        + ", ".join(f"{x['ticker']} (~${x['est_daily']:.2f}/d of ${x['daily_reward']:.0f})" for x in chosen))
 
     def _eligible(self, m) -> tuple[bool, str] | bool:
         c = self.cfg
@@ -301,7 +250,8 @@ class Quoter:
                 add = px * d(self.cfg["size"])
                 if committed + add > d(self.cfg["max_capital"]):
                     continue
-                exp = int(now + max(120, int(self.cfg["refresh_sec"]) * 6))
+                # longer-lived quotes keep their place in the queue; still expire on their own if the app dies
+                exp = int(now + max(120, int(self.cfg.get("quote_ttl_sec") or 600), int(self.cfg["refresh_sec"]) * 6))
                 try:
                     r = self.e.place(ticker=t, intent=intent, price=px, count=self.cfg["size"], source="quoter",
                                      strategy="liquidity", time_in_force="good_till_canceled", post_only=True,
@@ -355,7 +305,8 @@ class Quoter:
     def _fmt(self, rows):
         q2 = Decimal("0.01")
         return [{**s, "daily_reward": str(s["daily_reward"].quantize(q2)), "est_daily": str(s["est_daily"].quantize(q2)),
-                 "share": str((s["share"] * 100).quantize(Decimal("0.1")))} for s in rows]
+                 "share": str((s["share"] * 100).quantize(Decimal("0.1"))),
+                 "capital": str(d(s.get("capital")).quantize(q2))} for s in rows]
 
     def snapshot(self):
         return {"state": self.state, "selected": self._fmt(self.selected),

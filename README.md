@@ -167,13 +167,13 @@ Two more guards apply:
 
 ### Liquidity quoter (v1.1)
 Kalshi's Liquidity Incentive Program pays for resting orders near the top of the book, whether or not they fill. The program is listed through Jan 1, 2027, but Kalshi can end it at any time. When enabled, the quoter:
-- picks the markets with the largest daily reward pools (minimum $5/day by default)
+- scores every market with a liquidity program using Kalshi's formula at your quote size and picks the best estimated reward per $ of capital, until *Markets at once* or *Max $ committed* (re-picked every 10 minutes; pools under *Min pool $/day* ignored)
 - joins the best YES bid and the best NO bid with post-only orders, so on most series it pays $0 in fees
 - stops adding to a side once the net position reaches the cap (30 contracts)
 - pulls quotes and cools down for 10 minutes if the price moves 4c or more in one cycle
 - stops quoting 6 hours before expected settlement, so it doesn't quote in-game
 - caps total committed capital at $100
-- gives every quote a ~2-minute expiry, so nothing is left resting if the app or laptop stops
+- gives every quote an expiry (*Quote lifetime*, default 10 minutes) so nothing is left resting long if the app or laptop stops; a quote is only re-placed shortly before it expires, so it keeps its place in the queue
 
 The real cost is adverse selection: fills tend to come right before the price moves against you. Judge it on the Rewards tab over weeks: rewards credited minus losses on fills. Quoter orders are bound by the auto limits ($ per order, $ of fills per day).
 
