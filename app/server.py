@@ -325,6 +325,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         old_env = cfg.env
         if patch.get("env") and patch["env"] != old_env:
             eng.quoter.cancel_all("environment switch")
+            eng.quoter.selected, eng.quoter.programs_ts = [], 0     # re-pick markets for the new environment
         cfg.update(patch)
         if any(k in patch for k in ("env", "base_url_override")) or any(k.endswith(("_key_id", "_key_path")) for k in patch):
             eng.connect()

@@ -311,12 +311,34 @@ def quoter_select_tests():
     cfg = {"size": 10, "max_markets": 5, "max_capital": 100, "min_daily_reward": 5, "pull_hours": 6, "max_spread": 0.06,
            "min_mid": 0.15, "max_mid": 0.85, "max_volume_24h": 0}
     q = Quoter(types.SimpleNamespace(cfg=types.SimpleNamespace(quoter=cfg)))
+    t0 = time.time()
+    p = mm.Pacer(10)
+    for _ in range(4):
+        p()
+    check("pacer spaces requests (4 calls at 10/s >= 0.3s)", time.time() - t0 >= 0.29, time.time() - t0)
     sel, msg = q.select(KalshiClient(base))
     check("quoter select: $10/day pool picked, $0.30/day pool below the minimum ignored", [x["ticker"] for x in sel] == ["KXA-1"], msg)
     check("quoter select: estimate from Kalshi's formula", close(float(sel[0]["est_daily"]), round(10 * (10 / 210 + 10 / 210) / 2, 4), 1e-4), sel)
     check("quoter select: share and capital reported", close(float(sel[0]["share"]), 10 / 210, 1e-4) and close(float(sel[0]["capital"]), 9.8), sel)
     fm = q._fmt(sel)
     check("quoter select: UI format is plain strings", isinstance(fm[0]["capital"], str) and fm[0]["share"] == "4.8", fm)
+    # background re-pick: the current list stays until the new one is ready; no overlapping re-picks
+    calls = []
+
+    def slow_select(client):
+        calls.append(1)
+        time.sleep(0.5)
+        return [{"ticker": "NEW", "daily_reward": sel[0]["daily_reward"], "est_daily": sel[0]["est_daily"],
+                 "share": sel[0]["share"], "capital": sel[0]["capital"]}], "new"
+    q.e.client = None
+    q.selected = list(sel)
+    q.select = slow_select
+    q._refresh_bg()
+    q._refresh_bg()
+    check("re-pick runs in the background (current markets kept meanwhile)", [x["ticker"] for x in q.selected] == ["KXA-1"])
+    time.sleep(1.0)
+    check("re-pick result applied when ready; overlapping re-pick skipped", [x["ticker"] for x in q.selected] == ["NEW"] and len(calls) == 1, (q.selected, calls))
+    del q.select
     cfg["max_capital"] = 5
     sel, _ = q.select(KalshiClient(base))
     check("quoter select: capital cap below one market -> quotes nothing", sel == [])

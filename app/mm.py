@@ -205,9 +205,27 @@ def allocate(rows: list[dict], size: int, budgets=BUDGETS) -> list[dict]:
     return out
 
 
-def fetch_programs(client, max_pages=200) -> tuple[list[dict], int]:
+class Pacer:
+    """Spaces requests so a burst (e.g. the quoter re-picking markets) stays under Kalshi's rate limit while other
+    collectors share the same connection."""
+
+    def __init__(self, max_rps: float = 0):
+        self.gap = 1.0 / max_rps if max_rps else 0.0
+        self.last = 0.0
+
+    def __call__(self):
+        if self.gap:
+            w = self.last + self.gap - time.monotonic()
+            if w > 0:
+                time.sleep(w)
+            self.last = time.monotonic()
+
+
+def fetch_programs(client, max_pages=200, pace=None) -> tuple[list[dict], int]:
     progs, cur, pages = [], None, 0
     while True:
+        if pace:
+            pace()
         page = client.request("GET", "/incentive_programs", {"status": "active", "type": "liquidity", "limit": 1000, "cursor": cur})
         progs += page.get("incentive_programs") or []
         pages += 1
@@ -217,18 +235,20 @@ def fetch_programs(client, max_pages=200) -> tuple[list[dict], int]:
 
 
 def rank_markets(client, q: dict, sizes, now: float, prefilter: bool = False, min_pool: float = 0.0,
-                 progress=None) -> tuple[list[dict], dict]:
+                 progress=None, max_rps: float = 0) -> tuple[list[dict], dict]:
     """Score every market with an active liquidity program at each quote size (one snapshot of the book).
     prefilter=True (the live quoter) only fetches books for markets that pass the quoter's filters on their
     quoted best bid/ask, which cuts the requests ~5x. Returns (rows, info)."""
     prog = progress or (lambda msg: None)
+    pace = Pacer(max_rps)
     prog("incentive programs")
-    progs, pages = fetch_programs(client)
+    progs, pages = fetch_programs(client, pace=pace)
     pools = {t: v for t, v in aggregate_programs(progs, now).items() if v["daily"] >= min_pool}
     tickers = sorted(pools)
     mk: dict[str, dict] = {}
     for i in range(0, len(tickers), 100):
         prog(f"markets {i}/{len(tickers)}")
+        pace()
         for m in client.markets(status=None, tickers=tickers[i:i + 100], exclude_combos=False):
             mk[m["ticker"]] = m
     live = [t for t in tickers if mk.get(t, {}).get("status") == "active"
@@ -239,6 +259,7 @@ def rank_markets(client, q: dict, sizes, now: float, prefilter: bool = False, mi
     for i in range(0, len(live), 20):
         if i % 400 == 0:
             prog(f"order books {i}/{len(live)}")
+        pace()
         books.update(client.orderbooks(live[i:i + 20]))
     rows = []
     for t in live:

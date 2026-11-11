@@ -125,6 +125,24 @@ class Quoter:
         self.programs_ts = time.time()
         self.log("select", msg)
 
+    def _refresh_bg(self):
+        """Re-pick markets in the background (it takes ~30s at a polite request rate), so the cycle keeps
+        watching the live quotes for price jumps meanwhile. The new list applies on the next cycle."""
+        if getattr(self, "_picking", False):
+            return
+        self._picking = True
+        self.programs_ts = time.time()
+
+        def run():
+            try:
+                self.refresh_programs()
+            except Exception as e:
+                self.log("error", f"re-pick failed (keeping the current markets): {e}")
+            finally:
+                self._picking = False
+                self._wake.set()
+        threading.Thread(target=run, daemon=True, name="quoter-pick").start()
+
     def select(self, client):
         """Pick markets to quote. Read-only: public data only. Every market with an active liquidity program
         that passes the quoter's filters is scored with Kalshi's formula at your quote size (app/mm.py); the
@@ -133,7 +151,7 @@ class Quoter:
         size = int(d(c["size"]))
         rules = {k: c.get(k) for k in ("pull_hours", "max_spread", "min_mid", "max_mid")}
         rows, info = mm.rank_markets(client, rules, (size,), time.time(), prefilter=True,
-                                     min_pool=float(c.get("min_daily_reward") or 0))
+                                     min_pool=float(c.get("min_daily_reward") or 0), max_rps=4)
         picked = mm.pick_for_quoter(rows, size, int(c["max_markets"]), float(c["max_capital"]),
                                     float(c.get("max_volume_24h") or 0))
         k = str(size)
@@ -171,8 +189,10 @@ class Quoter:
         if not self.active():
             self.cancel_all("loss limit")
             return
-        if time.time() - self.programs_ts > 600 or not self.selected:
-            self.refresh_programs()
+        if not self.programs_ts:
+            self.refresh_programs()                 # first pick: nothing is quoted yet, so do it inline
+        elif time.time() - self.programs_ts > 600:
+            self._refresh_bg()
         client = self.e.client
         sel = {s["ticker"] for s in self.selected}
         # drop quotes in markets no longer selected
