@@ -199,6 +199,14 @@ def create_mock(public_keys: dict[str, object]):
         return {"credits": [{"credit_id": "c1", "type": "liquidity_incentive", "status": "paid", "amount_dollars": "3.2100",
                              "reason": "Liquidity incentive KXA-1", "created_time": "2026-11-09T11:00:00Z"}], "cursor": ""}
 
+    @app.get(PREFIX + "/portfolio/deposits")
+    def deposits(limit: int = 100, cursor: str = ""):
+        return {"deposits": S.get("deposits", []), "cursor": ""}
+
+    @app.get(PREFIX + "/portfolio/withdrawals")
+    def withdrawals(limit: int = 100, cursor: str = ""):
+        return {"withdrawals": S.get("withdrawals", []), "cursor": ""}
+
     @app.get(PREFIX + "/portfolio/fills")
     def fills(limit: int = 100, min_ts: int = 0, cursor: str = ""):
         return {"fills": S["fills"], "cursor": ""}

@@ -34,7 +34,9 @@ def check(cfg, *, intent: str, price, count, market: dict | None, positions: dic
     spent = {"all": $ filled on buys today, "auto": $ filled by auto/quoter today}."""
     r = cfg.risk
     p, c = d(price), d(count)
-    if r.get("kill_switch"):
+    closing = intent not in ("buy_yes", "buy_no")
+    if r.get("kill_switch") and not closing:
+        # sells only ever reduce a position you hold (the engine refuses anything else), so exiting stays possible
         raise RiskError("Kill switch is ON - no new orders")
     if c <= 0:
         raise RiskError("Count must be positive")

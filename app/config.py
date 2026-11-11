@@ -64,6 +64,15 @@ DEFAULTS = {
         "max_volume_24h": 0,            # skip markets that traded more than this in 24h (0 = no limit)
         "exit_step_in": True,           # at the inventory cap, the reducing quote steps 1c inside the spread (if >= 2c wide)
     },
+    # --- limits that scale with the account (see app/scaling.py); tiers default to scaling.DEFAULT_TIERS ---
+    "scaling": {
+        "enabled": False,
+        "caps": {},                     # optional $ ceilings: order, daily_buys, market, total, daily_loss, strat_day, strat_7d, drawdown, quoter
+        "max_markets_cap": 5,           # most markets the quoter may use when scaled
+        "base": None, "base_day": None, "base_env": None, "tier": None, "limits": None,
+    },
+    # --- exit rules: per-position take-profit / stop-loss (closing orders only) ---
+    "exits": {"enabled": True, "check_sec": 30},
     # --- circuit breakers (Phase 3) - every limit 0 = off until you set it ----------
     "breakers": {
         "enabled": True,                # compute P&L / drawdown every check_min (acts only on limits > 0)

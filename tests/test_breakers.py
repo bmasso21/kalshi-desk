@@ -132,7 +132,7 @@ def api_tests(tmp):
     # account drawdown: mock equity = $1000 cash + $25 positions = $1025
     a = br.account(time.time())
     check("account equity from Kalshi balance", close(a["equity"], 1025.0) and close(a["drawdown"], 0.0), a)
-    db.execute("INSERT INTO breaker_equity VALUES(?,?,?)", ("demo", time.time() - 86400, 1200.0))
+    db.execute("INSERT INTO breaker_equity2 VALUES(?,?,?,?)", ("demo", time.time() - 86400, 1200.0, 1200.0))
     a = br.account(time.time())
     check("drawdown vs the recorded peak, limit off -> no trip", close(a["drawdown"], 175.0) and not cfg.risk.get("kill_switch"), a)
     c.post("/api/config", headers=H, json={"breakers": {"account_drawdown": 100}})
@@ -140,7 +140,7 @@ def api_tests(tmp):
     check("drawdown >= limit trips the kill switch", cfg.risk.get("kill_switch") is True and a.get("tripped"), a)
     kill = db.query("SELECT message FROM audit WHERE kind='KILL' ORDER BY id DESC LIMIT 1")
     check("kill reason names the drawdown", kill and "drawdown breaker" in kill[0]["message"], kill)
-    old = db.query("SELECT 1 FROM breaker_equity WHERE equity=1200")
+    old = db.query("SELECT 1 FROM breaker_equity2 WHERE equity=1200")
     db.execute("DELETE FROM audit WHERE kind='x'")
     c.post("/api/breakers/reset", headers=H, json={"peak": True})
     cfg.update({"risk": {"kill_switch": False}})

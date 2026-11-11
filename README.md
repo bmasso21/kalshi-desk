@@ -134,6 +134,38 @@ blend behind the *hourly* markets, not what the daily markets settle on, so v2.1
 - The quoter's market picker now uses the same scoring (it used a simpler size ratio).
 - Backtester: filled/expired orders are dropped from the matching loop (same results, much faster on long runs).
 
+### Limits that scale with the account (v3.2) - Settings
+Tick *Scale limits with the account* and every dollar limit becomes a percentage of the account's value (cash +
+positions), taken once each morning or when you press *Recalculate now*:
+
+| Limit | under $250 | $250 - $1,000 | $1,000+ |
+|---|---|---|---|
+| Per order | 20% | 10% | 5% |
+| New buys per day | 50% | 30% | 20% |
+| Per market | 30% | 15% | 10% |
+| Total exposure | 80% | 80% | 70% |
+| Daily loss (kill switch) | 20% | 12% | 10% |
+| Breaker: per strategy per day | 15% | 8% | 5% |
+| Breaker: per strategy over 7 days | 30% | 16% | 12% |
+| Breaker: account drop below peak | 30% | 20% | 15% |
+| Quoter capital | 80% | 60% | 50% |
+
+- A limit never drops when the account grows into a tighter tier: it holds at the previous tier's top value until the
+  new percentage catches up (e.g. per order stays $50 from $250 to $500).
+- The base is fixed for the day; a deposit takes effect the next morning or on *Recalculate now*.
+- Also scaled: auto-trading limits (40% of the order limit, 30% of daily buys) and the quoter's markets (capital / $10,
+  up to 5), contracts per quote (capital / markets / 2) and inventory cap (2 x contracts).
+- Optional dollar ceilings per limit: `scaling.caps` in config.json (e.g. `{"order": 50}`). Tiers: `scaling.tiers`.
+- While on, typed values for those dollar limits are ignored. Turn it off to go back to fixed limits.
+- Deposits and withdrawals (Kalshi's transfer history) are netted out of the daily-loss limit and the drawdown breaker.
+
+### Exit rules (v3.2) - Portfolio
+Per position: *take* (sell when the bid for your side reaches this), *stop* (sell when it falls to this) and an optional
+*floor* (never sell below this on a stop; you are alerted and it waits). Prices are in your side's terms. Checked every 30s;
+sells the whole position at the bid, immediate-or-cancel, retrying what doesn't fill. A rule can only close a position, and
+closing orders are allowed even with the kill switch on (as of v3.2 the kill switch blocks buys, not exits). No bid = nothing
+is sent. A stop sells at whatever the bid is; in thin markets use the floor.
+
 ### Hardening (v3.1)
 - **Quoter exits.** The side that reduces a position is sent as a sell of what you hold (sized to the position), so it is
   never blocked by the capital cap or the buy limits. At the inventory cap it steps 1c inside the spread when the spread is
@@ -195,7 +227,7 @@ Two more guards apply:
 - **Sell YES / Sell NO** is blocked if you don't hold the position, so it can't accidentally open the opposite side.
 
 **Kill switch** (red button) does three things at once:
-- blocks all new orders
+- blocks all new buys (sells that close a position you hold stay allowed, so you can always exit)
 - turns auto-trading off
 - cancels every resting order
 

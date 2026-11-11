@@ -17,7 +17,7 @@ Every `check_min` minutes (current environment, needs a working key):
 
   Account drawdown - equity (cash + positions, Kalshi's numbers) vs its highest value recorded in the last
   `drawdown_days` days. Drop >= account_drawdown -> the kill switch trips (all orders blocked and cancelled).
-  Withdrawals look like losses: reset the peak after withdrawing.
+  Deposits and withdrawals are taken out of the comparison (Kalshi's transfer history), so they are neither profit nor loss.
 
 Every limit is 0 (= off) until you set it.
 """
@@ -34,6 +34,8 @@ from .kalshi_client import d
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS breaker_equity (env TEXT, ts REAL, equity REAL);
 CREATE INDEX IF NOT EXISTS breaker_equity_ts ON breaker_equity(env, ts);
+CREATE TABLE IF NOT EXISTS breaker_equity2 (env TEXT, ts REAL, equity REAL, adj REAL);
+CREATE INDEX IF NOT EXISTS breaker_equity2_ts ON breaker_equity2(env, ts);
 """
 ACTIONABLE_EXCLUDE = {"manual", "outside", "approved"}
 
@@ -145,16 +147,19 @@ class Breakers:
     def account(self, now: float) -> dict:
         env, c = self.e.cfg.env, self.cfg
         eq = float(self.e.equity())
-        self.db.execute("INSERT INTO breaker_equity VALUES(?,?,?)", (env, now, eq))
+        moved = self.e.transfers.net(0.0) if getattr(self.e, "transfers", None) else 0.0
+        adj = eq - moved                    # equity with every deposit/withdrawal taken out = trading result only
+        self.db.execute("INSERT INTO breaker_equity2 VALUES(?,?,?,?)", (env, now, eq, adj))
         since = max(now - float(c.get("drawdown_days") or 30) * 86400, float(c.get("peak_reset_ts") or 0))
-        row = self.db.query("SELECT MAX(equity) m FROM breaker_equity WHERE env=? AND ts>=?", (env, since))
-        peak = max(eq, float(row[0]["m"] or eq))
-        dd = peak - eq
+        row = self.db.query("SELECT MAX(adj) m FROM breaker_equity2 WHERE env=? AND ts>=?", (env, since))
+        peak_adj = max(adj, float(row[0]["m"] if row[0]["m"] is not None else adj))
+        dd = peak_adj - adj
         lim = float(c.get("account_drawdown") or 0)
-        out = {"equity": round(eq, 2), "peak": round(peak, 2), "drawdown": round(dd, 2), "limit": lim}
+        out = {"equity": round(eq, 2), "peak": round(peak_adj + moved, 2), "drawdown": round(dd, 2), "limit": lim,
+               "net_transfers": round(moved, 2)}
         if lim > 0 and dd >= lim and not self.e.cfg.risk.get("kill_switch"):
             self.e.trip_kill(f"Account drawdown breaker: equity ${eq:.2f} is ${dd:.2f} below its "
-                             f"{int(c.get('drawdown_days') or 30)}-day peak ${peak:.2f} (limit ${lim:.2f})")
+                             f"{int(c.get('drawdown_days') or 30)}-day peak (limit ${lim:.2f}; deposits/withdrawals excluded)")
             out["tripped"] = True
         return out
 

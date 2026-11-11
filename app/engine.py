@@ -40,8 +40,13 @@ class Engine:
         self.quoter = Quoter(self)
         from .clv import CLVTracker
         self.clv = CLVTracker(self)
+        from .scaling import Scaler, Transfers
+        self.transfers = Transfers(self)
+        self.scaler = Scaler(self)
         from .breakers import Breakers
         self.breakers = Breakers(self)
+        from .exits import Exits
+        self.exits = Exits(self)
         self.feed.listeners.append(self.quoter.on_feed)
 
     # ------------------------------------------------------------ connection --
@@ -151,21 +156,27 @@ class Engine:
         return (d(b.get("balance")) + d(b.get("portfolio_value"))) / 100
 
     def daily_pnl(self) -> dict | None:
-        """Equity change since the first check today. Deposits/withdrawals distort it."""
+        """Equity change since the first check today, net of deposits and withdrawals."""
         if not self.client.authenticated:
             return None
         eq = self.equity()
         day = risk.today_key()
-        row = self.db.query("SELECT start_equity FROM day_equity WHERE env=? AND day=?", (self.cfg.env, day))
+        row = self.db.query("SELECT start_equity, ts FROM day_equity WHERE env=? AND day=?", (self.cfg.env, day))
         if not row:
             self.db.execute("INSERT OR IGNORE INTO day_equity VALUES(?,?,?,?)", (self.cfg.env, day, float(eq), time.time()))
             start = eq
         else:
             start = Decimal(str(row[0]["start_equity"]))
-        return {"start": start, "now": eq, "pnl": eq - start}
+        # deposits/withdrawals since the day's first check are not profit or loss
+        moved = Decimal(str(round(self.transfers.net(float(row[0]["ts"])), 2))) if row else Decimal(0)
+        return {"start": start, "now": eq, "pnl": eq - start - moved, "transfers": moved}
 
     def check_loss_limit(self):
         """Trip the kill switch if today's loss reaches the limit."""
+        try:
+            self.scaler.apply()             # new day -> limits follow the account (no-op unless scaling is on)
+        except Exception as e:
+            self.scaler.error = str(e)[:200]
         lim = d(self.cfg.risk.get("max_daily_loss") or 0)
         if lim <= 0 or self.cfg.risk.get("kill_switch") or not self.client.authenticated:
             return
@@ -399,6 +410,7 @@ class Engine:
         self.alerts.start()
         self.clv.start()
         self.breakers.start()
+        self.exits.start()
 
     def stop(self, reason: str = "clean shutdown"):
         self._stop.set()
@@ -407,4 +419,5 @@ class Engine:
         self.feed.stop()
         self.clv.stop()
         self.breakers.stop()
+        self.exits.stop()
         self.alerts.stop(reason)

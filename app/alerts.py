@@ -35,7 +35,7 @@ PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 LOW, NORMAL, HIGH, EMERGENCY = -1, 0, 1, 2
 
 ERROR_KINDS = {"connect_error", "scan_error", "auto_error", "loss_check_error", "fill_sync_error",
-               "feed_watch_error", "api_error", "quoter_error", "summary_error", "watchdog_error", "clv_error", "warehouse_error", "breaker_error"}
+               "feed_watch_error", "api_error", "quoter_error", "summary_error", "watchdog_error", "clv_error", "warehouse_error", "breaker_error", "exit_error"}
 
 
 class Alerter:
@@ -98,6 +98,10 @@ class Alerter:
                       HIGH if manual else EMERGENCY)
         elif kind == "BREAKER" and c.get("kill", True):
             self.send("breaker", "Circuit breaker tripped", f"{message}\nEnv: {self.e.cfg.env.upper()}", HIGH)
+        elif kind == "EXIT" and c.get("fills", True):
+            self.send("exit", "Exit rule", f"{message}\nEnv: {self.e.cfg.env.upper()}", HIGH)
+        elif kind == "order_unknown" and c.get("errors", True):
+            self.send("error", "Order status unknown", message[:700], HIGH)
         elif kind == "LEG_RISK" and c.get("kill", True):
             self.send("leg_risk", "LEG RISK - partial basket", f"{message}\nCheck positions now.", EMERGENCY)
         elif kind in ERROR_KINDS and c.get("errors", True):

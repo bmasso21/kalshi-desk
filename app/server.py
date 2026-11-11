@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
-from . import __version__, risk
+from . import __version__, risk, scaling
 from .config import Config
 from .db import DB
 from .engine import NEVER_AUTO, Engine
@@ -259,6 +259,58 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             if "enabled" in bp:
                 bp["enabled"] = bool(bp["enabled"])
             patch["breakers"] = bp            # 'tripped' / peak reset only via the reset endpoint
+        if isinstance(patch.get("exits"), dict):
+            ex = {}
+            if "enabled" in patch["exits"]:
+                ex["enabled"] = bool(patch["exits"]["enabled"])
+            if "check_sec" in patch["exits"]:
+                try:
+                    ex["check_sec"] = max(10, min(600, float(patch["exits"]["check_sec"])))
+                except (TypeError, ValueError):
+                    pass
+            patch["exits"] = ex
+        want_rescale = False
+        if isinstance(patch.get("scaling"), dict):
+            sp_ = patch["scaling"]
+            sc = {}
+            if "enabled" in sp_:
+                sc["enabled"] = bool(sp_["enabled"])
+                want_rescale = sc["enabled"] and not (cfg.data.get("scaling") or {}).get("enabled")
+            if "max_markets_cap" in sp_:
+                try:
+                    sc["max_markets_cap"] = max(1, min(50, int(sp_["max_markets_cap"])))
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(sp_.get("caps"), dict):
+                caps = {}
+                for k, v in sp_["caps"].items():
+                    if k in scaling.KEYS:
+                        try:
+                            if float(v) > 0:
+                                caps[k] = float(v)
+                        except (TypeError, ValueError):
+                            errors.append(f"cap for {k} must be a number")
+                cfg.data.setdefault("scaling", {})["caps"] = caps        # replace, not merge
+                sc["caps"] = caps
+                want_rescale = want_rescale or bool((cfg.data.get("scaling") or {}).get("enabled") or sc.get("enabled"))
+            if isinstance(sp_.get("tiers"), list):
+                try:
+                    tiers = [{"upto": (None if t.get("upto") in (None, "", 0) else float(t["upto"])),
+                              **{k: max(0.0, min(100.0, float(t[k]))) for k in scaling.KEYS}} for t in sp_["tiers"]]
+                    ups = [t["upto"] for t in tiers]
+                    if not tiers or ups[-1] is not None or any(u is None for u in ups[:-1]) or ups[:-1] != sorted(ups[:-1]):
+                        raise ValueError
+                    sc["tiers"] = tiers
+                    want_rescale = True
+                except (KeyError, TypeError, ValueError):
+                    errors.append("tiers must be ordered by 'upto' (last one open-ended) with a percentage 0-100 for every limit")
+            patch["scaling"] = sc           # base / limits are only ever set by the app
+        scaling_on = bool({**(cfg.data.get("scaling") or {}), **(patch.get("scaling") or {})}.get("enabled"))
+        if scaling_on:                      # dollar limits follow the account: ignore hand-typed values for them
+            for sec, keys in scaling.SCALED_FIELDS.items():
+                if isinstance(patch.get(sec), dict):
+                    for k in keys:
+                        patch[sec].pop(k, None)
         tripped = (cfg.data.get("breakers") or {}).get("tripped") or {}
         if isinstance(patch.get("quoter"), dict) and patch["quoter"].get("enabled") and not cfg.quoter.get("enabled") \
                 and "liquidity" in tripped:
@@ -354,6 +406,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             eng.quoter.cancel_all("environment switch")
             eng.quoter.selected, eng.quoter.programs_ts = [], 0     # re-pick markets for the new environment
         cfg.update(patch)
+        post_update_rescale = want_rescale or (scaling_on and patch.get("env") and patch["env"] != old_env)
         if any(k in patch for k in ("env", "base_url_override")) or any(k.endswith(("_key_id", "_key_path")) for k in patch):
             eng.connect()
         safe = {k: v for k, v in patch.items() if "key" not in k}
@@ -361,6 +414,11 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             safe["sports"] = {k: v for k, v in safe["sports"].items() if k != "oddspapi_key"}
         if isinstance(safe.get("alerts"), dict):
             safe["alerts"] = {k: v for k, v in safe["alerts"].items() if k not in ("pushover_user", "pushover_token", "healthcheck_url")}
+        if post_update_rescale:
+            try:
+                eng.scaler.apply(force=True)
+            except Exception as e:
+                errors.append(f"could not read the account value to scale the limits: {e}")
         db.audit("config", json.dumps(safe)[:1000])
         if cfg.env != old_env:
             eng.trigger_scan()
@@ -561,6 +619,39 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         r["params"] = json.loads(r["params"] or "{}")
         r["filters"] = json.loads(r["filters"] or "{}")
         return r
+
+    # ------------------------------------------------- scaling + exits (3.2) --
+    @app.get("/api/scaling")
+    def scaling_status():
+        return {**eng.scaler.snapshot(), "transfers_error": eng.transfers.error}
+
+    @app.post("/api/scaling/recalc")
+    def scaling_recalc():
+        if not (cfg.data.get("scaling") or {}).get("enabled"):
+            raise HTTPException(400, "scaling is off")
+        if not eng.client.authenticated:
+            raise HTTPException(400, "no working API key for this environment")
+        eng.scaler.apply(force=True)
+        return eng.scaler.snapshot()
+
+    @app.get("/api/exits")
+    def exits_list():
+        return {"enabled": bool(cfg.data.get("exits", {}).get("enabled", True)), "rules": eng.exits.rules(active_only=False)[:100],
+                "state": eng.exits.state}
+
+    @app.post("/api/exits")
+    async def exits_set(request: Request):
+        b = await request.json()
+        if not eng.client.authenticated:
+            raise HTTPException(400, "no working API key for this environment")
+        try:
+            return eng.exits.set_rule(str(b.get("ticker") or ""), b.get("take_profit"), b.get("stop_loss"), b.get("floor"))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.delete("/api/exits/{ticker}")
+    def exits_del(ticker: str):
+        return {"removed": eng.exits.remove(ticker)}
 
     # ---------------------------------------------------- tax export (3) --
     @app.get("/api/export/tax")
@@ -813,6 +904,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             for m in c.markets(status=None, tickers=tickers[i:i + 100], exclude_combos=False):
                 mk[m["ticker"]] = m
         rows = []
+        xr = {r["ticker"]: r for r in eng.exits.rules()}
         for p in pos["market_positions"]:
             m = mk.get(p["ticker"], {})
             qty = d(p.get("position_fp"))
@@ -821,7 +913,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             rows.append({**p, "title": m.get("title"), "sub": m.get("yes_sub_title"), "status": m.get("status"),
                          "side": side, "qty": str(abs(qty)), "mark": str(mark),
                          "mark_value": str((abs(qty) * mark).quantize(d("0.01"))),
-                         "close_time": m.get("close_time")})
+                         "close_time": m.get("close_time"), "exit": xr.get(p["ticker"])})
         return {"authenticated": True, "balance": bal, "positions": rows,
                 "orders": c.orders(status="resting"), "fills": c.fills(max_items=200)}
 
