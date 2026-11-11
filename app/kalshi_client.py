@@ -98,6 +98,7 @@ class KalshiClient:
         self.session = requests.Session()
         self.read_bucket = TokenBucket(rate=200, capacity=600)
         self.write_bucket = TokenBucket(rate=100, capacity=100)
+        self.net_retries = 0
 
     @property
     def authenticated(self) -> bool:
@@ -123,10 +124,21 @@ class KalshiClient:
         is_write = method.upper() in ("POST", "PUT", "DELETE")
         params = {k: v for k, v in (params or {}).items() if v not in (None, "")}
         delay = 0.25
+        # Reads and cancels are safe to repeat after a dropped connection; new orders are NOT
+        # (the order may have reached Kalshi), so POST/PUT are never retried on network errors.
+        retry_net = method.upper() in ("GET", "DELETE")
         for attempt in range(retries):
             (self.write_bucket if is_write else self.read_bucket).take(10)
-            resp = self.session.request(method, self.base_url + path, params=params, json=body,
-                                        headers=self._headers(method, path), timeout=self.timeout)
+            try:
+                resp = self.session.request(method, self.base_url + path, params=params, json=body,
+                                            headers=self._headers(method, path), timeout=self.timeout)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if retry_net and attempt < retries - 1:
+                    self.net_retries += 1
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise
             if resp.status_code == 429 and attempt < retries - 1:
                 time.sleep(delay)
                 delay *= 2

@@ -182,6 +182,49 @@ def main():
     al._last_err["scan_error"] = 0
     db.audit("scan_error", "boom 4"); flush()
     check("next window's alert reports suppressed count", "(+2 more" in msgs[-1]["message"], msgs[-1]["message"])
+    # transient network errors: only persistent ones page
+    n0 = len(msgs)
+    for i in range(2):
+        db.audit("loss_check_error", "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))")
+    flush()
+    check("1-2 network blips -> no alert", len(msgs) == n0)
+    db.audit("loss_check_error", "Kalshi API 500: {'code': 'authentication_error'}"); flush()
+    check("3rd network failure in 15 min -> HIGH alert with count", len(msgs) == n0 + 1 and
+          msgs[-1]["message"].startswith("3 network failures in 15 min") and msgs[-1]["priority"] == "1", msgs[-1])
+    al._net_hist["loss_check_error"] = [time.time() - 1000, time.time() - 990]
+    al._last_err["loss_check_error"] = 0
+    db.audit("loss_check_error", "Read timed out. (read timeout=15)"); flush()
+    check("old blips outside the 15-min window don't count", len(msgs) == n0 + 1)
+
+    # client: reads/cancels retry a dropped connection, new orders never do
+    import requests as _rq
+    real = eng.client.session.request
+    calls = {"n": 0}
+
+    def flaky(method, url, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _rq.ConnectionError("('Connection aborted.', RemoteDisconnected('Remote end closed'))")
+        return real(method, url, **kw)
+    eng.client.session.request = flaky
+    m_ = eng.client.market("KXA-1")
+    check("GET retried after dropped connection", m_["ticker"] == "KXA-1" and calls["n"] == 2 and eng.client.net_retries == 1)
+    calls["n"] = 0
+    try:
+        eng.client.create_order("KXA-1", "bid", "0.30", 1)
+        raised = False
+    except _rq.ConnectionError:
+        raised = True
+    check("order POST NOT retried after dropped connection (no double order)", raised and calls["n"] == 1, calls)
+    calls["n"] = 0
+    eng.client.session.request = real
+    o = eng.client.create_order("KXA-1", "bid", "0.30", 1)
+    eng.client.session.request = flaky
+    calls["n"] = 0
+    eng.client.cancel_order(o["order_id"], "KXA-1")
+    check("cancel (DELETE) retried after dropped connection", calls["n"] == 2)
+    eng.client.session.request = real
+
     eng.client.tags_by_category = lambda: 1 / 0
     r = c.get("/api/categories")
     flush()

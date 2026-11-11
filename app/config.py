@@ -75,6 +75,7 @@ DEFAULTS = {
         "summary_time": "23:50",        # local time
         "fill_batch_sec": 10,
         "error_throttle_min": 30,
+        "network_errors_to_alert": 3,   # transient network/5xx errors alert only at this many in 15 min
         "feed_down_min": 5,
         "emergency_retry": 60,          # seconds between repeats until acknowledged (min 30)
         "emergency_expire": 3600,       # stop repeating after this many seconds (max 10800)

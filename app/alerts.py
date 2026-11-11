@@ -47,6 +47,7 @@ class Alerter:
         self._fills_first = 0.0
         self._last_err: dict[str, float] = {}
         self._suppressed: dict[str, int] = {}
+        self._net_hist: dict[str, list] = {}
         self._feed_down_since: float | None = None
         self._feed_down_sent = False
         self._last_hc = 0.0
@@ -99,6 +100,13 @@ class Alerter:
             self.send("leg_risk", "LEG RISK - partial basket", f"{message}\nCheck positions now.", EMERGENCY)
         elif kind in ERROR_KINDS and c.get("errors", True):
             now = time.time()
+            if self.is_network(message):
+                # brief network blips are normal; page only if they persist
+                h = self._net_hist.setdefault(kind, [])
+                h[:] = [t for t in h if now - t < 900] + [now]
+                if len(h) < int(c.get("network_errors_to_alert", 3)):
+                    return
+                message = f"{len(h)} network failures in 15 min. Latest: {message}"
             thr = float(c.get("error_throttle_min", 30)) * 60
             if now - self._last_err.get(kind, 0) < thr:
                 self._suppressed[kind] = self._suppressed.get(kind, 0) + 1
@@ -107,6 +115,14 @@ class Alerter:
             self._last_err[kind] = now
             more = f"\n(+{extra} more since last alert)" if extra else ""
             self.send("error", f"Error: {kind}", f"{message[-700:]}{more}", HIGH)
+
+    NET_MARKERS = ("ConnectionError", "Connection aborted", "RemoteDisconnected", "Read timed out",
+                   "ConnectTimeout", "ReadTimeout", "Max retries exceeded", "NameResolutionError",
+                   "Kalshi API 500", "Kalshi API 502", "Kalshi API 503", "Kalshi API 504", "Kalshi API 429")
+
+    @classmethod
+    def is_network(cls, message: str) -> bool:
+        return any(m in (message or "") for m in cls.NET_MARKERS)
 
     # -------------------------------------------------------------- fills --
     def _queue_fill(self, f: dict):
