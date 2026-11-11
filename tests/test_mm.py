@@ -351,6 +351,37 @@ def backtest_prune_test():
     check("backtester: every order fills from the next trade through it (2000 bars -> 2000)", r["contracts"] == 2000 and time.time() - t0 < 5, r["contracts"])
 
 
+def retry_tests():
+    from app.kalshi_client import KalshiError
+    n, waits = {"c": 0}, []
+
+    def flaky():
+        n["c"] += 1
+        if n["c"] < 3:
+            raise KalshiError(429, {"message": "too many requests"})
+        return "ok"
+    check("429: waits and retries, then succeeds", mm.with_retry(flaky, sleep=waits.append) == "ok" and waits == [5, 15], waits)
+
+    def bad():
+        raise KalshiError(400, {"message": "bad"})
+    try:
+        mm.with_retry(bad, sleep=waits.append)
+        ok = False
+    except KalshiError as e:
+        ok = e.status == 400
+    check("other errors are not retried", ok and waits == [5, 15])
+
+    def always():
+        raise KalshiError(429, {"message": "x"})
+    w2 = []
+    try:
+        mm.with_retry(always, sleep=w2.append)
+        ok = False
+    except KalshiError:
+        ok = True
+    check("gives up after 3 waits", ok and w2 == [5, 15, 45], w2)
+
+
 def quoter_select_tests():
     import types
 
@@ -412,6 +443,7 @@ if __name__ == "__main__":
     sim_tests()
     backtest_prune_test()
     quoter_select_tests()
+    retry_tests()
     integration_tests(tempfile.mkdtemp())
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     if FAIL:

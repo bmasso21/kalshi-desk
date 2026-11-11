@@ -40,7 +40,7 @@ import time
 import traceback
 
 from .fees import fee
-from .kalshi_client import KalshiClient, TokenBucket
+from .kalshi_client import KalshiClient, KalshiError, TokenBucket
 from .warehouse import PROD_URL, iso_ts
 
 SCHEMA = """
@@ -221,12 +221,27 @@ class Pacer:
             self.last = time.monotonic()
 
 
+RETRY_429 = (5, 15, 45)      # seconds; Kalshi's limit is shared with the warehouse and the shadow polling
+
+
+def with_retry(fn, *a, sleep=time.sleep, **kw):
+    """Call fn; on HTTP 429 wait and retry (the client's own quick retries are exhausted by then)."""
+    for i, w in enumerate(RETRY_429 + (None,)):
+        try:
+            return fn(*a, **kw)
+        except KalshiError as e:
+            if e.status != 429 or w is None:
+                raise
+            sleep(w)
+
+
 def fetch_programs(client, max_pages=200, pace=None) -> tuple[list[dict], int]:
     progs, cur, pages = [], None, 0
     while True:
         if pace:
             pace()
-        page = client.request("GET", "/incentive_programs", {"status": "active", "type": "liquidity", "limit": 1000, "cursor": cur})
+        page = with_retry(client.request, "GET", "/incentive_programs",
+                          {"status": "active", "type": "liquidity", "limit": 1000, "cursor": cur})
         progs += page.get("incentive_programs") or []
         pages += 1
         cur = page.get("next_cursor")
@@ -249,7 +264,7 @@ def rank_markets(client, q: dict, sizes, now: float, prefilter: bool = False, mi
     for i in range(0, len(tickers), 100):
         prog(f"markets {i}/{len(tickers)}")
         pace()
-        for m in client.markets(status=None, tickers=tickers[i:i + 100], exclude_combos=False):
+        for m in with_retry(client.markets, status=None, tickers=tickers[i:i + 100], exclude_combos=False):
             mk[m["ticker"]] = m
     live = [t for t in tickers if mk.get(t, {}).get("status") == "active"
             and (mk[t].get("market_type") or "binary") == "binary"]
@@ -260,7 +275,7 @@ def rank_markets(client, q: dict, sizes, now: float, prefilter: bool = False, mi
         if i % 400 == 0:
             prog(f"order books {i}/{len(live)}")
         pace()
-        books.update(client.orderbooks(live[i:i + 20]))
+        books.update(with_retry(client.orderbooks, live[i:i + 20]))
     rows = []
     for t in live:
         m, v, ob = mk[t], pools[t], books.get(t) or {}
@@ -314,7 +329,7 @@ def pick_for_quoter(rows: list[dict], size: int, max_markets: int, max_capital: 
 
 # ------------------------------------------------------------------ scan --
 class Scanner:
-    def __init__(self, wdb, client: KalshiClient | None = None, req_per_sec: float = 5, clock=time.time):
+    def __init__(self, wdb, client: KalshiClient | None = None, req_per_sec: float = 3, clock=time.time):
         ensure_schema(wdb)
         self.db = wdb
         self.client = client or KalshiClient(PROD_URL)
