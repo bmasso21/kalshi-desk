@@ -430,10 +430,12 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         if oddspapi.usage()["left"] < need:
             raise HTTPException(400, f"needs up to {need} OddsPapi requests; {oddspapi.usage()['left']} left this month")
 
+        refresh = bool(b.get("refresh_fixtures"))
+
         def run():
             app_sp_state["running"] = True
             try:
-                Study(oddspapi, wdb, eng.warehouse.client, eng.warehouse).run(leagues, days_back, max_games)
+                Study(oddspapi, wdb, eng.warehouse.client, eng.warehouse).run(leagues, days_back, max_games, refresh)
             except Exception as e:
                 db.audit("sports_error", str(e)[:500])
             finally:
@@ -441,6 +443,11 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         import threading
         threading.Thread(target=run, daemon=True, name="sports-study").start()
         return {"ok": True, "max_requests": need}
+
+    @app.post("/api/sports/stop")
+    def sports_stop():
+        wdb.put("sp_stop", time.time())
+        return {"ok": True}
 
     @app.post("/api/sports/eval")
     def sports_eval():

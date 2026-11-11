@@ -278,7 +278,8 @@ async function loadSportsCfg(){const sp=CFG.sports||{};let j={configured:false,u
    <div class="row" style="margin-top:10px"><b>Study (Pinnacle vs Kalshi, finished games)</b>
     <label class="f">Leagues<input id="spL" value="NFL,NBA" style="width:110px"></label><label class="f">Days back<input id="spD" type="number" value="21" style="width:70px"></label>
     <label class="f">Games to pull (1 request each)<input id="spN" type="number" value="10" style="width:80px"></label>
-    <button class="b pri" ${j.configured&&!j.running?'':'disabled'} onclick="spStudy()">${j.running?'Running…':'Run study'}</button>
+    <label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" id="spR">refresh game list (+1 request/league)</label>
+    <button class="b pri" ${j.configured&&!j.running?'':'disabled'} onclick="spStudy()">${j.running?'Running…':'Run study'}</button>${j.running?'<button class="b no" onclick="api(\'/api/sports/stop\',{method:\'POST\'}).then(()=>toast(\'Stopping after the current game\'))">Stop</button>':''}
     <button class="b" onclick="api('/api/sports/eval',{method:'POST'}).then(()=>loadSportsCfg()).catch(e=>toast(e.message,'err'))">Score games pulled so far (free)</button></div>
    ${spSummary(j.study,j.eval)}
    <table><thead><tr><th>Time</th><th>Request</th><th>HTTP</th><th class="r">Bytes</th></tr></thead><tbody>${(j.calls||[]).slice(0,15).map(c=>`<tr><td>${ts(c.ts)}</td><td style="font-size:12px">${esc(c.path)} ${esc(c.params)}</td><td class="${c.status===200?'y':'n'}">${c.status}</td><td class="r">${c.bytes}</td></tr>`).join('')||'<tr><td colspan=4 class="mut">No requests yet</td></tr>'}</tbody></table>`;
@@ -289,7 +290,7 @@ function spSummary(st,ev){if(!st)return'';const f=st.fixtures||[];let h=`<table 
   return h}
 async function spStudy(){const L=$('#spL').value.split(',').map(x=>x.trim().toUpperCase()).filter(Boolean),n=+$('#spN').value;
   if(!confirm(`Pull Pinnacle history for up to ${n} finished games? Uses up to ${n+3*L.length+2} of this month's OddsPapi requests.`))return;
-  try{await api('/api/sports/study',{method:'POST',body:{leagues:L,max_games:n,days_back:+$('#spD').value}});toast('Study started','ok');setTimeout(loadSportsCfg,4000)}catch(e){toast(e.message,'err')}}
+  try{await api('/api/sports/study',{method:'POST',body:{leagues:L,max_games:n,days_back:+$('#spD').value,refresh_fixtures:$('#spR').checked}});toast('Study started','ok');setTimeout(loadSportsCfg,4000)}catch(e){toast(e.message,'err')}}
 async function saveSports(){const b={monthly_cap:+$('#spC').value};const k=$('#spK').value.trim();if(k)b.oddspapi_key=k;
   try{const r=await api('/api/config',{method:'POST',body:{sports:b}});CFG=r.config;toast('Saved','ok')}catch(e){toast(e.message,'err');try{CFG=(await api('/api/config')).config}catch(_){}}loadSportsCfg()}
 async function loadAuth(){const s=await api('/api/auth/status');let ss={sessions:[]};try{ss=await api('/api/auth/sessions')}catch(e){}

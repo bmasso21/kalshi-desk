@@ -108,7 +108,9 @@ def study_tests(tmp):
                     self.r429 += 1
                     return Resp(429, {"error": {"code": "RATE_LIMITED", "retryMs": 100}})
                 return Resp(200, {params["fixtureId"]: {"bookmakers": {"pinnacle": {"markets": {"141": {"outcomes": {
-                    "1411": {"players": {"0": snaps(1.50)}}, "1412": {"players": {"0": snaps(2.70)}}}}}}}}})
+                    "1411": {"players": {"0": snaps(1.50)}}, "1412": {"players": {"0": snaps(2.70)}}}},
+                    "140": {"outcomes": {"1": {"players": {"0": snaps(1.9)}}}}}},
+                    "kalshi": {"markets": {"141": {"outcomes": {"1411": {"players": {"0": snaps(1.4)}}}}}}}}})
             return Resp(404, {})
 
     class KC:
@@ -159,12 +161,14 @@ def study_tests(tmp):
     md = db.get("sp_meta")["NFL"]
     check("study: moneyline market chosen (not spread/total)", md["market_id"] == "141" and sorted(o["id"] for o in md["outcomes"]) == ["1411", "1412"], md)
     hist_calls = [c for c in os_.calls if c[0].endswith("/historical-odds")]
-    check("study: history pulled only for the matched game (+1 retry after 429), Pinnacle + Kalshi only", len(hist_calls) == 2
-          and all(c[1]["fixtureId"] == "idA" and c[1]["bookmakers"] == "pinnacle,kalshi" for c in hist_calls))
+    check("study: history pulled only for the matched game (+1 retry after 429), Pinnacle only", len(hist_calls) == 2
+          and all(c[1]["fixtureId"] == "idA" and c[1]["bookmakers"] == "pinnacle" for c in hist_calls))
     check("study: 429 -> waited retryMs then retried", any(0.5 <= x <= 1.0 for x in slept), slept)
     check("study: request count = sports+tournaments+markets+fixtures+2 history", op.usage()["used"] == 6, op.usage())
     n_odds = db.query("SELECT count(*) n FROM sp_odds")[0]["n"]
-    check("study: Pinnacle snapshots stored", n_odds == 60, n_odds)
+    check("study: only Pinnacle moneyline snapshots stored", n_odds == 60, n_odds)
+    smp = op.raw("hist_sample")["body"]
+    check("study: raw sample is size-capped", len(smp["head"]) <= 20000 and smp["bytes"] > 0 and smp["moneyline_rows"] == 60)
     nc = db.query("SELECT count(*) n FROM wh_candles WHERE period=1")[0]["n"]
     nt = db.query("SELECT count(*) n FROM wh_trades")[0]["n"]
     check("study: Kalshi 1-min candles + trades synced", nc > 400 and nt == 300, (nc, nt))
@@ -303,7 +307,7 @@ def main():
     check("key never written to the audit trail", KEY not in aud and "monthly_cap" in aud)
     check("sports status: configured", c.get("/api/sports").json()["configured"] is True)
     check("discover needs the CSRF token", c.post("/api/sports/discover").status_code in (401, 403))
-    check("version 2.2.3", __import__("app").__version__ == "2.2.3")
+    check("version 2.2.4", __import__("app").__version__ == "2.2.4")
     check("no orders placed", not app.state.engine.db.query("SELECT 1 FROM orders_log LIMIT 1"))
 
 

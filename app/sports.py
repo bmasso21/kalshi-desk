@@ -466,24 +466,32 @@ class Study:
 
     # ---- Pinnacle history (1 request per game) ----
     def pull_history(self, fixture: dict) -> int:
-        body = self.op.get("/historical-odds", {"fixtureId": fixture["fixture_id"], "bookmakers": "pinnacle,kalshi"},
-                           note=f"hist:{fixture['league']}")      # polymarket must be requested alone
+        """Pinnacle only (Kalshi comes free from Kalshi itself; asking OddsPapi for 'kalshi' returns every prop market
+        and can be hundreds of MB). Only the moneyline market is stored."""
+        body = self.op.get("/historical-odds", {"fixtureId": fixture["fixture_id"], "bookmakers": "pinnacle"},
+                           note=f"hist:{fixture['league']}")
+        mid = (self.meta(fixture["league"]) or {}).get("market_id")
+        rows = [r for r in walk_historical(body, fixture["fixture_id"]) if r[1] == "pinnacle" and (not mid or r[2] == str(mid))]
         if not self.db.get("sp_raw_hist_sample"):
-            self.op.save_raw("hist_sample", body)
+            txt = json.dumps(body)
+            self.op.save_raw("hist_sample", {"bytes": len(txt), "head": txt[:20000], "moneyline_rows": len(rows)})
             self.db.put("sp_raw_hist_sample", fixture["fixture_id"])
-        rows = walk_historical(body, fixture["fixture_id"])
         if rows:
             self.db.executemany("INSERT OR REPLACE INTO sp_odds VALUES(?,?,?,?,?,?,?,?)", rows)
         self.db.execute("UPDATE sp_fixtures SET hist_pulled=?, hist_rows=? WHERE fixture_id=?",
                         (time.time(), len(rows), fixture["fixture_id"]))
         return len(rows)
 
-    def run(self, leagues=("NFL", "NBA"), days_back=21, max_games=20, refresh_fixtures=True) -> dict:
+    def stop(self):
+        self.db.put("sp_stop", time.time())
+
+    def run(self, leagues=("NFL", "NBA"), days_back=21, max_games=20, refresh_fixtures=False) -> dict:
         self.state = {"running": True, "started": time.time(), "log": [], "leagues": list(leagues), "max_games": max_games}
         self.db.put("sp_study", self.state)
         try:
             for lg in leagues:
-                if refresh_fixtures:
+                have = self.db.query("SELECT count(*) n FROM sp_fixtures WHERE league=?", (lg,))[0]["n"]
+                if refresh_fixtures or not have:
                     self.log(f"{lg}: fixtures +{self.fixtures(lg, days_back)}")
                 self.log(f"{lg}: Kalshi match {self.match(lg)}")
             todo = self.db.query(f"SELECT * FROM sp_fixtures WHERE kalshi_event IS NOT NULL AND hist_pulled IS NULL "
@@ -496,7 +504,11 @@ class Study:
                     if by[lg] and len(order) < max_games:
                         order.append(by[lg].pop(0))
             errs = 0
+            self.db.put("sp_stop", 0)
             for i, f in enumerate(order):
+                if self.db.get("sp_stop"):
+                    self.log("stopped by request")
+                    break
                 if self.op.usage()["left"] <= 0:
                     self.log("OddsPapi budget exhausted - stopping")
                     break
