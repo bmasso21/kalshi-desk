@@ -113,6 +113,7 @@ class Strategy:
     description = ""
     defaults: dict = {}
     uses_maker = False
+    candle_period = 60          # minutes per decision bar
 
     @classmethod
     def prepare(cls, wdb, params) -> object | None:
@@ -226,7 +227,54 @@ class WeatherFair(Strategy):
                 ctx.buy(side, px, min(size, room), maker=True, expire_hours=1, tag=f"bid_{side}")
 
 
-STRATEGIES: dict[str, type[Strategy]] = {s.name: s for s in (FavoriteLate, MakerJoin, WeatherFair)}
+class SportsFair(Strategy):
+    name = "sports_fair"
+    description = ("Maker (Phase 2.2). Pregame only: every `every_min` minutes from `start_minutes` until `stop_minutes` "
+                   "before the game, price each Kalshi team market at Pinnacle's no-vig line as seen `lag_sec` seconds "
+                   "earlier, and rest post-only bids `edge` below it on YES and NO (1-minute bars). Optional taker when the "
+                   "ask is `take_edge` below fair after fees (0 = never take). Uses Kalshi's real sports maker fees.")
+    defaults = {"edge": 0.02, "size": 10, "max_position": 50, "start_minutes": 360, "stop_minutes": 5, "every_min": 5,
+                "lag_sec": 60, "take_edge": 0.0}
+    uses_maker = True
+    candle_period = 1
+
+    @classmethod
+    def prepare(cls, wdb, params):
+        from .sports import SportsModel
+        return SportsModel(wdb, lag_sec=float(params.get("lag_sec", 60)))
+
+    @classmethod
+    def default_series(cls, svc):
+        return sorted({m.split("-")[0] for m in svc.by_market})
+
+    def on_bar(self, ctx):
+        p = ctx.params
+        fv = ctx.svc.fair(ctx.market, ctx.now) if ctx.svc else None
+        if not fv or not float(p["stop_minutes"]) <= fv["minutes_to_start"] <= float(p["start_minutes"]):
+            ctx.cancel_all()
+            return
+        if ctx.now - ctx.state.get("last", 0) < float(p["every_min"]) * 60 - 1:
+            return
+        ctx.state["last"] = ctx.now
+        ctx.cancel_all()
+        yb, ya = ctx.yes_bid, ctx.yes_ask
+        edge, size, cap, take = float(p["edge"]), float(p["size"]), float(p["max_position"]), float(p["take_edge"])
+        for side, fair, ask in (("yes", fv["p_yes"], ya if ya and 0 < ya < 1 else None),
+                                ("no", 1 - fv["p_yes"], (1 - yb) if yb and 0 < yb < 1 else None)):
+            room = cap - ctx.position[side]
+            if room <= 0:
+                continue
+            if take > 0 and ask is not None and ask + 0.07 * ask * (1 - ask) <= fair - take:
+                ctx.buy(side, price=round(ask, 2), count=min(size, room), tag=f"take_{side}")
+                continue
+            px = math.floor((fair - edge) * 100 + 1e-9) / 100
+            if ask is not None:
+                px = min(px, round(ask - 0.01, 2))
+            if px >= 0.01:
+                ctx.buy(side, px, min(size, room), maker=True, expire_hours=float(p["every_min"]) / 60, tag=f"bid_{side}")
+
+
+STRATEGIES: dict[str, type[Strategy]] = {s.name: s for s in (FavoriteLate, MakerJoin, WeatherFair, SportsFair)}
 
 
 def register(cls: type[Strategy]):
@@ -410,7 +458,7 @@ class Backtester:
         markets = self.load_markets(flt)
         per: dict[str, list] = {m: [] for m in models}
         for i, mk in enumerate(markets):
-            bars, trades = self.market_data(mk["ticker"])
+            bars, trades = self.market_data(mk["ticker"], cls.candle_period)
             if bars:
                 for model in models:
                     sim = MarketSim(mk, bars, trades, cls(), p, mk.get("fee_type"), mk.get("fee_multiplier"), model,

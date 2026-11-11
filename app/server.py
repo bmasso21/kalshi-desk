@@ -35,7 +35,9 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     from .weather import board as wx_board
     wx_store = WxStore(wdb)
     from .sports import BudgetExceeded, OddsPapi
+    from .sports import Study
     from .sports import discover as sp_discover
+    from .sports import evaluate as sp_evaluate
     oddspapi = OddsPapi(lambda: cfg.data.get("sports") or {}, wdb)
     app_sp_state = {"running": False}
     eng.weather = WxCollector(eng, wx_store)
@@ -409,8 +411,40 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     # -------------------------------------------------------------- sports --
     @app.get("/api/sports")
     def sports_status():
+        st = Study(oddspapi, wdb, eng.warehouse.client, eng.warehouse)
         return {"configured": oddspapi.configured, "usage": oddspapi.usage(), "running": app_sp_state["running"],
-                "calls": oddspapi.calls(60), "discover": wdb.get("sp_discover")}
+                "calls": oddspapi.calls(60), "discover": wdb.get("sp_discover"), "study": st.summary(),
+                "eval": wdb.get("sp_eval")}
+
+    @app.post("/api/sports/study")
+    async def sports_study(request: Request):
+        b = await request.json()
+        if not oddspapi.configured:
+            raise HTTPException(400, "Add your OddsPapi key in Settings first")
+        if app_sp_state["running"]:
+            raise HTTPException(409, "already running")
+        leagues = [x for x in (b.get("leagues") or ["NFL", "NBA"]) if x in ("NFL", "NBA", "NHL", "MLB")]
+        max_games = max(1, min(200, int(b.get("max_games") or 10)))
+        days_back = max(1.0, min(120.0, float(b.get("days_back") or 21)))
+        need = max_games + 3 * len(leagues) + 2
+        if oddspapi.usage()["left"] < need:
+            raise HTTPException(400, f"needs up to {need} OddsPapi requests; {oddspapi.usage()['left']} left this month")
+
+        def run():
+            app_sp_state["running"] = True
+            try:
+                Study(oddspapi, wdb, eng.warehouse.client, eng.warehouse).run(leagues, days_back, max_games)
+            except Exception as e:
+                db.audit("sports_error", str(e)[:500])
+            finally:
+                app_sp_state["running"] = False
+        import threading
+        threading.Thread(target=run, daemon=True, name="sports-study").start()
+        return {"ok": True, "max_requests": need}
+
+    @app.post("/api/sports/eval")
+    def sports_eval():
+        return sp_evaluate(wdb)
 
     @app.post("/api/sports/discover")
     def sports_discover():
