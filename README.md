@@ -42,6 +42,22 @@ turns red and every real-money order asks you to confirm twice.
 | Ledger | Every order attempt the app made (placed or rejected and why) plus an audit log. |
 | Settings | Keys, environment, risk limits, auto-trading, scanner. |
 
+### Real-time feed (v1.2)
+The app keeps one authenticated WebSocket connection to Kalshi (`wss://external-api-ws[.demo].kalshi.co/trade-api/ws/v2`):
+- **Account (all markets):** order updates (`user_orders`), fills (`fill`), positions (`market_positions`).
+- **Markets:** live order books (`orderbook_delta`) and tickers (`ticker`) for the markets that matter right now: the quoter's markets, markets you hold, and any market you open in the UI (kept for 5 minutes). Up to 250 at once.
+- Deltas are applied in sequence order. A missed message (sequence gap) triggers a fresh snapshot.
+- If the connection drops, the app reconnects automatically (1s, 2s, 4s … up to 30s) and re-reads resting orders and recent fills over REST, so nothing is missed. **While it's down, everything falls back to REST polling** exactly as in v1.1.
+- The header shows `LIVE · n/m books` (green) or `POLLING` (amber). `/api/feed` has the details.
+- Every fill is stored in the `fills` table with its strategy and source (used by the closing-line-value tracker).
+- The quoter now wakes on book changes in its markets (at most every 2s) instead of only every 15s.
+
+### Updating a running install
+Drop an empty file named `restart.request` next to `run.py`. The app cancels quoter orders, exits, and the boot task restarts it about 15 seconds later.
+
+### Tests
+`.venv\Scripts\python run_tests.py` runs everything against strict offline mocks of Kalshi's REST and WebSocket APIs (needs `pip install -r requirements-test.txt`).
+
 ### Scanner strategies
 - **basket_no** - On a mutually-exclusive event, buying NO on every outcome pays at least N-1 dollars. Flags when the total cost plus fees is below that. This is the only true arbitrage here. Its risk is *leg risk*: legs are sent fill-or-kill one at a time, and if a later leg misses, earlier legs stay filled. The ledger and audit flag `LEG_RISK`.
 - **basket_yes** - Buying YES on every outcome pays $1 only if exactly one outcome wins. If the event can resolve with none of the listed outcomes, you lose the basket. **Read the rules.** This strategy can never auto-trade.
