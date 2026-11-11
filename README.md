@@ -90,6 +90,15 @@ Built-in reference strategies: `favorite_late` (taker; favourite-longshot bias t
 - Shown overall and by strategy, category and series for 7/30/90/365 days, weighted by contracts, with "% of contracts that beat the close". The daily summary includes the 30-day CLV.
 - The backtester uses the same definition. Phase 3.2 will use the 30-day CLV per strategy to cut budgets automatically.
 
+### Remote access (v1.6, Tailscale + password)
+The server still listens only on `127.0.0.1`. `tailscale serve --bg 8765` publishes it as `https://<machine>.<tailnet>.ts.net`, reachable **only by devices signed in to your Tailscale account** (phone, laptop), with a real HTTPS certificate.
+- **On this computer** the app works without a password, as before.
+- **Remotely** a password is always required (Settings -> Remote access; at least 12 characters; stored as a PBKDF2 hash). Remote access is refused until a password has been set *on this computer*.
+- Optional **"Only these Tailscale accounts"** list: other accounts are refused before they even see the login page.
+- Sessions last 30 days (HttpOnly, Secure, SameSite=Strict cookie). "Log out everywhere" and password changes end all sessions.
+- 5 wrong passwords in 15 minutes lock remote logins for 15 minutes and send a phone alert; each new remote login sends a silent alert.
+- Real-money orders still need the double confirmation; nothing about trading permissions changes.
+
 ### Updating a running install
 Drop an empty file named `restart.request` next to `run.py`. The app cancels quoter orders, exits, and the boot task restarts it about 15 seconds later.
 
@@ -150,6 +159,7 @@ Both are rounded up to the cent. The real fee is shown on each fill.
 
 ## Notes / limits
 - Runs only while `start.bat` is open, and only on `127.0.0.1`. Nothing is reachable from your network.
+- Remote access (v1.6): see below. Without it, nothing is reachable from your network.
 - Keys never leave your computer. The browser never sees the key file path.
 - Data: `kalshi_desk.db` (SQLite) and `config.json` live in this folder. Back them up if you care about the ledger.
 - The app does not cover perps (margin), RFQs, block trades, or combos (multivariate). Combos are excluded from browsing.

@@ -51,6 +51,7 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
   <span class="spacer"></span>
   <span id="scanInfo" class="mut" style="font-size:12px"></span>
   <button class="b kill" id="killBtn">KILL SWITCH</button>
+  <button class="b hide" id="logoutBtn" onclick="api('/api/auth/logout',{method:'POST',body:{}}).finally(()=>location.replace('/login'))">Log out</button>
 </header>
 <main>
 <!-- SCANNER -->
@@ -119,6 +120,7 @@ async function api(u,o={}){o.headers={'Content-Type':'application/json','X-Desk-
   if(o.body&&typeof o.body!=='string')o.body=JSON.stringify(o.body);
   const r=await fetch(u,o);let j={};try{j=await r.json()}catch(e){}
   if(r.status===409&&j.needs_confirm){if(confirm(j.message)){const b=JSON.parse(o.body||'{}');b.confirm_token=j.confirm_token;return api(u,{...o,body:b})}throw new Error('Cancelled')}
+  if(r.status===401&&j.login){location.replace('/login');throw new Error('Please log in')}
   if(!r.ok)throw new Error(j.error||j.detail||('HTTP '+r.status));return j}
 // tabs
 document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x===b));
@@ -251,7 +253,21 @@ async function loadSettings(){const j=await api('/api/config');CFG=j.config;cons
     <label class="f">Min 24h volume${num('s3',s.min_volume_24h,'1')}</label><label class="f">Max events scanned${num('s4',s.max_markets_scanned,'100')}</label>
     ${strat.map(x=>`<label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" class="ss" value="${x}" ${s.strategies.includes(x)?'checked':''}>${x}</label>`).join('')}</div></div>
    <button class="b pri" onclick="saveSettings()">Save settings</button>
-   <div class="card" style="margin-top:12px"><h3 style="margin-top:0">Phone alerts (Pushover)</h3><div id="alertsBox" class="mut">Loading…</div></div>`;$('#sEnv').value=c.env;loadAlerts()}
+   <div class="card" style="margin-top:12px"><h3 style="margin-top:0">Remote access (Tailscale)</h3><div id="authBox" class="mut">Loading…</div></div>
+   <div class="card" style="margin-top:12px"><h3 style="margin-top:0">Phone alerts (Pushover)</h3><div id="alertsBox" class="mut">Loading…</div></div>`;$('#sEnv').value=c.env;loadAlerts();loadAuth()}
+async function loadAuth(){const s=await api('/api/auth/status');let ss={sessions:[]};try{ss=await api('/api/auth/sessions')}catch(e){}
+  $('#authBox').innerHTML=`<p style="margin-top:0">${s.remote_url?'Remote address: <a href="'+esc(s.remote_url)+'">'+esc(s.remote_url)+'</a> (only devices signed in to your Tailscale account can reach it).':'Remote address not set up yet.'}<br>
+   ${s.password_set?'<span class="y">Password is set.</span>':'<span class="w">No password yet – remote access stays OFF until you set one (only possible on this computer).</span>'} You are ${s.local?'on the server computer':'remote ('+esc(s.tailscale_login||'tailnet device')+')'}.</p>
+   <div class="row">${s.password_set&&!s.local?'<label class="f">Current password<input id="pwCur" type="password" autocomplete="current-password"></label>':''}
+    <label class="f">${s.password_set?'New password':'Password'} (12+ characters)<input id="pwNew" type="password" autocomplete="new-password"></label><label class="f">Repeat<input id="pwNew2" type="password" autocomplete="new-password"></label>
+    <button class="b pri" onclick="setPw()">${s.password_set?'Change password':'Set password'}</button></div>
+   <div class="row" style="margin-top:10px"><label class="f" style="flex:1">Only these Tailscale accounts (comma separated, blank = any device in your tailnet)<input id="tsAllow" value="${esc((s.allowed_tailscale_logins||[]).join(', '))}"></label>
+    ${s.tailscale_login?`<button class="b" onclick="$('#tsAllow').value='${esc(s.tailscale_login)}'">Just me (${esc(s.tailscale_login)})</button>`:''}<button class="b" onclick="saveAllow()">Save</button></div>
+   <table style="margin-top:10px"><thead><tr><th>Logged-in devices</th><th>Since</th><th>Last seen</th></tr></thead><tbody>${ss.sessions.map(x=>`<tr><td>${esc(x.login||'')} <span class="mut" style="font-size:12px">${esc((x.agent||'').slice(0,70))}</span></td><td>${ts(x.created)}</td><td>${ts(x.last_seen)}</td></tr>`).join('')||'<tr><td colspan=3 class="mut">None</td></tr>'}</tbody></table>
+   <button class="b" style="margin-top:8px" onclick="if(confirm('Log out every device?'))api('/api/auth/logout',{method:'POST',body:{everywhere:true}}).then(()=>{toast('All devices logged out','ok');loadAuth()})">Log out everywhere</button>`}
+async function setPw(){const n=$('#pwNew').value;if(n!==$('#pwNew2').value){toast('Passwords do not match','err');return}
+  try{const r=await api('/api/auth/password',{method:'POST',body:{new:n,current:$('#pwCur')?$('#pwCur').value:null}});toast(r.message,'ok');loadAuth()}catch(e){toast(e.message,'err')}}
+async function saveAllow(){const v=$('#tsAllow').value.split(',').map(x=>x.trim()).filter(Boolean);try{await api('/api/config',{method:'POST',body:{auth:{allowed_tailscale_logins:v}}});toast('Saved','ok')}catch(e){toast(e.message,'err')}loadAuth()}
 async function loadAlerts(){const al=CFG.alerts||{};let j={configured:false,alerts:[]};try{j=await api('/api/alerts')}catch(e){}
   const cb=(id,v,t)=>`<label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" id="${id}" ${v?'checked':''}>${t}</label>`;
   const pr={'-1':'low','0':'normal','1':'high','2':'EMERGENCY'};
@@ -330,7 +346,7 @@ async function showBt(id){const b=await api('/api/backtests/'+id);if(b.status!==
    ${curve(v.equity_curve)}<div class="mut" style="font-size:12px">Params ${esc(JSON.stringify(R.params))} · filters ${esc(JSON.stringify(R.filters))} · slippage ${R.slippage_cents}¢</div>
    <table style="margin-top:8px"><thead><tr><th>Series</th><th class="r">Markets</th><th class="r">Contracts</th><th class="r">Fees</th><th class="r">P&amp;L</th><th class="r">ROI</th><th class="r">CLV</th></tr></thead><tbody>${Object.entries(v.by_series).slice(0,40).map(([k,x])=>`<tr><td>${esc(k)}</td><td class="r">${x.markets}</td><td class="r">${x.contracts.toFixed(0)}</td><td class="r">${money(x.fees)}</td><td class="r ${x.pnl<0?'n':'y'}">${money(x.pnl)}</td><td class="r">${pct(x.roi)}</td><td class="r">${x.avg_clv_cents==null?'–':x.avg_clv_cents.toFixed(2)+'¢'}</td></tr>`).join('')}</tbody></table></div>`).join('')}
 // boot
-(async()=>{const s=await api('/api/session');TOKEN=s.token;CFG=(await api('/api/config')).config;status();loadSignals();loadCats();setInterval(status,5000);setInterval(()=>{if(!$('#t-scanner').classList.contains('hide'))loadSignals()},20000)})();
+(async()=>{const s=await api('/api/session');TOKEN=s.token;api('/api/auth/status').then(a=>{if(!a.local)$('#logoutBtn').classList.remove('hide')}).catch(()=>{});CFG=(await api('/api/config')).config;status();loadSignals();loadCats();setInterval(status,5000);setInterval(()=>{if(!$('#t-scanner').classList.contains('hide'))loadSignals()},20000)})();
 </script>
 </body>
 </html>

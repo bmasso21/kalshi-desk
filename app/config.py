@@ -83,6 +83,13 @@ DEFAULTS = {
         "healthcheck_url": "",          # optional dead-man ping (e.g. healthchecks.io) every minute
         "api_url_override": "",         # testing only
     },
+    # --- remote access (Tailscale serve + password) ---------------------------
+    "auth": {
+        "password_hash": "", "salt": "", "iterations": 600000,
+        "session_days": 30,
+        "allowed_tailscale_logins": [],   # e.g. ["you@gmail.com"]; empty = any device in your tailnet (still needs the password)
+    },
+    "remote_url": "",                     # https://<machine>.<tailnet>.ts.net (set by the setup script)
     # --- research data warehouse (production PUBLIC market data, no key) ------
     "warehouse": {
         "enabled": True,
@@ -185,6 +192,10 @@ class Config:
             d[f"{e}_private_key_path"] = bool(d[f"{e}_private_key_path"])
             kid = d[f"{e}_key_id"]
             d[f"{e}_key_id"] = (kid[:8] + "…") if kid else ""
+        au = d.get("auth", {})
+        for k in ("password_hash", "salt", "iterations"):
+            au.pop(k, None)
+        au["password_set"] = bool(self.data.get("auth", {}).get("password_hash"))
         a = d.get("alerts", {})
         for k in ("pushover_user", "pushover_token"):
             a[k] = (a[k][:4] + "…") if a.get(k) else ""

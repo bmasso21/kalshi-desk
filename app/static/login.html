@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kalshi Desk – log in</title>
+<style>
+:root{--bg:#0f1214;--panel:#171b1e;--line:#262c31;--txt:#e6e9eb;--mut:#8b959c;--no:#e5484d}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--txt);font:16px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;padding:16px}
+form{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;width:100%;max-width:360px}
+h1{font-size:20px;margin:0 0 4px}p{color:var(--mut);font-size:13px;margin:0 0 16px}
+input{width:100%;padding:12px;border-radius:8px;border:1px solid var(--line);background:#0c0f11;color:var(--txt);font-size:16px}
+button{width:100%;margin-top:12px;padding:12px;border-radius:8px;border:1px solid #24508c;background:#173257;color:var(--txt);font-size:16px;cursor:pointer}
+#err{color:var(--no);font-size:14px;min-height:20px;margin-top:10px}
+</style>
+</head>
+<body>
+<form id="f">
+  <h1>Kalshi Desk</h1>
+  <p id="who">Private trading desk. Log in to continue.</p>
+  <input id="pw" type="password" autocomplete="current-password" placeholder="Password" autofocus required>
+  <button type="submit">Log in</button>
+  <div id="err"></div>
+</form>
+<script>
+fetch('/api/auth/status').then(r=>r.json()).then(s=>{if(s.tailscale_login)document.getElementById('who').textContent='Signed in to Tailscale as '+s.tailscale_login+'.';if(s.logged_in)location.replace('/')}).catch(()=>{});
+document.getElementById('f').onsubmit=async e=>{e.preventDefault();const err=document.getElementById('err');err.textContent='';
+  try{const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})});
+    const j=await r.json();if(r.ok)location.replace('/');else{err.textContent=j.error||'Login failed';document.getElementById('pw').select()}}catch(x){err.textContent='Server unreachable'}};
+</script>
+</body>
+</html>

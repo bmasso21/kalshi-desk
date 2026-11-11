@@ -126,7 +126,10 @@ def main():
           and msgs[-1]["priority"] == "1", msgs[-1])
     al.mark_clean("restart requested (update)")
     al.startup("9.9"); flush()
-    check("after clean stop -> normal, says why", msgs[-1]["priority"] == "0" and "restart requested" in msgs[-1]["message"])
+    check("after an update restart -> silent (low), says why", msgs[-1]["priority"] == "-1" and "restart requested" in msgs[-1]["message"])
+    al.mark_clean("clean shutdown")
+    al.startup("9.9"); flush()
+    check("after other clean stop -> normal", msgs[-1]["priority"] == "0")
 
     # ---- fills ----------------------------------------------------------------------------
     n0 = len(msgs)

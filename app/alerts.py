@@ -176,7 +176,8 @@ class Alerter:
         if clean or first:
             self.send("started", "Kalshi Desk started",
                       f"v{version} running, env {self.e.cfg.env.upper()}."
-                      + (f" Previous stop: {reason}." if reason else ""), NORMAL)
+                      + (f" Previous stop: {reason}." if reason else ""),
+                      LOW if "update" in reason else NORMAL)   # routine update restarts are silent
         else:
             self.send("started", "Kalshi Desk restarted after an unclean stop",
                       f"v{version} running, env {self.e.cfg.env.upper()}. The previous run ended without a clean "

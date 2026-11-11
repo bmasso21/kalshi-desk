@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 from . import __version__, risk
 from .config import Config
@@ -32,9 +32,12 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     eng.warehouse = Warehouse(eng, wdb)
     eng.feed.listeners.append(eng.warehouse.on_feed)
     bt = Backtester(wdb)
+    from .auth import COOKIE, Auth
+    auth = Auth(cfg, db, eng.alerts, extra_local_hosts=() if start_engine else ("testclient",))
     app = FastAPI(title="Kalshi Desk", version=__version__)
     app.state.engine = eng
     app.state.backtester = bt
+    app.state.auth = auth
     app.state.wdb = wdb
     session_token = secrets.token_urlsafe(24)  # CSRF guard for state-changing calls
     prod_confirms: dict[str, float] = {}
@@ -65,11 +68,66 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         return JSONResponse({"error": f"Risk check: {e}"}, status_code=400)
 
     @app.middleware("http")
-    async def _csrf(request: Request, call_next):
-        if request.method in ("POST", "PUT", "DELETE") and request.url.path.startswith("/api/"):
+    async def _guard(request: Request, call_next):
+        ok, code, msg = auth.check(request)
+        if not ok:
+            if request.url.path.startswith("/api/"):
+                return JSONResponse({"error": msg, "login": code == 401}, status_code=code)
+            if code == 401:
+                return RedirectResponse("/login", status_code=303)
+            return HTMLResponse(f"<!doctype html><meta name=viewport content='width=device-width'><body style='font:16px sans-serif;"
+                                f"background:#0f1214;color:#e6e9eb;padding:24px'><h2>Kalshi Desk</h2><p>{msg}</p>", status_code=code)
+        if request.method in ("POST", "PUT", "DELETE") and request.url.path.startswith("/api/") \
+                and request.url.path != "/api/auth/login":
             if request.headers.get("X-Desk-Token") != session_token:
                 return JSONResponse({"error": "bad session token - reload the page"}, status_code=403)
         return await call_next(request)
+
+    # ---------------------------------------------------------------- auth --
+    @app.get("/login")
+    def login_page():
+        return FileResponse(STATIC / "login.html")
+
+    @app.get("/api/auth/status")
+    def auth_status(request: Request):
+        sess = auth.session(request)
+        return {"password_set": auth.password_set, "local": auth.is_local(request),
+                "tailscale_login": auth.ts_login(request), "logged_in": bool(sess) or auth.is_local(request),
+                "allowed_tailscale_logins": auth.conf.get("allowed_tailscale_logins") or [],
+                "remote_url": cfg.data.get("remote_url") or ""}
+
+    @app.post("/api/auth/login")
+    async def auth_login(request: Request):
+        b = await request.json()
+        ok, msg, tok = auth.login(request, str(b.get("password") or ""))
+        if not ok:
+            return JSONResponse({"error": msg}, status_code=401)
+        r = JSONResponse({"ok": True})
+        r.set_cookie(COOKIE, tok, max_age=int(float(auth.conf.get("session_days", 30)) * 86400), httponly=True,
+                     secure=not auth.is_local(request), samesite="strict", path="/")
+        return r
+
+    @app.post("/api/auth/logout")
+    async def auth_logout(request: Request):
+        b = await request.json() if (request.headers.get("content-length") or "0") != "0" else {}
+        auth.logout(request, everywhere=bool(b.get("everywhere")))
+        r = JSONResponse({"ok": True})
+        r.delete_cookie(COOKIE, path="/")
+        return r
+
+    @app.post("/api/auth/password")
+    async def auth_password(request: Request):
+        b = await request.json()
+        ok, msg = auth.set_password(request, str(b.get("new") or ""), b.get("current"))
+        if not ok:
+            return JSONResponse({"error": msg}, status_code=400)
+        r = JSONResponse({"ok": True, "message": msg})
+        r.delete_cookie(COOKIE, path="/")
+        return r
+
+    @app.get("/api/auth/sessions")
+    def auth_sessions():
+        return {"sessions": auth.sessions()}
 
     # ------------------------------------------------------------------ ui --
     @app.get("/")
@@ -126,6 +184,39 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 except Exception:
                     patch.pop(pk)
                     errors.append(f"{e} key file is not a valid private key: {p}")
+        if "auth" in patch:
+            a = patch["auth"] if isinstance(patch["auth"], dict) else {}
+            a = {k: v for k, v in a.items() if k in ("allowed_tailscale_logins", "session_days")}
+            if "allowed_tailscale_logins" in a:
+                v = a["allowed_tailscale_logins"]
+                if not isinstance(v, list) or not all(isinstance(x, str) and "@" in x or isinstance(x, str) and len(x) < 100 for x in v):
+                    a.pop("allowed_tailscale_logins")
+                    errors.append("allowed Tailscale logins must be a list of account names")
+                else:
+                    v = [x.strip() for x in v if x.strip()]
+                    me = (auth.ts_login(request) or "").lower()
+                    if v and not auth.is_local(request) and me not in [x.lower() for x in v]:
+                        a.pop("allowed_tailscale_logins")
+                        errors.append(f"That list doesn't include you ({me or 'unknown'}) - refusing to lock you out")
+                    else:
+                        a["allowed_tailscale_logins"] = v
+            if "session_days" in a:
+                try:
+                    a["session_days"] = max(1.0, min(365.0, float(a["session_days"])))
+                except (TypeError, ValueError):
+                    a.pop("session_days")
+            patch["auth"] = a
+            if not a:
+                patch.pop("auth")
+        if "remote_url" in patch:
+            u = str(patch.get("remote_url") or "").strip().rstrip("/")
+            if not auth.is_local(request):
+                patch.pop("remote_url")
+            elif u and not re.fullmatch(r"https://[A-Za-z0-9.-]+\.ts\.net", u):
+                patch.pop("remote_url")
+                errors.append("remote_url must look like https://<machine>.<tailnet>.ts.net")
+            else:
+                patch["remote_url"] = u
         if isinstance(patch.get("warehouse"), dict):
             w = patch["warehouse"]
             w.pop("base_url_override", None)         # test-only, never from the browser
