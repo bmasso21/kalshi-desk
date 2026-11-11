@@ -34,6 +34,13 @@ CREATE TABLE IF NOT EXISTS settlements (
 CREATE TABLE IF NOT EXISTS day_equity (
     env TEXT, day TEXT, start_equity REAL, ts REAL, PRIMARY KEY (env, day)
 );
+CREATE TABLE IF NOT EXISTS fills (
+    env TEXT, fill_key TEXT, trade_id TEXT, order_id TEXT, client_order_id TEXT, ticker TEXT,
+    action TEXT, outcome_side TEXT, book_side TEXT, yes_price TEXT, count TEXT, fee TEXT,
+    is_taker INTEGER, post_position TEXT, ts REAL, source TEXT, strategy TEXT, order_source TEXT, raw TEXT,
+    PRIMARY KEY (env, fill_key)
+);
+CREATE INDEX IF NOT EXISTS fills_ts ON fills(env, ts);
 CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT, message TEXT
 );
@@ -71,6 +78,36 @@ class DB:
                            tuple(str(v) if v is not None and not isinstance(v, (int, float)) else v
                                  for v in f.values()))
         return cur.lastrowid
+
+    def record_fill(self, env: str, f: dict, source: str) -> bool:
+        """Store a fill from the WebSocket feed or REST /portfolio/fills. Returns True if new.
+        Both feeds carry trade_id; REST also has fill_id. Keyed so the two never double count."""
+        import datetime as _dt
+        tid = f.get("trade_id") or f.get("fill_id")
+        oid = f.get("order_id") or ""
+        key = f"{tid}:{oid}" if tid else f"{oid}:{f.get('ts_ms') or f.get('created_time')}:{f.get('count_fp')}"
+        ts = f.get("ts_ms")
+        if ts:
+            ts = float(ts) / 1000
+        elif f.get("ts"):
+            ts = float(f["ts"])
+        elif f.get("created_time"):
+            try:
+                ts = _dt.datetime.fromisoformat(str(f["created_time"]).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                ts = time.time()
+        else:
+            ts = time.time()
+        meta = self.query("SELECT strategy, source FROM orders_log WHERE order_id=? ORDER BY id DESC LIMIT 1", (oid,)) if oid else []
+        fee = f.get("fee_cost") if f.get("fee_cost") is not None else f.get("fee_cost_dollars")
+        cur = self.execute(
+            "INSERT OR IGNORE INTO fills VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (env, key, tid, oid, f.get("client_order_id"), f.get("market_ticker") or f.get("ticker"),
+             f.get("action"), f.get("outcome_side") or f.get("purchased_side") or f.get("side"),
+             f.get("book_side"), f.get("yes_price_dollars"), f.get("count_fp"), str(fee) if fee is not None else None,
+             int(bool(f.get("is_taker"))), f.get("post_position_fp"), ts, source,
+             meta[0]["strategy"] if meta else None, meta[0]["source"] if meta else None, json.dumps(f, default=str)))
+        return cur.rowcount > 0
 
     def spend_since(self, env: str, since_ts: float, source: str | None = None) -> float:
         sql = "SELECT cost FROM orders_log WHERE env=? AND ts>=? AND status='placed'"

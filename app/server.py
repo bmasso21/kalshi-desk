@@ -67,8 +67,11 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     @app.get("/api/status")
     def status():
         c = eng.client
+        fs = eng.feed.status()
         out = {"env": cfg.env, "authenticated": c.authenticated, "scan": eng.scan_state,
-               "kill_switch": cfg.risk["kill_switch"], "auto": cfg.auto["enabled"]}
+               "kill_switch": cfg.risk["kill_switch"], "auto": cfg.auto["enabled"],
+               "feed": {k: fs[k] for k in ("mode", "connected", "reason", "error", "markets_watched",
+                                           "books_synced", "since", "last_msg")}}
         try:
             out["exchange"] = c.exchange_status()
         except Exception as e:
@@ -194,10 +197,31 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         evs.sort(key=vol, reverse=True)
         return {"events": evs[:limit], "total": len(evs)}
 
+    @app.get("/api/feed")
+    def feed_status():
+        return eng.feed.status()
+
+    def _book(ticker: str):
+        eng.feed.want_ui(ticker)
+        ob = eng.feed.book(ticker, depth=10)
+        if ob is not None:
+            return ob, "ws"
+        return eng.client.orderbook(ticker, depth=10), "rest"
+
+    @app.get("/api/book/{ticker}")
+    def live_book(ticker: str):
+        """Lightweight book refresh for the market view (live feed when available)."""
+        ob, src = _book(ticker)
+        book = book_from_orderbook(ob)
+        js = lambda lv: [[str(p), str(c)] for p, c in lv]
+        top = eng.feed.top(ticker)
+        return {"ticker": ticker, "source": src, "book": {k: js(v) for k, v in book.items()},
+                "top": {k: str(v) for k, v in top.items()} if top else None}
+
     @app.get("/api/market/{ticker}")
     def market(ticker: str):
-        m = eng.client.market(ticker)
-        ob = eng.client.orderbook(ticker, depth=10)
+        m = eng.feed.market_overlay(eng.client.market(ticker))
+        ob, src = _book(ticker)
         book = book_from_orderbook(ob)
         ser = {}
         try:
@@ -207,7 +231,8 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             ev = {}
         fv = db.query("SELECT * FROM fair_values WHERE ticker=?", (ticker,))
         js = lambda lv: [[str(p), str(c)] for p, c in lv]
-        return {"market": m, "event": {k: ev.get(k) for k in ("title", "category", "mutually_exclusive", "series_ticker")},
+        return {"market": m, "book_source": src,
+                "event": {k: ev.get(k) for k in ("title", "category", "mutually_exclusive", "series_ticker")},
                 "fee_type": ser.get("fee_type"), "fee_multiplier": ser.get("fee_multiplier"),
                 "book": {k: js(v) for k, v in book.items()}, "fair_value": fv[0] if fv else None}
 

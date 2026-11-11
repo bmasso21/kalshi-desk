@@ -28,9 +28,13 @@ class Engine:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._scan_now = threading.Event()
+        from .ws_feed import Feed
+        self.feed = Feed(self)
+        self.feed.listeners.append(self._on_feed)
         self.connect()
         from .quoter import Quoter
         self.quoter = Quoter(self)
+        self.feed.listeners.append(self.quoter.on_feed)
 
     # ------------------------------------------------------------ connection --
     def connect(self):
@@ -45,6 +49,42 @@ class Engine:
         self.positions_cache = {"ts": 0, "data": None}
         self.spend_cache = {"ts": 0, "data": None}
         self.db.audit("connect", f"env={c.env} authenticated={self.client.authenticated}")
+        if getattr(self, "feed", None):
+            self.feed.restart()
+
+    # ------------------------------------------------------------- live feed --
+    def _on_feed(self, kind: str, msg: dict):
+        """WebSocket events. Fills are stored and invalidate the position/spend caches."""
+        if kind == "fill":
+            self.db.record_fill(self.cfg.env, msg, "ws")
+            self.positions_cache["ts"] = 0
+            self.spend_cache["ts"] = 0
+        elif kind == "order":
+            if d(msg.get("fill_count_fp")) > 0 or msg.get("status") != "resting":
+                self.spend_cache["ts"] = 0
+        elif kind == "position":
+            self.positions_cache["ts"] = 0
+        elif kind == "resync":
+            threading.Thread(target=self.sync_fills, daemon=True, name="fill-resync").start()
+        elif kind == "feed_down":
+            self.db.audit("feed_down", f"WebSocket dropped ({msg.get('error')}); REST polling until reconnect")
+
+    def sync_fills(self, lookback: int = 3 * 86400) -> int:
+        """Pull recent fills over REST (after a reconnect, or as the polling fallback)."""
+        if not self.client.authenticated:
+            return 0
+        row = self.db.query("SELECT MAX(ts) t FROM fills WHERE env=?", (self.cfg.env,))
+        since = int((row[0]["t"] or 0) - 300) if row and row[0]["t"] else int(time.time()) - lookback
+        n = 0
+        try:
+            for f in self.client.fills(min_ts=max(since, int(time.time()) - lookback), max_items=5000):
+                n += self.db.record_fill(self.cfg.env, f, "rest")
+        except Exception as e:
+            self.db.audit("fill_sync_error", str(e))
+        if n:
+            self.positions_cache["ts"] = 0
+            self.spend_cache["ts"] = 0
+        return n
 
     def positions(self, max_age=10):
         if not self.client.authenticated:
@@ -311,6 +351,13 @@ class Engine:
             except Exception as e:
                 self.db.audit("loss_check_error", str(e))
             self.scan_once()
+            try:
+                pos = self.positions(max_age=30) or {}
+                self.feed.want("positions", [mp["ticker"] for mp in pos.get("market_positions", [])])
+                if not self.feed.live():
+                    self.sync_fills()
+            except Exception as e:
+                self.db.audit("feed_watch_error", str(e))
             wait = max(30, int(self.cfg.scanner["interval_sec"]))
             self.scan_state["next"] = time.time() + wait
             self._scan_now.wait(wait)
@@ -321,9 +368,12 @@ class Engine:
 
     def start(self):
         threading.Thread(target=self.loop, daemon=True, name="scanner").start()
+        if self.cfg.data.get("ws_enabled", True):
+            self.feed.start()
         self.quoter.start()
 
     def stop(self):
         self._stop.set()
         self._scan_now.set()
         self.quoter.stop()
+        self.feed.stop()

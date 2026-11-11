@@ -43,6 +43,7 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
   <span id="envPill" class="pill demo">DEMO</span>
   <span id="authPill" class="pill">…</span>
   <span id="autoPill" class="pill">auto off</span>
+  <span id="feedPill" class="pill" title="">feed …</span>
   <nav id="nav">
     <button data-t="scanner" class="on">Scanner</button><button data-t="markets">Markets</button>
     <button data-t="rewards">Rewards</button><button data-t="portfolio">Portfolio</button><button data-t="ledger">Ledger</button><button data-t="settings">Settings</button>
@@ -127,6 +128,8 @@ async function loadRewards(){try{const [q,r]=await Promise.all([api('/api/quoter
 async function status(){try{const s=await api('/api/status');const p=$('#envPill');p.textContent=s.env.toUpperCase()+(s.env==='prod'?' · REAL MONEY':'');p.className='pill '+s.env;
   $('#authPill').textContent=s.authenticated?'API key ✓':'no API key (read-only)';$('#authPill').style.color=s.authenticated?'var(--yes)':'var(--warn)';
   $('#autoPill').textContent=s.auto?'AUTO ON':'auto off';$('#autoPill').style.color=s.auto?'var(--warn)':'';
+  const f=s.feed||{},fp=$('#feedPill');FEED_LIVE=!!f.connected;fp.textContent=f.connected?`LIVE · ${f.books_synced}/${f.markets_watched} books`:'POLLING';
+  fp.style.color=f.connected?'var(--yes)':'var(--warn)';fp.title=f.connected?'Real-time WebSocket feed connected':('REST polling: '+(f.reason||'')+(f.error?' · '+f.error:''));
   const k=$('#killBtn');k.textContent=s.kill_switch?'KILL SWITCH ON – click to release':'KILL SWITCH';k.dataset.on=s.kill_switch?'1':'';
   const sc=s.scan;$('#scanInfo').textContent=(sc.running?'scanning… ':'')+(sc.last?'last scan '+new Date(sc.last*1000).toLocaleTimeString():'')+(sc.error?' · ERROR: '+sc.error:'')+(s.exchange&&s.exchange.trading_active===false?' · exchange trading paused':'');
 }catch(e){$('#scanInfo').textContent='server unreachable'}}
@@ -153,12 +156,20 @@ async function loadEvents(){$('#evList').innerHTML='<div class="ev mut">Loading�
 $('#q').onkeydown=e=>{if(e.key==='Enter')loadEvents()};$('#cat').onchange=loadEvents;
 async function openMarket(t){document.querySelector('#nav button[data-t=markets]').click();$('#detail').innerHTML='<div class="card mut">Loading…</div>';
   try{const j=await api('/api/market/'+encodeURIComponent(t));CUR=j;renderDetail()}catch(e){$('#detail').innerHTML=`<div class="card n">${esc(e.message)}</div>`}}
-function renderDetail(){const j=CUR,m=j.market,b=j.book;const lv=(a,cls)=>a.slice(0,8).map(([p,c])=>`<tr><td class="${cls}">${px(p)}</td><td class="r">${Number(c).toFixed(0)}</td></tr>`).join('')||'<tr><td class="mut">empty</td></tr>';
+let FEED_LIVE=false,BOOK_TS=0;
+function bookHtml(b,src){const lv=(a,cls)=>a.slice(0,8).map(([p,c])=>`<tr><td class="${cls}">${px(p)}</td><td class="r">${Number(c).toFixed(0)}</td></tr>`).join('')||'<tr><td class="mut">empty</td></tr>';
+  return `<div class="grid" style="grid-template-columns:1fr 1fr"><div><div class="mut">Buy YES (asks)</div><table class="book">${lv(b.yes_asks,'y')}</table></div><div><div class="mut">Buy NO (asks)</div><table class="book">${lv(b.no_asks,'n')}</table></div></div>
+  <div class="mut" style="font-size:11px;margin-top:4px">book: ${src==='ws'?'<span class="y">live feed</span>':'REST snapshot'} · ${new Date().toLocaleTimeString()}</div>`}
+async function refreshBook(){if(!CUR||$('#t-markets').classList.contains('hide')||!$('#bookBox'))return;
+  const now=Date.now();if(now-BOOK_TS<(FEED_LIVE?1500:10000))return;BOOK_TS=now;
+  try{const r=await api('/api/book/'+encodeURIComponent(CUR.market.ticker));if(r.ticker===CUR.market.ticker){CUR.book=r.book;$('#bookBox').innerHTML=bookHtml(r.book,r.source)}}catch(e){}}
+setInterval(refreshBook,1000);
+function renderDetail(){const j=CUR,m=j.market,b=j.book;
   $('#detail').innerHTML=`<div class="card"><div class="mut" style="font-size:12px">${esc(j.event.category)} · ${esc(m.ticker)} · ${esc(m.status)} · closes ${ts(m.close_time)}</div>
    <h3 style="margin:6px 0">${esc(m.title)}</h3><div>${esc(m.yes_sub_title||'')}</div>
    <div class="row" style="margin:10px 0"><div><div class="mut">YES ask</div><div class="big y">${px(m.yes_ask_dollars)}</div></div><div><div class="mut">NO ask</div><div class="big n">${px(m.no_ask_dollars)}</div></div>
    <div><div class="mut">Last</div><div class="big">${px(m.last_price_dollars)}</div></div><div><div class="mut">24h vol</div><div class="big">${Number(m.volume_24h_fp||0).toFixed(0)}</div></div><div><div class="mut">Open int.</div><div class="big">${Number(m.open_interest_fp||0).toFixed(0)}</div></div></div>
-   <div class="grid" style="grid-template-columns:1fr 1fr"><div><div class="mut">Buy YES (asks)</div><table class="book">${lv(b.yes_asks,'y')}</table></div><div><div class="mut">Buy NO (asks)</div><table class="book">${lv(b.no_asks,'n')}</table></div></div>
+   <div id="bookBox">${bookHtml(b,j.book_source)}</div>
    <details style="margin-top:8px"><summary class="mut">Rules</summary><p>${esc(m.rules_primary)}</p><p class="mut">${esc(m.rules_secondary||'')}</p></details></div>
    <div class="card"><h3 style="margin-top:0">Order ticket</h3><div class="row">
     <label class="f">Action<select id="oInt"><option value="buy_yes">Buy YES</option><option value="buy_no">Buy NO</option><option value="sell_yes">Sell YES (close)</option><option value="sell_no">Sell NO (close)</option></select></label>

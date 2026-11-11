@@ -61,6 +61,11 @@ def create_mock(public_keys: dict[str, object]):
     S = build_state()
     app.state.S = S
     app.state.calls = []
+    app.state.order_hooks = []   # callables(order) - the WebSocket mock bridges these to user_order
+
+    def emit(o):
+        for h in app.state.order_hooks:
+            h(dict(o))
 
     def markets():
         return {m["ticker"]: m for e in S["events"] for m in e["markets"]}
@@ -169,7 +174,7 @@ def create_mock(public_keys: dict[str, object]):
                              "reason": "Liquidity incentive KXA-1", "created_time": "2026-11-09T11:00:00Z"}], "cursor": ""}
 
     @app.get(PREFIX + "/portfolio/fills")
-    def fills(limit: int = 100):
+    def fills(limit: int = 100, min_ts: int = 0, cursor: str = ""):
         return {"fills": S["fills"], "cursor": ""}
 
     @app.get(PREFIX + "/portfolio/settlements")
@@ -229,6 +234,7 @@ def create_mock(public_keys: dict[str, object]):
             r["average_fill_price"] = f"{fillpx:.4f}"
             r["average_fee_paid"] = "0.0175"
         app.state.last_order = b
+        emit(S["orders"][oid])
         return JSONResponse(r, 201)
 
     @app.delete(PREFIX + "/portfolio/events/orders/{oid}")
@@ -238,6 +244,7 @@ def create_mock(public_keys: dict[str, object]):
             return JSONResponse({"code": "not_found", "message": "order"}, 404)
         o["status"] = "canceled"
         red = o["remaining_count_fp"]; o["remaining_count_fp"] = "0.00"
+        emit(o)
         return {"order_id": oid, "reduced_by": red, "ts_ms": int(time.time() * 1000)}
 
     return app

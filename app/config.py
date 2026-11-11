@@ -23,6 +23,8 @@ DEFAULTS = {
     "prod_key_id": "",
     "prod_private_key_path": "",
     "port": 8765,
+    "ws_enabled": True,            # real-time WebSocket feed (falls back to REST polling)
+    "ws_url_override": "",         # testing only; leave blank
     # --- risk limits (dollars) --------------------------------------------
     "risk": {
         "max_order_cost": 25.0,         # max $ at risk on a single order

@@ -48,7 +48,11 @@ class Quoter:
         self.state = {"running": False, "last": None, "error": None, "markets": 0, "resting": 0,
                       "committed": "0"}
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._lock = threading.RLock()
+        self.mid_hist: dict[str, collections.deque] = {}
+        self.last_cycle = 0.0
+        self.cycles = 0
 
     # ------------------------------------------------------------ helpers --
     def log(self, kind, msg):
@@ -85,6 +89,34 @@ class Quoter:
             if e.status != 404:  # 404 = already filled/expired/cancelled
                 self.log("cancel_error", f"{ticker} {side}: {e}")
             return False
+
+    def on_feed(self, kind, msg):
+        """Wake the quoter when a quoted market's book or one of our orders changes."""
+        if not self.cfg.get("enabled"):
+            return
+        if kind == "book" and msg.get("ticker") in self.quotes:
+            self._wake.set()
+        elif kind in ("order", "fill"):
+            t = msg.get("ticker") or msg.get("market_ticker")
+            if t in self.quotes:
+                self._wake.set()
+
+    def _jumped(self, t, mid, now) -> Decimal | None:
+        """Mid moved >= jump_cents vs. any mid seen in the last refresh window (and always vs. the
+        previous cycle's mid), so faster, feed-driven cycles don't dilute the jump test."""
+        h = self.mid_hist.setdefault(t, collections.deque(maxlen=200))
+        window = float(self.cfg.get("refresh_sec") or 15)
+        ref = [m for ts, m in h if now - ts <= window]
+        if h:
+            ref.append(h[-1][1])
+        h.append((now, mid))
+        thr = d(self.cfg["jump_cents"]) / 100
+        worst = max(ref, key=lambda m: abs(mid - m)) if ref else None
+        if worst is not None and abs(mid - worst) >= thr:
+            h.clear()
+            h.append((now, mid))   # the new level is the reference after the cooldown
+            return worst
+        return None
 
     # ---------------------------------------------------------- selection --
     @staticmethod
@@ -178,6 +210,8 @@ class Quoter:
         if not self.active():
             if self.quotes:
                 self.cancel_all("quoter disabled / kill switch")
+            if getattr(self.e, "feed", None):
+                self.e.feed.want("quoter", ())
             return
         self.e.check_loss_limit()
         if not self.active():
@@ -195,8 +229,14 @@ class Quoter:
         if not sel:
             self._update_state(client)
             return
-        markets = {m["ticker"]: m for m in client.markets(status=None, tickers=sorted(sel), exclude_combos=False)}
-        resting = {o["order_id"]: o for o in client.orders(status="resting", max_items=1000)}
+        feed = getattr(self.e, "feed", None)
+        if feed:
+            feed.want("quoter", sel)
+        markets = {m["ticker"]: (feed.market_overlay(m) if feed else m)
+                   for m in client.markets(status=None, tickers=sorted(sel), exclude_combos=False)}
+        live_orders = feed.resting_orders() if feed else None
+        resting = {o["order_id"]: o for o in (live_orders if live_orders is not None
+                                               else client.orders(status="resting", max_items=1000))}
         positions = self.e.positions(max_age=5) or {"market_positions": []}
         held = {mp["ticker"]: d(mp.get("position_fp")) for mp in positions.get("market_positions", [])}
         exposure = {mp["ticker"]: abs(d(mp.get("market_exposure_dollars"))) for mp in positions.get("market_positions", [])}
@@ -207,6 +247,8 @@ class Quoter:
         for t in list(self.quotes):
             for side, q in list(self.quotes[t].items()):
                 if q["oid"] not in resting:
+                    if now - q.get("placed", 0) < 10:
+                        continue  # just placed; the feed/REST order list may not show it yet
                     del self.quotes[t][side]
                     self.log("gone", f"{t} {side} @{q['price']} no longer resting (filled or expired)")
 
@@ -221,9 +263,9 @@ class Quoter:
                 continue
             yb, ya = d(m["yes_bid_dollars"]), d(m["yes_ask_dollars"])
             mid = (yb + ya) / 2
-            last = self.last_mid.get(t)
+            last = self._jumped(t, mid, now)
             self.last_mid[t] = mid
-            if last is not None and abs(mid - last) >= d(self.cfg["jump_cents"]) / 100:
+            if last is not None:
                 for side in list(self.quotes.get(t, {})):
                     self._cancel(t, side)
                 self.cooldown[t] = now + float(self.cfg["cooldown_min"]) * 60
@@ -262,7 +304,7 @@ class Quoter:
                     k = r["kalshi"]
                     if d(k.get("remaining_count")) > 0:
                         self.quotes.setdefault(t, {})[side] = {"oid": k["order_id"], "price": str(px), "exp": exp,
-                                                               "client": client}
+                                                               "client": client, "placed": time.time()}
                         committed += add
                     if d(k.get("fill_count")) > 0:
                         self.log("fill", f"{t} {intent} {k['fill_count']} @ {px} filled on placement")
@@ -276,22 +318,32 @@ class Quoter:
         self.state.update(last=time.time(), error=None, markets=len(self.selected),
                           resting=sum(len(s) for s in self.quotes.values()), committed=str(committed.quantize(Decimal("0.01"))))
 
+    MIN_GAP = 2.0   # seconds between feed-triggered cycles
+
     def loop(self):
         while not self._stop.is_set():
             self.state["running"] = self.active()
+            self._wake.clear()
             try:
                 with self._lock:
+                    self.last_cycle = time.time()
+                    self.cycles += 1
                     self.cycle()
             except Exception as e:
                 self.state["error"] = str(e)
                 self.log("error", traceback.format_exc()[-600:])
-            self._stop.wait(max(5, int(self.cfg.get("refresh_sec") or 15)))
+            # sleep until the refresh interval, or earlier if the live feed reports a change
+            self._wake.wait(max(5, int(self.cfg.get("refresh_sec") or 15)))
+            gap = self.MIN_GAP - (time.time() - self.last_cycle)
+            if gap > 0:
+                self._stop.wait(gap)
 
     def start(self):
         threading.Thread(target=self.loop, daemon=True, name="quoter").start()
 
     def stop(self):
         self._stop.set()
+        self._wake.set()
         self.cancel_all("shutdown")
 
     def _fmt(self, rows):
