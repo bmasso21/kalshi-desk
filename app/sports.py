@@ -466,8 +466,8 @@ class Study:
 
     # ---- Pinnacle history (1 request per game) ----
     def pull_history(self, fixture: dict) -> int:
-        body = self.op.get("/historical-odds", {"fixtureId": fixture["fixture_id"], "bookmakers": "pinnacle,kalshi,polymarket"},
-                           note=f"hist:{fixture['league']}")
+        body = self.op.get("/historical-odds", {"fixtureId": fixture["fixture_id"], "bookmakers": "pinnacle,kalshi"},
+                           note=f"hist:{fixture['league']}")      # polymarket must be requested alone
         if not self.db.get("sp_raw_hist_sample"):
             self.op.save_raw("hist_sample", body)
             self.db.put("sp_raw_hist_sample", fixture["fixture_id"])
@@ -495,13 +495,24 @@ class Study:
                 for lg in leagues:
                     if by[lg] and len(order) < max_games:
                         order.append(by[lg].pop(0))
+            errs = 0
             for i, f in enumerate(order):
                 if self.op.usage()["left"] <= 0:
                     self.log("OddsPapi budget exhausted - stopping")
                     break
-                n = self.pull_history(f)
-                self.sync_kalshi(f)
-                self.log(f"{i + 1}/{len(order)} {f['league']} {f['p1']} vs {f['p2']}: {n} odds rows, Kalshi synced")
+                try:
+                    n = self.pull_history(f)
+                    self.sync_kalshi(f)
+                    errs = 0
+                    self.log(f"{i + 1}/{len(order)} {f['league']} {f['p1']} vs {f['p2']}: {n} odds rows, Kalshi synced")
+                except BudgetExceeded:
+                    raise
+                except Exception as e:
+                    errs += 1
+                    self.log(f"{i + 1}/{len(order)} {f['league']} {f['p1']} vs {f['p2']}: ERROR {str(e)[:200]}")
+                    if "401" in str(e) or errs >= 3:
+                        self.log("stopping after repeated errors")
+                        break
         except Exception as e:
             self.log(f"ERROR {type(e).__name__}: {str(e)[:300]}")
         finally:
@@ -538,7 +549,9 @@ class SportsModel:
     def series(self, fixture_id, league):
         if fixture_id not in self._series:
             mid = (self.meta.get(league) or {}).get("market_id")
-            outs = [o["id"] for o in (self.meta.get(league) or {}).get("outcomes") or []]
+            # outcome named "1" = participant 1, "2" = participant 2 (the /markets list order is NOT reliable)
+            named = {str(o.get("name")): o["id"] for o in (self.meta.get(league) or {}).get("outcomes") or []}
+            outs = [named["1"], named["2"]] if "1" in named and "2" in named else []
             rows = self.db.query("SELECT outcome_id, ts, price, active FROM sp_odds WHERE fixture_id=? AND bookmaker='pinnacle' "
                                  "AND market_id=? ORDER BY ts", (fixture_id, mid))
             # outcome order: as listed by /markets (first = participant 1)

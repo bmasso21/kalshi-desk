@@ -95,7 +95,7 @@ def study_tests(tmp):
                 return Resp(200, [{"tournamentId": 31, "tournamentSlug": "nfl", "tournamentName": "NFL"}, {"tournamentId": 32, "tournamentSlug": "ncaa"}])
             if p == "/markets":
                 return Resp(200, [{"marketId": 140, "marketName": "Spread", "handicap": -3.5, "outcomes": [{"outcomeId": 1}, {"outcomeId": 2}]},
-                                  {"marketId": 141, "marketName": "Moneyline (incl. overtime)", "outcomes": [{"outcomeId": 1411, "outcomeName": "1"}, {"outcomeId": 1412, "outcomeName": "2"}]},
+                                  {"marketId": 141, "marketName": "Moneyline (incl. overtime)", "outcomes": [{"outcomeId": 1412, "outcomeName": "2"}, {"outcomeId": 1411, "outcomeName": "1"}]},
                                   {"marketId": 142, "marketName": "Total", "outcomes": [{"outcomeId": 1}, {"outcomeId": 2}, {"outcomeId": 3}]}])
             if p == "/fixtures":
                 return Resp(200, [{"fixtureId": "idA", "participant1Name": "Los Angeles Chargers", "participant2Name": "Pittsburgh Steelers",
@@ -157,9 +157,10 @@ def study_tests(tmp):
     check("study: fixtures stored, Kalshi match by abbreviation", fx[0]["kalshi_event"] == ev and fx[0]["p1_market"].endswith("-LAC")
           and fx[0]["match_note"] == "abbr" and fx[1]["match_note"] == "no Kalshi match", ([dict(x) for x in fx], log))
     md = db.get("sp_meta")["NFL"]
-    check("study: moneyline market chosen (not spread/total)", md["market_id"] == "141" and [o["id"] for o in md["outcomes"]] == ["1411", "1412"], md)
+    check("study: moneyline market chosen (not spread/total)", md["market_id"] == "141" and sorted(o["id"] for o in md["outcomes"]) == ["1411", "1412"], md)
     hist_calls = [c for c in os_.calls if c[0].endswith("/historical-odds")]
-    check("study: history pulled only for the matched game (+1 retry after 429)", len(hist_calls) == 2 and all(c[1]["fixtureId"] == "idA" for c in hist_calls))
+    check("study: history pulled only for the matched game (+1 retry after 429), Pinnacle + Kalshi only", len(hist_calls) == 2
+          and all(c[1]["fixtureId"] == "idA" and c[1]["bookmakers"] == "pinnacle,kalshi" for c in hist_calls))
     check("study: 429 -> waited retryMs then retried", any(0.5 <= x <= 1.0 for x in slept), slept)
     check("study: request count = sports+tournaments+markets+fixtures+2 history", op.usage()["used"] == 6, op.usage())
     n_odds = db.query("SELECT count(*) n FROM sp_odds")[0]["n"]
@@ -187,7 +188,7 @@ def study_tests(tmp):
     fv = m.fair({"ticker": f"{ev}-LAC"}, t)
     o1, o2 = 1.50 + 0.01 * 24, 2.70 + 0.01 * 24     # snapshot i=24 is the last one older than t-60
     exp = (1 / o1) / (1 / o1 + 1 / o2)
-    check("model: Pinnacle no-vig probability, lagged", fv and abs(fv["p_yes"] - exp) < 1e-9, (fv, exp))
+    check("model: Pinnacle no-vig probability, lagged; outcome '1' = participant 1 even when listed second", fv and abs(fv["p_yes"] - exp) < 1e-9, (fv, exp))
     fv2 = m.fair({"ticker": f"{ev}-PIT"}, t)
     check("model: other team = 1 - p", abs(fv2["p_yes"] - (1 - exp)) < 1e-9)
     check("model: nothing before the first snapshot", m.fair({"ticker": f"{ev}-LAC"}, T0 - 40 * 3600) is None)
@@ -302,7 +303,7 @@ def main():
     check("key never written to the audit trail", KEY not in aud and "monthly_cap" in aud)
     check("sports status: configured", c.get("/api/sports").json()["configured"] is True)
     check("discover needs the CSRF token", c.post("/api/sports/discover").status_code in (401, 403))
-    check("version 2.2.2", __import__("app").__version__ == "2.2.2")
+    check("version 2.2.3", __import__("app").__version__ == "2.2.3")
     check("no orders placed", not app.state.engine.db.query("SELECT 1 FROM orders_log LIMIT 1"))
 
 
