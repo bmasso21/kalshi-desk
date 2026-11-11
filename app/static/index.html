@@ -46,7 +46,7 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
   <span id="feedPill" class="pill" title="">feed …</span>
   <nav id="nav">
     <button data-t="scanner" class="on">Scanner</button><button data-t="markets">Markets</button>
-    <button data-t="rewards">Rewards</button><button data-t="portfolio">Portfolio</button><button data-t="ledger">Ledger</button><button data-t="clv">CLV</button><button data-t="research">Research</button><button data-t="settings">Settings</button>
+    <button data-t="rewards">Rewards</button><button data-t="portfolio">Portfolio</button><button data-t="ledger">Ledger</button><button data-t="clv">CLV</button><button data-t="weather">Weather</button><button data-t="research">Research</button><button data-t="settings">Settings</button>
   </nav>
   <span class="spacer"></span>
   <span id="scanInfo" class="mut" style="font-size:12px"></span>
@@ -102,6 +102,19 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
    <button class="b" onclick="api('/api/clv/run',{method:'POST'}).then(loadClv)">Score now</button><span id="clvInfo" class="mut" style="font-size:12px"></span></div>
   <div id="clvBox"></div>
 </section>
+<section id="t-weather" class="hide">
+  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Weather data &amp; model</h3><span>
+   <button class="b" onclick="api('/api/weather/sync',{method:'POST'}).then(()=>{toast('Weather sync started');setTimeout(loadWeather,1500)})">Sync now</button>
+   <button class="b pri" onclick="api('/api/weather/eval',{method:'POST'}).then(()=>{toast('Scorecard started (runs in the background)');setTimeout(loadWeather,2000)}).catch(e=>toast(e.message,'err'))">Run scorecard</button></span></div>
+   <div id="wxStatus" class="mut">Loading…</div></div>
+  <div class="card" id="wxEval"></div>
+  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Fair values (read-only – nothing is traded)</h3>
+   <span><select id="wxDays" onchange="loadWxBoard()"><option value="0">Today</option><option value="1" selected>Today + tomorrow</option><option value="2">Next 3 days</option></select>
+   <label class="mut" style="font-size:12px"><input type="checkbox" id="wxEdgeOnly" onchange="loadWxBoard()"> only buckets with ≥5¢ edge</label>
+   <button class="b" onclick="loadWxBoard()">Refresh</button></span></div>
+   <p class="mut" style="font-size:12px;margin:6px 0">Fair = model probability the NWS climate report lands in the bucket. Edge buy YES = fair − ask; edge buy NO = bid − fair. Quotes are the latest hourly candle from production public data, so they can be up to an hour old.</p>
+   <div id="wxBoard"></div></div>
+</section>
 <section id="t-research" class="hide">
   <div class="card"><h3 style="margin-top:0">Data warehouse</h3><div id="whBox" class="mut">Loading…</div></div>
   <div class="card"><h3 style="margin-top:0">Run a backtest</h3><div id="btForm"></div></div>
@@ -125,7 +138,7 @@ async function api(u,o={}){o.headers={'Content-Type':'application/json','X-Desk-
 // tabs
 document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x===b));
   document.querySelectorAll('main>section').forEach(s=>s.classList.toggle('hide',s.id!=='t-'+b.dataset.t));
-  ({scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:loadRewards,portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,research:loadResearch,settings:loadSettings})[b.dataset.t]()});
+  ({scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:loadRewards,portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,weather:loadWeather,research:loadResearch,settings:loadSettings})[b.dataset.t]()});
 async function loadRewards(){try{const [q,r]=await Promise.all([api('/api/quoter'),api('/api/rewards')]);const st=q.state;
   $('#qState').innerHTML=(q.config.enabled?(st.running?'<b class="y">RUNNING</b>':'<b class="w">enabled, not running (kill switch or no key)</b>'):'<b class="mut">OFF</b>')+` · ${q.env.toUpperCase()} · ${st.resting} quotes resting · $${st.committed} committed / $${q.config.max_capital} cap`+(st.error?` · <span class="n">${esc(st.error)}</span>`:'');
   $('#qSel').innerHTML=q.selected.map(s=>`<tr><td><a href="#" onclick="openMarket('${esc(s.ticker)}');return false">${esc(s.title)}</a> <span class="mut">${esc(s.sub||'')} · ${esc(s.ticker)}</span></td><td class="r">$${esc(s.daily_reward)}</td><td class="r">${esc(s.share)}%</td><td class="r y">$${esc(s.est_daily)}</td></tr>`).join('')||'<tr><td colspan=4 class="mut">None yet (quoter off, or no pools meet your minimum)</td></tr>';
@@ -345,6 +358,31 @@ async function showBt(id){const b=await api('/api/backtests/'+id);if(b.status!==
    <div class="row" style="gap:22px">${[['Markets traded',v.markets_traded+' / '+v.markets_simulated],['Contracts',v.contracts],['Cost',money(v.cost)],['Fees',money(v.fees)],['Net P&L',money(v.pnl)],['ROI',pct(v.roi)],['P&L / contract',(v.pnl_per_contract_cents??'–')+'¢'],['Avg CLV',(v.avg_clv_cents??'–')+'¢'],['Win rate',pct(v.win_rate_markets)],['Max drawdown',money(v.max_drawdown)],['Sharpe (daily, ann.)',v.sharpe_daily_annualized??'–']].map(([k,x])=>`<div><div class="mut">${k}</div><div class="big" style="font-size:18px">${x}</div></div>`).join('')}</div>
    ${curve(v.equity_curve)}<div class="mut" style="font-size:12px">Params ${esc(JSON.stringify(R.params))} · filters ${esc(JSON.stringify(R.filters))} · slippage ${R.slippage_cents}¢</div>
    <table style="margin-top:8px"><thead><tr><th>Series</th><th class="r">Markets</th><th class="r">Contracts</th><th class="r">Fees</th><th class="r">P&amp;L</th><th class="r">ROI</th><th class="r">CLV</th></tr></thead><tbody>${Object.entries(v.by_series).slice(0,40).map(([k,x])=>`<tr><td>${esc(k)}</td><td class="r">${x.markets}</td><td class="r">${x.contracts.toFixed(0)}</td><td class="r">${money(x.fees)}</td><td class="r ${x.pnl<0?'n':'y'}">${money(x.pnl)}</td><td class="r">${pct(x.roi)}</td><td class="r">${x.avg_clv_cents==null?'–':x.avg_clv_cents.toFixed(2)+'¢'}</td></tr>`).join('')}</tbody></table></div>`).join('')}
+// weather (2.1)
+async function loadWeather(){try{const j=await api('/api/weather'),c=j.collector,n=c.counts;
+  const ser=Object.entries(j.series||{}),mapped=ser.filter(([k,v])=>v.mapped).length;
+  $('#wxStatus').innerHTML=`<div class="row" style="gap:22px">${[['Temperature series',mapped+' / '+ser.length],['Forecast runs',n.nbs_runs],['Forecast rows',n.nbs_rows],['Observations',n.obs_rows],['Climate reports',n.cli_days]].map(([k,v])=>`<div><div class="mut">${k}</div><div class="big">${Number(v||0).toLocaleString?Number(v||0).toLocaleString():v}</div></div>`).join('')}</div>
+   <p style="font-size:12px">Latest forecast run ${n.nbs_last_run?new Date(n.nbs_last_run*1000).toUTCString().slice(5,22)+' UTC':'–'} · latest observation ${n.obs_last?ts(n.obs_last):'–'} · latest climate report ${esc(n.cli_last||'–')} ·
+   ${c.running?'<span class="w">Syncing: '+esc(c.phase)+' '+esc(c.progress)+'</span>':'Idle'} · last sync ${c.last_sync?ts(c.last_sync):'never'} · ${c.requests} requests${c.error?' · <span class="n">last error: '+esc(c.error)+'</span>':''}
+   ${c.unmapped&&c.unmapped.length?' · <span class="w">stations not mapped: '+esc(c.unmapped.join(', '))+'</span>':''}</p>
+   <p style="font-size:12px">Sources: NWS National Blend of Models station forecasts, ASOS observations and NWS Daily Climate Reports, via the Iowa Environmental Mesonet (public). Settlement = the climate report for the station named in each market's rules.</p>`;
+  const e=j.eval;let h='<h3 style="margin-top:0">Scorecard (out-of-sample, before any trading)</h3>';
+  if(!e)h+='<p class="mut">Not run yet. Click <b>Run scorecard</b> once the data has synced.</p>';
+  else if(e.status==='running'){h+=`<p class="w">Running… ${esc(e.progress||'')}</p>`;setTimeout(loadWeather,5000)}
+  else if(e.status==='error')h+=`<pre class="n" style="white-space:pre-wrap">${esc(e.error)}</pre>`;
+  else{const sc=e.settlement_check;h+=`<p style="font-size:12px">${e.events} events · ${e.markets} settled buckets · ran ${ts(e.started)} (${e.duration}s).
+   <b>Settlement check:</b> the NWS climate report reproduces Kalshi's result on <b class="${sc.agree_pct>=99?'y':'n'}">${sc.agree_pct??'–'}%</b> of buckets (${sc.cli_agrees} agree, ${sc.cli_disagrees} disagree, ${sc.no_cli} without a report).</p>
+   <table><thead><tr><th>Hours before day ends</th><th class="r">Buckets</th><th class="r">Brier model</th><th class="r">Brier market</th><th class="r">Log loss model</th><th class="r">Log loss market</th><th class="r">Model closer</th></tr></thead><tbody>
+   ${Object.entries(e.by_hours_before_day_end).map(([k,v])=>`<tr><td>${k}h</td><td class="r">${v.n}</td><td class="r ${v.brier_model<v.brier_market?'y':'n'}">${v.brier_model??'–'}</td><td class="r">${v.brier_market??'–'}</td><td class="r ${v.logloss_model<v.logloss_market?'y':'n'}">${v.logloss_model??'–'}</td><td class="r">${v.logloss_market??'–'}</td><td class="r">${v.model_better_pct??'–'}%</td></tr>`).join('')}</tbody></table>
+   <p class="mut" style="font-size:12px">Lower Brier / log loss = more accurate. The market column scores the mid-price at the same moment. A model that is not more accurate than the market has no edge to trade.</p>`}
+  $('#wxEval').innerHTML=h;loadWxBoard()}catch(x){toast(x.message,'err')}}
+async function loadWxBoard(){try{const j=await api('/api/weather/board?days='+$('#wxDays').value),only=$('#wxEdgeOnly').checked;
+  const ce=v=>v==null?'–':`<span class="${v>=0.05?'y':v<0?'mut':''}">${(v>0?'+':'')+(100*v).toFixed(0)}¢</span>`;
+  $('#wxBoard').innerHTML=j.events.map(e=>{const m=e.model,ms=e.markets.filter(x=>!only||(x.edge_buy_yes>=0.05||x.edge_buy_no>=0.05));if(only&&!ms.length)return'';
+   return `<div style="border-top:1px solid var(--line);padding:8px 0"><b>${esc(e.city||e.station)} ${e.kind==='high'?'high':'low'} · ${esc(e.date)}</b> <span class="mut">${esc(e.station)} · ${esc(e.event)}</span>
+   ${m?`<span style="font-size:12px"> · expected <b>${m.mean}°</b> · forecast ${m.x??'–'}° · observed so far ${m.obs_so_far??'–'}° · ${m.hours_left}h left in the climate day</span>`:'<span class="w" style="font-size:12px"> · not enough data to price</span>'}
+   <table style="margin-top:4px"><thead><tr><th>Bucket</th><th class="r">Fair</th><th class="r">Bid</th><th class="r">Ask</th><th class="r">Edge buy YES</th><th class="r">Edge buy NO</th><th class="mut">Quote time</th></tr></thead><tbody>
+   ${ms.map(x=>`<tr><td>${esc(x.sub||x.ticker)}</td><td class="r"><b>${x.fair==null?'–':(100*x.fair).toFixed(0)+'¢'}</b></td><td class="r">${px(x.bid)}</td><td class="r">${px(x.ask)}</td><td class="r">${ce(x.edge_buy_yes)}</td><td class="r">${ce(x.edge_buy_no)}</td><td class="mut" style="font-size:12px">${x.quote_ts?new Date(x.quote_ts*1000).toLocaleTimeString():''}</td></tr>`).join('')}</tbody></table></div>`}).join('')||'<p class="mut">No open temperature events priced yet (data still syncing?).</p>'}catch(x){toast(x.message,'err')}}
 // boot
 (async()=>{const s=await api('/api/session');TOKEN=s.token;api('/api/auth/status').then(a=>{if(!a.local)$('#logoutBtn').classList.remove('hide')}).catch(()=>{});CFG=(await api('/api/config')).config;status();loadSignals();loadCats();setInterval(status,5000);setInterval(()=>{if(!$('#t-scanner').classList.contains('hide'))loadSignals()},20000)})();
 </script>

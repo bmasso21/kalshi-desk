@@ -99,6 +99,19 @@ The server still listens only on `127.0.0.1`. `tailscale serve --bg 8765` publis
 - 5 wrong passwords in 15 minutes lock remote logins for 15 minutes and send a phone alert; each new remote login sends a silent alert.
 - Real-money orders still need the double confirmation; nothing about trading permissions changes.
 
+### Weather fair values (v2.1)
+Daily high/low temperature markets settle on the NWS Daily Climate Report (CLI) for the station named in each
+market's rules (e.g. CLIMDW = Chicago Midway), calendar day in local STANDARD time. The Weather tab:
+- collects, for every station those markets use: NWS National Blend of Models station forecasts (NBS, every 6 h),
+  ASOS observations and the climate reports, from the Iowa Environmental Mesonet (public, no key);
+- prices every bucket: forecast extreme for the rest of the climate day + observed high/low so far + error
+  distributions learned only from earlier days (incl. the usual gap between the climate report and the 5-minute obs);
+- **Scorecard**: out-of-sample accuracy of the model vs the market's own price at 36/24/12/6/3/1 h before the day
+  ends, plus a check that the climate report reproduces Kalshi's actual results;
+- backtest strategy `weather_fair`: post-only bids `edge` below fair value on YES and NO.
+Nothing here places orders. Kalshi's weather-index endpoints (`/live_data/weather/{city}`) are the multi-station
+blend behind the *hourly* markets, not what the daily markets settle on, so v2.1 doesn't price from them.
+
 ### Updating a running install
 Drop an empty file named `restart.request` next to `run.py`. The app cancels quoter orders, exits, and the boot task restarts it about 15 seconds later.
 

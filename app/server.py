@@ -31,6 +31,16 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     wdb = WarehouseDB(cfg.path.parent / "warehouse.db")
     eng.warehouse = Warehouse(eng, wdb)
     eng.feed.listeners.append(eng.warehouse.on_feed)
+    from .weather import WxCollector, WxModel, WxStore
+    from .weather import board as wx_board
+    wx_store = WxStore(wdb)
+    eng.weather = WxCollector(eng, wx_store)
+    wx_model: dict = {"m": None, "ts": 0.0}
+
+    def weather_model():
+        if wx_model["m"] is None or time.time() - wx_model["ts"] > 600:
+            wx_model["m"], wx_model["ts"] = WxModel(wx_store), time.time()
+        return wx_model["m"]
     bt = Backtester(wdb)
     from .auth import COOKIE, Auth
     auth = Auth(cfg, db, eng.alerts, extra_local_hosts=() if start_engine else ("testclient",))
@@ -47,10 +57,12 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         if start_engine:
             eng.start()
             eng.warehouse.start()
+            eng.weather.start()
             eng.alerts.startup(__version__)
 
     @app.on_event("shutdown")
     def _stop():
+        eng.weather.stop()
         eng.warehouse.stop()
         eng.stop()
 
@@ -336,6 +348,36 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     @app.post("/api/research/sync")
     def research_sync():
         eng.warehouse.trigger()
+        return {"ok": True}
+
+    # ------------------------------------------------------------- weather --
+    @app.get("/api/weather")
+    def weather_status():
+        return {"collector": eng.weather.status(), "series": wx_store.series_map(), "eval": wdb.get("wx_eval")}
+
+    @app.post("/api/weather/sync")
+    def weather_sync():
+        eng.weather.trigger()
+        return {"ok": True}
+
+    @app.get("/api/weather/board")
+    def weather_board(days: int = 1):
+        return {"events": wx_board(wdb, weather_model(), max_days_ahead=max(0, min(2, days))),
+                "model_built": wx_model["ts"], "note": "Quotes are the latest hourly candle from production public data."}
+
+    @app.post("/api/weather/eval")
+    def weather_eval():
+        cur = wdb.get("wx_eval") or {}
+        if cur.get("status") == "running" and time.time() - (cur.get("started") or 0) < 3 * 3600:
+            raise HTTPException(409, "an evaluation is already running")
+        import os
+        import subprocess
+        import sys
+        wdb.put("wx_eval", {"status": "running", "started": time.time()})
+        kw = {"cwd": str(Path(__file__).resolve().parent.parent), "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if os.name == "nt":
+            kw["creationflags"] = 0x00004000 | 0x08000000
+        app.state.wx_eval_proc = subprocess.Popen([sys.executable, "-m", "app.weather", "--db", wdb.path, "--eval", "--store"], **kw)
         return {"ok": True}
 
     @app.get("/api/backtests")

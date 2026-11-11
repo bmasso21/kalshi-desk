@@ -104,6 +104,13 @@ DEFAULTS = {
         "max_hist_pages": 20,
         "base_url_override": "",        # testing only
     },
+    # --- weather data for 2.1 (NWS forecast guidance + observations + climate reports, public) ---
+    "weather": {
+        "enabled": True,                # collect data only; no trading
+        "sync_interval_min": 20,
+        "lookback_days": 130,
+        "request_gap_sec": 0.4,
+    },
     # --- scanner ----------------------------------------------------------
     "scanner": {
         "interval_sec": 120,

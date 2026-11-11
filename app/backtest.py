@@ -71,6 +71,7 @@ class Ctx:
         self.bars: list[dict] = []
         self.params = sim.params
         self.state: dict = {}
+        self.svc = sim.svc               # strategy-specific data service (e.g. the weather model), or None
 
     # data (never beyond self.now) -------------------------------------
     @property
@@ -112,6 +113,16 @@ class Strategy:
     description = ""
     defaults: dict = {}
     uses_maker = False
+
+    @classmethod
+    def prepare(cls, wdb, params) -> object | None:
+        """Optional: build a data service shared by every market in the run (exposed as ctx.svc)."""
+        return None
+
+    @classmethod
+    def default_series(cls, svc) -> list[str] | None:
+        """Optional: restrict the run to these series when the caller gave no series filter."""
+        return None
 
     def on_bar(self, ctx: Ctx):
         raise NotImplementedError
@@ -166,7 +177,56 @@ class MakerJoin(Strategy):
             ctx.buy("no", round(1 - ya, 4), float(p["size"]), maker=True, expire_hours=1, tag="bid_no")
 
 
-STRATEGIES: dict[str, type[Strategy]] = {s.name: s for s in (FavoriteLate, MakerJoin)}
+class WeatherFair(Strategy):
+    name = "weather_fair"
+    description = ("Maker (Phase 2.1). Every hour, price each daily high/low temperature bucket from NWS forecast "
+                   "guidance (NBM) + today's observations + calibration from prior days only, then rest post-only "
+                   "bids `edge` below fair value on YES and on NO. Starts `start_hours` before the climate day ends, "
+                   "skips fair values outside [min_fair, max_fair]. Optional taker: if the ask is `take_edge` or "
+                   "more below fair (after fees) take it (0 = never take).")
+    defaults = {"edge": 0.05, "size": 10, "max_position": 30, "start_hours": 36, "min_fair": 0.03, "max_fair": 0.97,
+                "take_edge": 0.0, "run_lag_h": 3.0, "calib_days": 60}
+    uses_maker = True
+
+    @classmethod
+    def prepare(cls, wdb, params):
+        from .weather import WxModel, WxStore
+        return WxModel(WxStore(wdb), run_lag_h=float(params.get("run_lag_h", 3)),
+                       calib_days=int(params.get("calib_days", 60)))
+
+    @classmethod
+    def default_series(cls, svc):
+        return sorted(k for k, v in svc.smap.items() if v["mapped"])
+
+    def on_bar(self, ctx):
+        p = ctx.params
+        ctx.cancel_all()
+        fv = ctx.svc.fair(ctx.market, ctx.now) if ctx.svc else None
+        if not fv or fv["hours_left"] > float(p["start_hours"]):
+            return
+        ctx.state["last_fair"] = fv["p_yes"]
+        f_yes = fv["p_yes"]
+        if not float(p["min_fair"]) <= f_yes <= float(p["max_fair"]):
+            return
+        yb, ya = ctx.yes_bid, ctx.yes_ask
+        edge, size, cap = float(p["edge"]), float(p["size"]), float(p["max_position"])
+        take = float(p["take_edge"])
+        for side, fair, ask in (("yes", f_yes, ya if ya and 0 < ya < 1 else None),
+                                ("no", 1 - f_yes, (1 - yb) if yb and 0 < yb < 1 else None)):
+            room = cap - ctx.position[side]
+            if room <= 0:
+                continue
+            if take > 0 and ask is not None and ask + 0.07 * ask * (1 - ask) <= fair - take:
+                ctx.buy(side, price=round(ask, 2), count=min(size, room), tag=f"take_{side}")
+                continue
+            px = math.floor((fair - edge) * 100 + 1e-9) / 100
+            if ask is not None:
+                px = min(px, round(ask - 0.01, 2))
+            if px >= 0.01:
+                ctx.buy(side, px, min(size, room), maker=True, expire_hours=1, tag=f"bid_{side}")
+
+
+STRATEGIES: dict[str, type[Strategy]] = {s.name: s for s in (FavoriteLate, MakerJoin, WeatherFair)}
 
 
 def register(cls: type[Strategy]):
@@ -177,7 +237,8 @@ def register(cls: type[Strategy]):
 # --------------------------------------------------------------- simulator --
 class MarketSim:
     def __init__(self, market: dict, bars: list[dict], trades: list[dict], strategy: Strategy, params: dict,
-                 fee_type: str, fee_mult: float, maker_model: str, slippage: float):
+                 fee_type: str, fee_mult: float, maker_model: str, slippage: float, svc=None):
+        self.svc = svc
         self.m, self.bars, self._trades = market, bars, trades
         self.strategy, self.params = strategy, params
         self.fee_type, self.fee_mult = fee_type or "quadratic", fee_mult if fee_mult is not None else 1.0
@@ -339,8 +400,13 @@ class Backtester:
         """Streams market by market (only one market's trades in memory at a time)."""
         cls = STRATEGIES[strategy]
         p = {**cls.defaults, **(params or {})}
-        flt = filters or {}
+        flt = dict(filters or {})
         models = models or (["through", "touch"] if cls.uses_maker else ["through"])
+        svc = cls.prepare(self.db, p)
+        if not flt.get("series") and svc is not None:
+            ds = cls.default_series(svc)
+            if ds is not None:
+                flt["series"] = ds or ["__no_series_with_data__"]
         markets = self.load_markets(flt)
         per: dict[str, list] = {m: [] for m in models}
         for i, mk in enumerate(markets):
@@ -348,7 +414,7 @@ class Backtester:
             if bars:
                 for model in models:
                     sim = MarketSim(mk, bars, trades, cls(), p, mk.get("fee_type"), mk.get("fee_multiplier"), model,
-                                    slippage_cents / 100)
+                                    slippage_cents / 100, svc)
                     r = sim.run()
                     if not r["fills"]:
                         r = {k: v for k, v in r.items()}   # keep the light record only
