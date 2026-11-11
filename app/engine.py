@@ -38,6 +38,8 @@ class Engine:
         self.connect()
         from .quoter import Quoter
         self.quoter = Quoter(self)
+        from .clv import CLVTracker
+        self.clv = CLVTracker(self)
         self.feed.listeners.append(self.quoter.on_feed)
 
     # ------------------------------------------------------------ connection --
@@ -50,6 +52,8 @@ class Engine:
             self.client = KalshiClient(c.base_url)
             self.db.audit("connect_error", f"could not load {c.env} key: {e}")
         self.series_cache = {}
+        if getattr(self, "clv", None):
+            self.clv.markets.clear()
         self.positions_cache = {"ts": 0, "data": None}
         self.spend_cache = {"ts": 0, "data": None}
         self.db.audit("connect", f"env={c.env} authenticated={self.client.authenticated}")
@@ -379,10 +383,12 @@ class Engine:
             self.feed.start()
         self.quoter.start()
         self.alerts.start()
+        self.clv.start()
 
     def stop(self, reason: str = "clean shutdown"):
         self._stop.set()
         self._scan_now.set()
         self.quoter.stop()
         self.feed.stop()
+        self.clv.stop()
         self.alerts.stop(reason)

@@ -83,6 +83,13 @@ Settings → **Phone alerts**: paste your Pushover **user key** and an **applica
 
 Built-in reference strategies: `favorite_late` (taker; favourite-longshot bias test) and `maker_join` (the quoter's logic without rewards = its adverse-selection cost). Phase 2 strategies plug into the same engine.
 
+### Closing-line value (v1.5)
+**CLV** tab. Every fill (yours, the app's, or ones placed on kalshi.com) is scored once its market closes:
+- **Closing line** = the market's last traded YES price before it closed, in the same environment as the fill (demo fills vs demo prices). Fallbacks: Kalshi's historical tier for archived markets, then the market's last price.
+- **CLV per contract** = how much better your price was than that line, in your side's terms (buy YES: line - price; buy NO / sell YES: price - line in YES terms). Direction comes from Kalshi's `book_side`.
+- Shown overall and by strategy, category and series for 7/30/90/365 days, weighted by contracts, with "% of contracts that beat the close". The daily summary includes the 30-day CLV.
+- The backtester uses the same definition. Phase 3.2 will use the 30-day CLV per strategy to cut budgets automatically.
+
 ### Updating a running install
 Drop an empty file named `restart.request` next to `run.py`. The app cancels quoter orders, exits, and the boot task restarts it about 15 seconds later.
 

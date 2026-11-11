@@ -226,6 +226,15 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     def alerts_summary_preview():
         return {"text": eng.alerts.summary_text()}
 
+    # ----------------------------------------------------------------- CLV --
+    @app.get("/api/clv")
+    def clv_summary(days: float = 30):
+        return {**eng.clv.summary(days), "tracker": eng.clv.state}
+
+    @app.post("/api/clv/run")
+    def clv_run():
+        return eng.clv.run_once()
+
     # ------------------------------------------------------------ research --
     @app.get("/api/research")
     def research():

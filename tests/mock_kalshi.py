@@ -124,8 +124,12 @@ def create_mock(public_keys: dict[str, object]):
 
     @app.get(PREFIX + "/events/{t}")
     def event(t: str):
-        e = next(e for e in S["events"] if e["event_ticker"] == t)
-        return {"event": {k: v for k, v in e.items() if k != "markets"}, "markets": e["markets"]}
+        e = next((e for e in S["events"] if e["event_ticker"] == t), None)
+        if e is None:
+            e = S.get("hist_events", {}).get(t)
+            if e is None:
+                return JSONResponse({"code": "not_found", "message": "event"}, 404)
+        return {"event": {k: v for k, v in e.items() if k != "markets"}, "markets": e.get("markets", [])}
 
     @app.get(PREFIX + "/markets")
     def mlist(tickers: str = "", limit: int = 100, status: str = "", mve_filter: str = ""):
@@ -138,8 +142,30 @@ def create_mock(public_keys: dict[str, object]):
         ts = request.query_params.getlist("tickers")
         return {"orderbooks": [{"ticker": t, "orderbook_fp": ob(t)["orderbook_fp"]} for t in ts if t in markets()]}
 
+    @app.get(PREFIX + "/markets/trades")
+    def public_trades(ticker: str = "", max_ts: int = 10 ** 12, min_ts: int = 0, limit: int = 100, cursor: str = ""):
+        import calendar as _cal
+        ts_ = lambda t: _cal.timegm(time.strptime(t["created_time"][:19], "%Y-%m-%dT%H:%M:%S"))
+        sel = [t for t in S.get("public_trades", []) if t["ticker"] == ticker and min_ts <= ts_(t) <= max_ts]
+        sel.sort(key=ts_, reverse=True)   # newest first, like Kalshi
+        return {"trades": sel[:limit], "cursor": ""}
+
+    @app.get(PREFIX + "/historical/trades")
+    def hist_trades(ticker: str = "", max_ts: int = 10 ** 12, min_ts: int = 0, limit: int = 100, cursor: str = ""):
+        import calendar as _cal
+        ts_ = lambda t: _cal.timegm(time.strptime(t["created_time"][:19], "%Y-%m-%dT%H:%M:%S"))
+        sel = [t for t in S.get("hist_trades", []) if t["ticker"] == ticker and min_ts <= ts_(t) <= max_ts]
+        return {"trades": sel[:limit], "cursor": ""}
+
+    @app.get(PREFIX + "/historical/markets/{t}")
+    def hist_market(t: str):
+        m = S.get("hist_markets", {}).get(t)
+        return {"market": m} if m else JSONResponse({"code": "not_found", "message": "market"}, 404)
+
     @app.get(PREFIX + "/markets/{t}")
     def market(t: str):
+        if t not in markets():
+            return JSONResponse({"code": "not_found", "message": "market not found"}, 404)
         return {"market": markets()[t]}
 
     @app.get(PREFIX + "/markets/{t}/orderbook")

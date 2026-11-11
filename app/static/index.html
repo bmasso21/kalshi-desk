@@ -46,7 +46,7 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
   <span id="feedPill" class="pill" title="">feed …</span>
   <nav id="nav">
     <button data-t="scanner" class="on">Scanner</button><button data-t="markets">Markets</button>
-    <button data-t="rewards">Rewards</button><button data-t="portfolio">Portfolio</button><button data-t="ledger">Ledger</button><button data-t="research">Research</button><button data-t="settings">Settings</button>
+    <button data-t="rewards">Rewards</button><button data-t="portfolio">Portfolio</button><button data-t="ledger">Ledger</button><button data-t="clv">CLV</button><button data-t="research">Research</button><button data-t="settings">Settings</button>
   </nav>
   <span class="spacer"></span>
   <span id="scanInfo" class="mut" style="font-size:12px"></span>
@@ -96,6 +96,11 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
   <div class="card"><h3 style="margin-top:0">Audit</h3><table><tbody id="auditBody"></tbody></table></div>
 </section>
 <!-- SETTINGS -->
+<section id="t-clv" class="hide">
+  <div class="card row"><b>Closing-line value</b><select id="clvDays" onchange="loadClv()"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option><option value="365">1 year</option></select>
+   <button class="b" onclick="api('/api/clv/run',{method:'POST'}).then(loadClv)">Score now</button><span id="clvInfo" class="mut" style="font-size:12px"></span></div>
+  <div id="clvBox"></div>
+</section>
 <section id="t-research" class="hide">
   <div class="card"><h3 style="margin-top:0">Data warehouse</h3><div id="whBox" class="mut">Loading…</div></div>
   <div class="card"><h3 style="margin-top:0">Run a backtest</h3><div id="btForm"></div></div>
@@ -118,7 +123,7 @@ async function api(u,o={}){o.headers={'Content-Type':'application/json','X-Desk-
 // tabs
 document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x===b));
   document.querySelectorAll('main>section').forEach(s=>s.classList.toggle('hide',s.id!=='t-'+b.dataset.t));
-  ({scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:loadRewards,portfolio:loadPortfolio,ledger:loadLedger,research:loadResearch,settings:loadSettings})[b.dataset.t]()});
+  ({scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:loadRewards,portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,research:loadResearch,settings:loadSettings})[b.dataset.t]()});
 async function loadRewards(){try{const [q,r]=await Promise.all([api('/api/quoter'),api('/api/rewards')]);const st=q.state;
   $('#qState').innerHTML=(q.config.enabled?(st.running?'<b class="y">RUNNING</b>':'<b class="w">enabled, not running (kill switch or no key)</b>'):'<b class="mut">OFF</b>')+` · ${q.env.toUpperCase()} · ${st.resting} quotes resting · $${st.committed} committed / $${q.config.max_capital} cap`+(st.error?` · <span class="n">${esc(st.error)}</span>`:'');
   $('#qSel').innerHTML=q.selected.map(s=>`<tr><td><a href="#" onclick="openMarket('${esc(s.ticker)}');return false">${esc(s.title)}</a> <span class="mut">${esc(s.sub||'')} · ${esc(s.ticker)}</span></td><td class="r">$${esc(s.daily_reward)}</td><td class="r">${esc(s.share)}%</td><td class="r y">$${esc(s.est_daily)}</td></tr>`).join('')||'<tr><td colspan=4 class="mut">None yet (quoter off, or no pools meet your minimum)</td></tr>';
@@ -281,6 +286,15 @@ async function saveSettings(){const v=id=>+$('#'+id).value,env=$('#sEnv').value;
   if(patch.auto.enabled&&!CFG.auto.enabled&&!confirm('Turn ON auto-trading? Orders will be placed without asking you.'))return;
   if(patch.quoter.enabled&&!CFG.quoter.enabled&&!confirm(`Turn ON the liquidity quoter in ${env.toUpperCase()}? It will place and cancel resting orders automatically.`))return;
   try{const r=await api('/api/config',{method:'POST',body:patch});toast(r.authenticated?'Saved – API key is working':'Saved – no working key for '+r.config.env.toUpperCase()+' yet','ok');loadSettings();status()}catch(e){toast(e.message,'err');loadSettings();status()}}
+// CLV
+const cents=v=>v==null?'–':(v>0?'+':'')+Number(v).toFixed(2)+'¢';
+function clvTable(title,g){const rows=Object.entries(g);if(!rows.length)return'';return `<div class="card"><h3 style="margin-top:0">${title}</h3><table><thead><tr><th></th><th class="r">Fills</th><th class="r">Contracts</th><th class="r">Avg CLV / contract</th><th class="r">Total CLV</th><th class="r">Beat the close</th></tr></thead><tbody>${rows.map(([k,v])=>`<tr><td>${esc(k)}</td><td class="r">${v.fills}</td><td class="r">${v.contracts}</td><td class="r ${v.avg_clv_cents<0?'n':'y'}">${cents(v.avg_clv_cents)}</td><td class="r">${money(v.total_clv_dollars)}</td><td class="r">${v.beat_close_pct==null?'–':v.beat_close_pct+'%'}</td></tr>`).join('')}</tbody></table></div>`}
+async function loadClv(){try{const j=await api('/api/clv?days='+$('#clvDays').value),o=j.overall;
+  $('#clvInfo').textContent=`${j.env.toUpperCase()} · ${j.pending} fills waiting for their market to close · ${j.nodata} without a closing price${j.tracker.last_run?' · scored '+new Date(j.tracker.last_run*1000).toLocaleTimeString():''}`;
+  $('#clvBox').innerHTML=`<div class="card"><div class="row" style="gap:24px">${[['Avg CLV / contract',`<span class="${o.avg_clv_cents<0?'n':'y'}">${cents(o.avg_clv_cents)}</span>`],['Contracts scored',o.contracts],['Total CLV',money(o.total_clv_dollars)],['Beat the close',o.beat_close_pct==null?'–':o.beat_close_pct+'%']].map(([k,v])=>`<div><div class="mut">${k}</div><div class="big">${v}</div></div>`).join('')}</div>
+   <p class="mut" style="font-size:12px;margin-bottom:0">CLV = your price vs the market's last trade before it closed, in your side's terms. Positive = you bought cheaper (or sold dearer) than where the market finished. It shows edge long before P&amp;L is meaningful. Weighted by contracts.</p></div>
+   ${clvTable('By strategy',j.by_strategy)}${clvTable('By category',j.by_category)}${clvTable('By series',j.by_series)}
+   <div class="card"><h3 style="margin-top:0">Fills</h3><table><thead><tr><th>Time</th><th>Market</th><th>Strategy</th><th>Side</th><th class="r">Contracts</th><th class="r">YES price</th><th class="r">Closing YES</th><th class="r">CLV</th><th>Status</th></tr></thead><tbody>${j.recent.map(r=>`<tr><td>${ts(r.ts)}</td><td>${esc(r.ticker)}</td><td>${esc(r.strategy||r.source)}</td><td>${esc(r.action)} ${esc(r.side)}</td><td class="r">${r.count}</td><td class="r">${px(r.yes_price)}</td><td class="r">${px(r.closing_yes)}</td><td class="r ${r.clv_cents<0?'n':'y'}">${cents(r.clv_cents)}</td><td class="mut">${r.status}</td></tr>`).join('')||'<tr><td colspan=9 class="mut">No fills yet</td></tr>'}</tbody></table></div>`}catch(e){toast(e.message,'err')}}
 // research
 let STRATS=[];
 async function loadResearch(){try{const j=await api('/api/research');STRATS=j.strategies;const w=j.warehouse,c=w.counts,cf=w.config;

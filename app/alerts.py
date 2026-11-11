@@ -35,7 +35,7 @@ PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 LOW, NORMAL, HIGH, EMERGENCY = -1, 0, 1, 2
 
 ERROR_KINDS = {"connect_error", "scan_error", "auto_error", "loss_check_error", "fill_sync_error",
-               "feed_watch_error", "api_error", "quoter_error", "summary_error", "watchdog_error"}
+               "feed_watch_error", "api_error", "quoter_error", "summary_error", "watchdog_error", "clv_error", "warehouse_error"}
 
 
 class Alerter:
@@ -217,6 +217,13 @@ class Alerter:
         try:
             sp = e.spent_today(max_age=0)
             lines.append(f"Filled buys: ${sp['all']:.2f} (auto/quoter ${sp['auto']:.2f})")
+        except Exception:
+            pass
+        try:
+            cs = e.clv.summary(30)["overall"]
+            if cs["contracts"]:
+                lines.append(f"CLV 30d: {cs['avg_clv_cents']:+.2f}c/contract over {cs['contracts']:.0f} contracts, "
+                             f"beat the close {cs['beat_close_pct']:.0f}%")
         except Exception:
             pass
         errs = db.query("SELECT kind, COUNT(*) n FROM audit WHERE ts>=? AND (kind LIKE '%error%' OR kind IN "
