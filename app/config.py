@@ -63,6 +63,17 @@ DEFAULTS = {
         "quote_ttl_sec": 600,           # each quote expires on its own after this (re-placed 60s before; keeps queue priority)
         "max_volume_24h": 0,            # skip markets that traded more than this in 24h (0 = no limit)
     },
+    # --- circuit breakers (Phase 3) - every limit 0 = off until you set it ----------
+    "breakers": {
+        "enabled": True,                # compute P&L / drawdown every check_min (acts only on limits > 0)
+        "check_min": 5,
+        "strategy_daily_loss": 0.0,     # $ a strategy may lose today (its fills, marked to market) before it is turned off
+        "strategy_7d_loss": 0.0,        # $ over the last 7 days
+        "account_drawdown": 0.0,        # $ below the account's equity peak -> kill switch
+        "drawdown_days": 30,            # peak lookback
+        "tripped": {},                  # strategy -> {ts, reason}; set by the app, cleared by you (Settings)
+        "peak_reset_ts": 0,
+    },
     # --- phone alerts (Pushover) --------------------------------------------
     "alerts": {
         "enabled": True,

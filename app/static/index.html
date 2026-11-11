@@ -101,6 +101,8 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
 <!-- LEDGER -->
 <section id="t-ledger" class="hide">
   <div class="card" id="spent"></div>
+  <div class="card row"><b>Tax export</b><select id="taxYear"></select>
+   <button class="b" onclick="taxExport()">Download CSV</button><span class="mut" style="font-size:12px">Every fill, settlement and credit (rewards) in the year from Kalshi's records for the current environment, with cash flows, fees and a net total. A worksheet for your accountant – check it against Kalshi's own year-end statements.</span></div>
   <div class="card"><h3 style="margin-top:0">Order log (every attempt)</h3><table><thead><tr><th>Time</th><th>Env</th><th>Source</th><th>Ticker</th><th>Intent</th><th class="r">Px</th><th class="r">Count</th><th class="r">Cost</th><th>Status</th><th class="r">Filled</th><th>Error</th></tr></thead><tbody id="logBody"></tbody></table></div>
   <div class="card"><h3 style="margin-top:0">Audit</h3><table><tbody id="auditBody"></tbody></table></div>
 </section>
@@ -260,6 +262,10 @@ async function loadSettings(){const j=await api('/api/config');CFG=j.config;cons
     <label class="f">Max $ per market${num('r3',r.max_market_exposure)}</label><label class="f">Max $ total exposure${num('r4',r.max_total_exposure)}</label>
     <label class="f">Max contracts / order${num('r5',r.max_contracts_per_order,'1')}</label><label class="f">Max $ loss / day (trips kill switch)${num('r9',r.max_daily_loss)}</label><label class="f">Min buy price${num('r6',r.min_price)}</label><label class="f">Max buy price${num('r7',r.max_price)}</label>
     <label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" id="r8" ${r.require_confirm_prod?'checked':''}>Double-confirm prod orders</label></div></div>
+   <div class="card"><h3 style="margin-top:0">Circuit breakers</h3><p class="mut" style="font-size:12px;margin-top:0">A strategy that loses this much on its own fills (marked to market; liquidity rewards not counted) is turned off and stays off until you reset it here. The account breaker trips the kill switch when equity falls this far below its recent peak (withdrawals count as a drop – reset the peak after one). 0 = off.</p><div class="row">
+    <label class="f">Per strategy: max $ loss today${num('b1',(c.breakers||{}).strategy_daily_loss||0)}</label><label class="f">Per strategy: max $ loss over 7 days${num('b2',(c.breakers||{}).strategy_7d_loss||0)}</label>
+    <label class="f">Account: max $ below peak${num('b3',(c.breakers||{}).account_drawdown||0)}</label><label class="f">Peak lookback (days)${num('b4',(c.breakers||{}).drawdown_days||30,'1')}</label></div>
+    <div id="brkBox" class="mut" style="margin-top:8px">Loading…</div></div>
    <div class="card"><h3 style="margin-top:0">Auto-trading</h3><p class="w">Off by default. When on, scanner signals from the selected strategies are placed without asking, inside the tighter auto limits below. ${j.never_auto.join(', ')} can never auto-trade.</p><div class="row">
     <label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" id="a1" ${a.enabled?'checked':''}>Enable auto-trading</label>
     ${strat.filter(x=>!j.never_auto.includes(x)).map(x=>`<label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" class="as" value="${x}" ${a.strategies.includes(x)?'checked':''}>${x}</label>`).join('')}
@@ -277,7 +283,7 @@ async function loadSettings(){const j=await api('/api/config');CFG=j.config;cons
    <button class="b pri" onclick="saveSettings()">Save settings</button>
    <div class="card" style="margin-top:12px"><h3 style="margin-top:0">Remote access (Tailscale)</h3><div id="authBox" class="mut">Loading…</div></div>
    <div class="card" style="margin-top:12px"><h3 style="margin-top:0">Phone alerts (Pushover)</h3><div id="alertsBox" class="mut">Loading…</div></div>
-   <div class="card" style="margin-top:12px"><h3 style="margin-top:0">Sports odds research (OddsPapi, free plan)</h3><div id="sportsBox" class="mut">Loading…</div></div>`;$('#sEnv').value=c.env;loadAlerts();loadAuth();loadSportsCfg()}
+   <div class="card" style="margin-top:12px"><h3 style="margin-top:0">Sports odds research (OddsPapi, free plan)</h3><div id="sportsBox" class="mut">Loading…</div></div>`;$('#sEnv').value=c.env;loadAlerts();loadAuth();loadSportsCfg();loadBreakers()}
 async function loadSportsCfg(){const sp=CFG.sports||{};let j={configured:false,usage:{used:0,cap:240,left:240,month:''},calls:[]};try{j=await api('/api/sports')}catch(e){}const u=j.usage,d=j.discover;
   $('#sportsBox').innerHTML=`<p style="margin-top:0" class="${j.configured?'y':'w'}">${j.configured?'Key saved ('+esc(sp.oddspapi_key)+').':'No key yet: paste your OddsPapi API key below.'} <span class="mut">Requests this month (${esc(u.month)}): <b>${u.used}</b> of ${u.cap} allowed (free plan: 250). Every request is counted before it is sent; the app stops at the cap.</span></p>
    <div class="row"><label class="f">OddsPapi API key<input id="spK" type="password" autocomplete="off" placeholder="paste key" style="width:320px"></label>
@@ -339,9 +345,19 @@ async function saveAlerts(){const b={enabled:$('#alE').checked,fills:$('#alF').c
 async function testAlert(p){if(p===2&&!confirm('Send an EMERGENCY test? It repeats on your phone until you acknowledge it in the Pushover app.'))return;
   try{const r=await api('/api/alerts/test',{method:'POST',body:{priority:p}});toast(r.ok?'Test sent – check your phone':'Not sent: '+(r.error||r.status),r.ok?'ok':'err')}catch(e){toast(e.message,'err')}loadAlerts()}
 async function previewSummary(){try{const r=await api('/api/alerts/summary_preview');$('#sumPrev').textContent=r.text}catch(e){toast(e.message,'err')}}
+function taxExport(){const y=$('#taxYear').value;if(CFG&&CFG.env!=='prod'&&!confirm('You are on DEMO – the export will contain demo (fake-money) records. Continue?'))return;location.href='/api/export/tax?year='+y}
+(()=>{const y=new Date().getFullYear();const el=document.getElementById('taxYear');if(el)el.innerHTML=[y,y-1,y-2].map(x=>`<option>${x}</option>`).join('')})();
+async function loadBreakers(){try{const j=await api('/api/breakers'),st=j.state,a=st.account,tr=j.tripped;
+  const rows=Object.entries(st.strategies||{});
+  $('#brkBox').innerHTML=`${Object.keys(tr).length?`<p class="n"><b>Tripped:</b> ${Object.entries(tr).map(([k,v])=>`${esc(k)} – ${esc(v.reason)} (${ts(v.ts)}) <button class="b" onclick="brkReset('${esc(k)}')">Reset</button>`).join('<br>')}</p>`:'<p class="y" style="margin:4px 0">No breaker tripped.</p>'}
+   ${a?`<p style="font-size:12px;margin:4px 0">Account equity ${money(a.equity)} · peak ${money(a.peak)} · ${money(a.drawdown)} below peak <button class="b" onclick="brkReset(null,true)">Reset peak</button></p>`:''}
+   <table><thead><tr><th>Strategy</th><th class="r">P&amp;L today</th><th class="r">P&amp;L 7 days</th><th class="r">Fills (7d)</th></tr></thead><tbody>${rows.map(([k,x])=>`<tr><td>${esc(k)}</td><td class="r ${x.today<0?'n':''}">${money(x.today)}</td><td class="r ${x.week<0?'n':''}">${money(x.week)}</td><td class="r">${x.fills_week}${x.unpriced?' <span class="mut">('+x.unpriced+' unpriced)</span>':''}</td></tr>`).join('')||'<tr><td colspan=4 class="mut">No fills in the last 7 days</td></tr>'}</tbody></table>
+   <p class="mut" style="font-size:12px;margin:4px 0">Checked ${st.last?ts(st.last):'not yet'} (every ${j.limits.check_min} min)${st.error?' · <span class="n">'+esc(st.error)+'</span>':''} <button class="b" onclick="api('/api/breakers/check',{method:'POST'}).then(loadBreakers).catch(e=>toast(e.message,'err'))">Check now</button></p>`}catch(e){$('#brkBox').textContent=e.message}}
+async function brkReset(st,peak){if(!confirm(peak?'Reset the account equity peak to now?':'Reset the breaker for '+st+'? You can then switch it back on.'))return;try{await api('/api/breakers/reset',{method:'POST',body:{strategy:st,peak:!!peak}});toast('Reset','ok')}catch(e){toast(e.message,'err')}loadBreakers()}
 async function saveSettings(){const v=id=>+$('#'+id).value,env=$('#sEnv').value;
   if(env==='prod'&&CFG.env!=='prod'&&!confirm('Switch to PRODUCTION? Orders will use real money.'))return;
   const patch={env,risk:{max_order_cost:v('r1'),max_daily_spend:v('r2'),max_market_exposure:v('r3'),max_total_exposure:v('r4'),max_contracts_per_order:v('r5'),min_price:v('r6'),max_price:v('r7'),require_confirm_prod:$('#r8').checked,max_daily_loss:v('r9')},
+   breakers:{strategy_daily_loss:v('b1'),strategy_7d_loss:v('b2'),account_drawdown:v('b3'),drawdown_days:v('b4')},
    quoter:{enabled:$('#q1').checked,max_markets:v('q2'),size:v('q3'),min_daily_reward:v('q4'),max_inventory:v('q5'),max_capital:v('q6'),pull_hours:v('q7'),jump_cents:v('q8'),quote_ttl_sec:v('q9'),max_volume_24h:v('q10')},
    auto:{enabled:$('#a1').checked,strategies:[...document.querySelectorAll('.as:checked')].map(x=>x.value),max_order_cost:v('a2'),max_daily_spend:v('a3')},
    scanner:{interval_sec:v('s1'),min_edge:v('s2'),min_volume_24h:v('s3'),max_markets_scanned:v('s4'),strategies:[...document.querySelectorAll('.ss:checked')].map(x=>x.value)}};

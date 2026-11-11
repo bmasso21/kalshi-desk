@@ -40,6 +40,8 @@ class Engine:
         self.quoter = Quoter(self)
         from .clv import CLVTracker
         self.clv = CLVTracker(self)
+        from .breakers import Breakers
+        self.breakers = Breakers(self)
         self.feed.listeners.append(self.quoter.on_feed)
 
     # ------------------------------------------------------------ connection --
@@ -384,6 +386,7 @@ class Engine:
         self.quoter.start()
         self.alerts.start()
         self.clv.start()
+        self.breakers.start()
 
     def stop(self, reason: str = "clean shutdown"):
         self._stop.set()
@@ -391,4 +394,5 @@ class Engine:
         self.quoter.stop()
         self.feed.stop()
         self.clv.stop()
+        self.breakers.stop()
         self.alerts.stop(reason)

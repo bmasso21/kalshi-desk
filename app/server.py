@@ -244,6 +244,29 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 errors.append("remote_url must look like https://<machine>.<tailnet>.ts.net")
             else:
                 patch["remote_url"] = u
+        if isinstance(patch.get("breakers"), dict):
+            bp = {k: v for k, v in patch["breakers"].items()
+                  if k in ("enabled", "check_min", "strategy_daily_loss", "strategy_7d_loss", "account_drawdown", "drawdown_days")}
+            for k, lo, hi in (("check_min", 1, 60), ("strategy_daily_loss", 0, 10 ** 6), ("strategy_7d_loss", 0, 10 ** 6),
+                              ("account_drawdown", 0, 10 ** 7), ("drawdown_days", 1, 365)):
+                if k in bp:
+                    try:
+                        bp[k] = max(lo, min(hi, float(bp[k])))
+                    except (TypeError, ValueError):
+                        bp.pop(k)
+            if "enabled" in bp:
+                bp["enabled"] = bool(bp["enabled"])
+            patch["breakers"] = bp            # 'tripped' / peak reset only via the reset endpoint
+        tripped = (cfg.data.get("breakers") or {}).get("tripped") or {}
+        if isinstance(patch.get("quoter"), dict) and patch["quoter"].get("enabled") and not cfg.quoter.get("enabled") \
+                and "liquidity" in tripped:
+            patch["quoter"].pop("enabled")
+            errors.append("The quoter's circuit breaker is tripped - reset it in Settings first")
+        if isinstance(patch.get("auto"), dict) and isinstance(patch["auto"].get("strategies"), list):
+            blocked = [x for x in patch["auto"]["strategies"] if x in tripped and x not in (cfg.auto.get("strategies") or [])]
+            if blocked:
+                patch["auto"]["strategies"] = [x for x in patch["auto"]["strategies"] if x not in blocked]
+                errors.append(f"Circuit breaker tripped for {', '.join(blocked)} - reset it first")
         if isinstance(patch.get("quoter"), dict):
             qp = patch["quoter"]
             for k, lo, hi in (("quote_ttl_sec", 120, 3600), ("max_volume_24h", 0, 10 ** 9)):
@@ -534,6 +557,43 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         r["params"] = json.loads(r["params"] or "{}")
         r["filters"] = json.loads(r["filters"] or "{}")
         return r
+
+    # ---------------------------------------------------- tax export (3) --
+    @app.get("/api/export/tax")
+    def tax_export(year: int = 0):
+        from fastapi.responses import Response
+
+        from . import taxes
+        if not eng.client.authenticated:
+            raise HTTPException(400, "no working API key for this environment")
+        y = year or time.gmtime().tm_year
+        if not 2020 <= y <= 2100:
+            raise HTTPException(400, "bad year")
+        text, tot = taxes.build(eng.client, y)
+        db.audit("tax_export", f"{cfg.env} {y}: {json.dumps(tot)}")
+        return Response(text, media_type="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="kalshi-desk-{cfg.env}-{y}.csv"'})
+
+    # ------------------------------------------------------- breakers (3) --
+    @app.get("/api/breakers")
+    def breakers_status():
+        return eng.breakers.snapshot()
+
+    @app.post("/api/breakers/check")
+    def breakers_check():
+        if not eng.client.authenticated:
+            raise HTTPException(400, "no working API key for this environment")
+        eng.breakers.check()
+        return eng.breakers.snapshot()
+
+    @app.post("/api/breakers/reset")
+    async def breakers_reset(request: Request):
+        b = await request.json()
+        st = b.get("strategy")
+        if st is not None and st not in eng.breakers.tripped():
+            raise HTTPException(400, "that breaker is not tripped")
+        eng.breakers.reset(st, peak=bool(b.get("peak")))
+        return eng.breakers.snapshot()
 
     # ------------------------------------------------- market making (2.3) --
     mm_cache: dict = {"ts": 0.0, "r": None}

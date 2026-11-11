@@ -134,6 +134,23 @@ blend behind the *hourly* markets, not what the daily markets settle on, so v2.1
 - The quoter's market picker now uses the same scoring (it used a simpler size ratio).
 - Backtester: filled/expired orders are dropped from the matching loop (same results, much faster on long runs).
 
+### Circuit breakers (v3.0) - Settings
+Every 5 minutes, for the current environment:
+- **Per strategy**: P&L of that strategy's own fills (today and last 7 days), each fill marked to the market (settled
+  result, else the mid). Liquidity rewards are not counted (conservative). If a loss reaches *max $ loss today* or
+  *max $ loss over 7 days*, that strategy is turned off (quoter disabled + quotes cancelled; auto strategy removed from
+  auto-trading), you get a phone alert, and it can't be switched back on until you press *Reset*. Manual and outside
+  fills are shown but never trip anything.
+- **Account**: equity (Kalshi's cash + positions) vs its highest value in the last 30 days. A drop of *max $ below peak*
+  trips the kill switch. Withdrawals look like a drop: press *Reset peak* after withdrawing.
+- All limits are 0 (off) until you set them.
+
+### Tax export (v3.0) - Ledger
+*Download CSV* for a year: every fill, settlement and credit (liquidity rewards etc.) from Kalshi's records for the current
+environment, with cash flow (buys negative, sells/settlements/credits positive), fees, and a total row (net = cash flow -
+fees; positions still open at year end are at cost). A worksheet for your accountant, not tax advice; check it against
+Kalshi's own year-end statements.
+
 ### Updating a running install
 Drop an empty file named `restart.request` next to `run.py`. The app cancels quoter orders, exits, and the boot task restarts it about 15 seconds later.
 
