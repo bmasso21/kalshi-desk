@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS fills (
     PRIMARY KEY (env, fill_key)
 );
 CREATE INDEX IF NOT EXISTS fills_ts ON fills(env, ts);
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, day TEXT, kind TEXT, priority INTEGER,
+    title TEXT, message TEXT, status TEXT, detail TEXT
+);
+CREATE INDEX IF NOT EXISTS alerts_day ON alerts(kind, day);
 CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT, message TEXT
 );
@@ -54,6 +59,7 @@ class DB:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self.audit_listeners: list = []
 
     def execute(self, sql: str, args=()):
         with self.lock:
@@ -68,6 +74,11 @@ class DB:
     # --- helpers -------------------------------------------------------------
     def audit(self, kind: str, message: str):
         self.execute("INSERT INTO audit(ts,kind,message) VALUES(?,?,?)", (time.time(), kind, message))
+        for fn in list(self.audit_listeners):
+            try:
+                fn(kind, message)
+            except Exception:
+                pass
 
     def log_order(self, **f) -> int:
         f.setdefault("ts", time.time())

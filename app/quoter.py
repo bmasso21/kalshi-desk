@@ -332,6 +332,7 @@ class Quoter:
             except Exception as e:
                 self.state["error"] = str(e)
                 self.log("error", traceback.format_exc()[-600:])
+                self.e.db.audit("quoter_error", traceback.format_exc()[-600:])
             # sleep until the refresh interval, or earlier if the live feed reports a change
             self._wake.wait(max(5, int(self.cfg.get("refresh_sec") or 15)))
             gap = self.MIN_GAP - (time.time() - self.last_cycle)

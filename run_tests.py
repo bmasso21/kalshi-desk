@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-SUITES = ["tests/test_e2e.py", "tests/test_ws.py"]
+SUITES = ["tests/test_e2e.py", "tests/test_ws.py", "tests/test_alerts.py"]
 
 failed = []
 for s in SUITES:

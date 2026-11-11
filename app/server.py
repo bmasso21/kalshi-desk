@@ -35,6 +35,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     def _start():
         if start_engine:
             eng.start()
+            eng.alerts.startup(__version__)
 
     @app.on_event("shutdown")
     def _stop():
@@ -43,6 +44,11 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     @app.exception_handler(KalshiError)
     async def _kerr(_, e: KalshiError):
         return JSONResponse({"error": str(e), "detail": e.payload}, status_code=400)
+
+    @app.exception_handler(Exception)
+    async def _any(request: Request, e: Exception):
+        db.audit("api_error", f"{request.method} {request.url.path}: {type(e).__name__}: {e}")
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
 
     @app.exception_handler(risk.RiskError)
     async def _rerr(_, e: risk.RiskError):
@@ -110,6 +116,32 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 except Exception:
                     patch.pop(pk)
                     errors.append(f"{e} key file is not a valid private key: {p}")
+        if isinstance(patch.get("alerts"), dict):
+            al = patch["alerts"]
+            for k, label in (("pushover_user", "Pushover user key"), ("pushover_token", "Pushover API token")):
+                if k in al:
+                    v = str(al[k] or "").strip()
+                    if not v or v.endswith("…"):
+                        al.pop(k)            # blank / masked value = keep the stored one
+                    elif not re.fullmatch(r"[A-Za-z0-9]{30}", v):
+                        al.pop(k)
+                        errors.append(f"{label} should be 30 letters/digits (copy it from pushover.net)")
+                    else:
+                        al[k] = v
+            if "healthcheck_url" in al:
+                v = str(al["healthcheck_url"] or "").strip()
+                if v.endswith("…"):
+                    al.pop("healthcheck_url")
+                elif v and not v.startswith("https://"):
+                    al.pop("healthcheck_url")
+                    errors.append("Heartbeat URL must start with https://")
+                else:
+                    al["healthcheck_url"] = v
+            if "summary_time" in al and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(al["summary_time"])):
+                al.pop("summary_time")
+                errors.append("Summary time must be HH:MM (24h)")
+            for k in ("api_url_override",):
+                al.pop(k, None)              # test-only setting, never from the browser
         if "auto" in patch and "strategies" in patch["auto"]:
             patch["auto"]["strategies"] = [s for s in patch["auto"]["strategies"] if s not in NEVER_AUTO]
         old_env = cfg.env
@@ -118,7 +150,10 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         cfg.update(patch)
         if any(k in patch for k in ("env", "base_url_override")) or any(k.endswith(("_key_id", "_key_path")) for k in patch):
             eng.connect()
-        db.audit("config", json.dumps({k: v for k, v in patch.items() if "key" not in k})[:1000])
+        safe = {k: v for k, v in patch.items() if "key" not in k}
+        if isinstance(safe.get("alerts"), dict):
+            safe["alerts"] = {k: v for k, v in safe["alerts"].items() if k not in ("pushover_user", "pushover_token", "healthcheck_url")}
+        db.audit("config", json.dumps(safe)[:1000])
         if cfg.env != old_env:
             eng.trigger_scan()
         out = get_config()
@@ -138,6 +173,26 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             db.audit("kill_switch", "released")
             cancelled = []
         return {"kill_switch": bool(on), "cancelled": cancelled}
+
+    # -------------------------------------------------------------- alerts --
+    @app.get("/api/alerts")
+    def alerts_list():
+        return {"configured": eng.alerts.configured(),
+                "alerts": db.query("SELECT id,ts,kind,priority,title,message,status,detail FROM alerts ORDER BY id DESC LIMIT 100")}
+
+    @app.post("/api/alerts/test")
+    async def alerts_test(request: Request):
+        b = await request.json()
+        pr = int(b.get("priority", 0))
+        if pr not in (-1, 0, 1, 2):
+            raise HTTPException(400, "priority must be -1, 0, 1 or 2")
+        names = {-1: "low (no sound)", 0: "normal", 1: "high", 2: "EMERGENCY - repeats until you acknowledge it"}
+        return eng.alerts.send("test", f"Kalshi Desk test: {names[pr]}",
+                               f"Test alert at {time.strftime('%H:%M:%S')}. Env {cfg.env.upper()}.", pr, sync=True)
+
+    @app.get("/api/alerts/summary_preview")
+    def alerts_summary_preview():
+        return {"text": eng.alerts.summary_text()}
 
     # -------------------------------------------------------------- quoter --
     @app.get("/api/quoter")

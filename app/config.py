@@ -61,6 +61,27 @@ DEFAULTS = {
         "min_mid": 0.15, "max_mid": 0.85,
         "max_spread": 0.06,
     },
+    # --- phone alerts (Pushover) --------------------------------------------
+    "alerts": {
+        "enabled": True,
+        "pushover_user": "",            # Pushover user key (30 chars) - entered in Settings, never shown again
+        "pushover_token": "",           # Pushover application API token (30 chars)
+        "device": "",                   # optional: only this Pushover device
+        "fills": True,
+        "kill": True,                   # kill switch + leg risk (emergency priority)
+        "errors": True,
+        "lifecycle": True,              # app started / restarted / down (watchdog)
+        "daily_summary": True,
+        "summary_time": "23:50",        # local time
+        "fill_batch_sec": 10,
+        "error_throttle_min": 30,
+        "feed_down_min": 5,
+        "emergency_retry": 60,          # seconds between repeats until acknowledged (min 30)
+        "emergency_expire": 3600,       # stop repeating after this many seconds (max 10800)
+        "app_down_min": 2,              # watchdog: alert after the app is unreachable this long
+        "healthcheck_url": "",          # optional dead-man ping (e.g. healthchecks.io) every minute
+        "api_url_override": "",         # testing only
+    },
     # --- scanner ----------------------------------------------------------
     "scanner": {
         "interval_sec": 120,
@@ -149,4 +170,9 @@ class Config:
             d[f"{e}_private_key_path"] = bool(d[f"{e}_private_key_path"])
             kid = d[f"{e}_key_id"]
             d[f"{e}_key_id"] = (kid[:8] + "…") if kid else ""
+        a = d.get("alerts", {})
+        for k in ("pushover_user", "pushover_token"):
+            a[k] = (a[k][:4] + "…") if a.get(k) else ""
+        if a.get("healthcheck_url"):
+            a["healthcheck_url"] = a["healthcheck_url"][:30] + "…"
         return d

@@ -28,9 +28,13 @@ class Engine:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._scan_now = threading.Event()
+        from .alerts import Alerter
         from .ws_feed import Feed
+        self.alerts = Alerter(self)
+        self.db.audit_listeners.append(self.alerts.on_audit)
         self.feed = Feed(self)
         self.feed.listeners.append(self._on_feed)
+        self.feed.listeners.append(self.alerts.on_feed)
         self.connect()
         from .quoter import Quoter
         self.quoter = Quoter(self)
@@ -56,7 +60,8 @@ class Engine:
     def _on_feed(self, kind: str, msg: dict):
         """WebSocket events. Fills are stored and invalidate the position/spend caches."""
         if kind == "fill":
-            self.db.record_fill(self.cfg.env, msg, "ws")
+            if self.db.record_fill(self.cfg.env, msg, "ws"):
+                self.alerts.on_fill(msg)
             self.positions_cache["ts"] = 0
             self.spend_cache["ts"] = 0
         elif kind == "order":
@@ -78,7 +83,9 @@ class Engine:
         n = 0
         try:
             for f in self.client.fills(min_ts=max(since, int(time.time()) - lookback), max_items=5000):
-                n += self.db.record_fill(self.cfg.env, f, "rest")
+                if self.db.record_fill(self.cfg.env, f, "rest"):
+                    n += 1
+                    self.alerts.on_fill(f)
         except Exception as e:
             self.db.audit("fill_sync_error", str(e))
         if n:
@@ -371,9 +378,11 @@ class Engine:
         if self.cfg.data.get("ws_enabled", True):
             self.feed.start()
         self.quoter.start()
+        self.alerts.start()
 
-    def stop(self):
+    def stop(self, reason: str = "clean shutdown"):
         self._stop.set()
         self._scan_now.set()
         self.quoter.stop()
         self.feed.stop()
+        self.alerts.stop(reason)

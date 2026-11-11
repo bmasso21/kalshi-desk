@@ -239,7 +239,32 @@ async function loadSettings(){const j=await api('/api/config');CFG=j.config;cons
    <div class="card"><h3 style="margin-top:0">Scanner</h3><div class="row"><label class="f">Every (sec)${num('s1',s.interval_sec,'10')}</label><label class="f">Min edge $/contract after fees${num('s2',s.min_edge)}</label>
     <label class="f">Min 24h volume${num('s3',s.min_volume_24h,'1')}</label><label class="f">Max events scanned${num('s4',s.max_markets_scanned,'100')}</label>
     ${strat.map(x=>`<label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" class="ss" value="${x}" ${s.strategies.includes(x)?'checked':''}>${x}</label>`).join('')}</div></div>
-   <button class="b pri" onclick="saveSettings()">Save settings</button>`;$('#sEnv').value=c.env}
+   <button class="b pri" onclick="saveSettings()">Save settings</button>
+   <div class="card" style="margin-top:12px"><h3 style="margin-top:0">Phone alerts (Pushover)</h3><div id="alertsBox" class="mut">Loading…</div></div>`;$('#sEnv').value=c.env;loadAlerts()}
+async function loadAlerts(){const al=CFG.alerts||{};let j={configured:false,alerts:[]};try{j=await api('/api/alerts')}catch(e){}
+  const cb=(id,v,t)=>`<label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" id="${id}" ${v?'checked':''}>${t}</label>`;
+  const pr={'-1':'low','0':'normal','1':'high','2':'EMERGENCY'};
+  $('#alertsBox').innerHTML=`<p class="${j.configured?'y':'w'}" style="margin-top:0">${j.configured?'Pushover is set up.':'Not set up yet: enter your Pushover user key and an application API token from pushover.net.'}</p>
+   <div class="row"><label class="f">User key ${al.pushover_user?'(set: '+esc(al.pushover_user)+')':''}<input id="alU" autocomplete="off" placeholder="30 characters" style="width:300px"></label>
+   <label class="f">Application API token ${al.pushover_token?'(set: '+esc(al.pushover_token)+')':''}<input id="alT" autocomplete="off" placeholder="30 characters" style="width:300px"></label>
+   <label class="f">Device (optional)<input id="alD" value="${esc(al.device||'')}" style="width:140px"></label></div>
+   <div class="row" style="margin-top:8px">${cb('alE',al.enabled,'Alerts on')}${cb('alF',al.fills,'Fills')}${cb('alK',al.kill,'Kill switch / leg risk (emergency)')}${cb('alR',al.errors,'Errors')}${cb('alL',al.lifecycle,'App started / down')}${cb('alS',al.daily_summary,'Daily P&amp;L summary')}
+   <label class="f">Summary at<input id="alST" value="${esc(al.summary_time||'23:50')}" style="width:70px"></label>
+   <label class="f">Error alerts at most every (min)<input id="alET" type="number" value="${al.error_throttle_min??30}" style="width:70px"></label>
+   <label class="f">Emergency repeats every (sec)<input id="alRR" type="number" min="30" value="${al.emergency_retry??60}" style="width:70px"></label></div>
+   <div class="row" style="margin-top:8px"><label class="f" style="flex:1">Heartbeat URL (optional, healthchecks.io) ${al.healthcheck_url?'(set)':''}<input id="alH" placeholder="https://hc-ping.com/…" style="width:100%"></label></div>
+   <div class="row" style="margin-top:10px"><button class="b pri" onclick="saveAlerts()">Save alerts</button>
+    <button class="b" onclick="testAlert(0)">Test normal</button><button class="b" onclick="testAlert(1)">Test high</button><button class="b" onclick="testAlert(-1)">Test low</button><button class="b no" onclick="testAlert(2)">Test EMERGENCY</button>
+    <button class="b" onclick="previewSummary()">Preview daily summary</button></div>
+   <pre id="sumPrev" class="mut" style="white-space:pre-wrap;font-size:12px"></pre>
+   <table style="margin-top:8px"><thead><tr><th>Time</th><th>Kind</th><th>Priority</th><th>Title</th><th>Status</th></tr></thead><tbody>${(j.alerts||[]).slice(0,25).map(a=>`<tr><td>${ts(a.ts)}</td><td>${esc(a.kind)}</td><td>${pr[a.priority]}</td><td title="${esc(a.message)}">${esc(a.title)}</td><td class="${a.status==='sent'?'y':a.status==='failed'?'n':'mut'}" title="${esc(a.detail||'')}">${a.status}</td></tr>`).join('')||'<tr><td colspan=5 class="mut">No alerts yet</td></tr>'}</tbody></table>`}
+async function saveAlerts(){const b={enabled:$('#alE').checked,fills:$('#alF').checked,kill:$('#alK').checked,errors:$('#alR').checked,lifecycle:$('#alL').checked,daily_summary:$('#alS').checked,
+   summary_time:$('#alST').value.trim(),error_throttle_min:+$('#alET').value,emergency_retry:Math.max(30,+$('#alRR').value),device:$('#alD').value.trim()};
+  const u=$('#alU').value.trim(),t=$('#alT').value.trim(),h=$('#alH').value.trim();if(u)b.pushover_user=u;if(t)b.pushover_token=t;if(h)b.healthcheck_url=h;
+  try{const r=await api('/api/config',{method:'POST',body:{alerts:b}});CFG=r.config;toast('Alert settings saved','ok')}catch(e){toast(e.message,'err');try{CFG=(await api('/api/config')).config}catch(_){}}loadAlerts()}
+async function testAlert(p){if(p===2&&!confirm('Send an EMERGENCY test? It repeats on your phone until you acknowledge it in the Pushover app.'))return;
+  try{const r=await api('/api/alerts/test',{method:'POST',body:{priority:p}});toast(r.ok?'Test sent – check your phone':'Not sent: '+(r.error||r.status),r.ok?'ok':'err')}catch(e){toast(e.message,'err')}loadAlerts()}
+async function previewSummary(){try{const r=await api('/api/alerts/summary_preview');$('#sumPrev').textContent=r.text}catch(e){toast(e.message,'err')}}
 async function saveSettings(){const v=id=>+$('#'+id).value,env=$('#sEnv').value;
   if(env==='prod'&&CFG.env!=='prod'&&!confirm('Switch to PRODUCTION? Orders will use real money.'))return;
   const patch={env,risk:{max_order_cost:v('r1'),max_daily_spend:v('r2'),max_market_exposure:v('r3'),max_total_exposure:v('r4'),max_contracts_per_order:v('r5'),min_price:v('r6'),max_price:v('r7'),require_confirm_prod:$('#r8').checked,max_daily_loss:v('r9')},

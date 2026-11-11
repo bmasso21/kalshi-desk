@@ -52,6 +52,24 @@ The app keeps one authenticated WebSocket connection to Kalshi (`wss://external-
 - Every fill is stored in the `fills` table with its strategy and source (used by the closing-line-value tracker).
 - The quoter now wakes on book changes in its markets (at most every 2s) instead of only every 15s.
 
+### Phone alerts (v1.3, Pushover)
+Settings → **Phone alerts**: paste your Pushover **user key** and an **application API token** (create an application at pushover.net). They are stored in `config.json` on this computer and never shown in the browser again.
+
+| Event | Priority |
+|---|---|
+| Fill (bursts within 10s are batched into one message) | normal |
+| Kill switch tripped automatically (loss limit), leg risk on a basket | **emergency**: repeats until you acknowledge it |
+| Kill switch pressed by you | high |
+| Errors (scan, auto, quoter, API, fill sync…) | high, at most once per kind every 30 min, with a count of the ones skipped |
+| Live feed down 5+ min / restored | high / normal |
+| App started (normal) or restarted after an unclean stop (high) | normal / high |
+| App unreachable 2+ min (sent by the watchdog) | **emergency** |
+| Daily P&L summary (default 23:50) | low (no sound) |
+
+**Watchdog.** A separate process checks the server every 30s. If it stays unreachable for 2 minutes you get an emergency alert; 3 minutes later the watchdog kills the hung server so the boot task's launcher restarts it, and tells you. Update restarts (~20s) don't alert. Log: `logs\watchdog.log`.
+
+**Whole machine offline.** Nothing on this computer can report that it lost power or internet. For that, create a free check at healthchecks.io (period 5 min), turn on its Pushover integration, and paste its ping URL into *Heartbeat URL*; the app pings it every minute.
+
 ### Updating a running install
 Drop an empty file named `restart.request` next to `run.py`. The app cancels quoter orders, exits, and the boot task restarts it about 15 seconds later.
 
