@@ -418,7 +418,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             raise HTTPException(400, "Add your OddsPapi key in Settings first")
         if app_sp_state["running"]:
             raise HTTPException(409, "already running")
-        if oddspapi.usage()["left"] < 14:
+        if oddspapi.usage()["left"] < 9:
             raise HTTPException(400, "not enough OddsPapi requests left this month")
 
         def run():

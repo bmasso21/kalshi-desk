@@ -38,7 +38,9 @@ class Sess:
 
     def get(self, url, params=None, headers=None, timeout=None):
         self.calls.append((url, dict(params or {}), dict(headers or {})))
-        p = url.split("/en", 1)[1]
+        p = url.split("/v4", 1)[1]
+        if params.get("apiKey") != KEY:
+            return Resp(401, {"error": 401, "message": "invalid apiKey"})
         if p == "/sports":
             return Resp(200, [{"sportId": 11, "slug": "basketball", "sportName": "Basketball"},
                               {"sportId": 13, "slug": "american-football", "sportName": "American Football"},
@@ -50,14 +52,14 @@ class Sess:
             return Resp(200, [{"tournamentId": 100 + params["sportId"], "tournamentName": name, "sportId": params["sportId"]},
                               {"tournamentId": 999, "tournamentName": "Other"}])
         if p == "/fixtures":
-            return Resp(200, [{"fixtureId": "id1", "participant1Name": "A"}, {"fixtureId": "id2"}])
-        if p == "/fixtures/mapping":
-            return Resp(200, [{"bookmaker": "kalshi", "fixtureId": "id1", "bookmakerFixtureId": "KXNFLGAME-26NOV15AB"}])
+            return Resp(200, [{"fixtureId": "id1", "participant1Name": "A", "statusId": 2}, {"fixtureId": "id2", "statusId": 0}])
+        if p == "/historical-odds":
+            return Resp(200, {"id1": {"bookmakers": {"pinnacle": {"markets": {"101": {}}}}}})
         if p == "/markets":
             return Resp(200, [{"marketId": 1, "marketName": "Moneyline"}])
         if p == "/bookmakers":
             return Resp(200, [{"slug": "pinnacle"}])
-        return Resp(404, {"error": "nope " + str(headers)})
+        return Resp(404, {"error": "nope " + str(params)})
 
 
 class KC:
@@ -74,7 +76,7 @@ def main():
     op = S.OddsPapi(lambda: conf, db, session=sess)
     check("usage starts at 0", op.usage()["used"] == 0 and op.usage()["cap"] == 5)
     op.get("/sports")
-    check("key sent as X-API-Key header, not in the URL/params", sess.calls[0][2].get("X-API-Key") == KEY and KEY not in json.dumps(sess.calls[0][1]))
+    check("v4 API with the apiKey query parameter", sess.calls[0][0] == "https://api.oddspapi.io/v4/sports" and sess.calls[0][1].get("apiKey") == KEY)
     check("each request counted", op.usage()["used"] == 1)
     for _ in range(4):
         op.get("/sports")
@@ -93,6 +95,18 @@ def main():
     except RuntimeError as e:
         err = str(e)
     check("HTTP errors raised with the key redacted", "404" in err and KEY not in err and "***" in err, err)
+
+    class Boom:
+        def get(self, url, params=None, headers=None, timeout=None):
+            raise ConnectionError(f"failed to reach {url}?apiKey={params.get('apiKey')}")
+    db.put("sp_usage", {"month": op.month(), "count": 0})
+    opb = S.OddsPapi(lambda: conf, db, session=Boom())
+    try:
+        opb.get("/sports")
+        e2 = ""
+    except RuntimeError as e:
+        e2 = str(e)
+    check("network errors never leak the key (exception + call log)", e2 and KEY not in e2 and KEY not in json.dumps(opb.calls()), e2)
     check("call log never contains the key", KEY not in json.dumps(op.calls()))
     conf2 = {"oddspapi_key": "", "monthly_cap": 5}
     op2 = S.OddsPapi(lambda: conf2, db, session=Sess())
@@ -101,7 +115,7 @@ def main():
         nokey = False
     except RuntimeError as e:
         nokey = "Settings" in str(e)
-    check("no key -> refuses without spending", nokey and op2.usage()["used"] == 1)   # (counter shared: 1 from the 404 above)
+    check("no key -> refuses without spending", nokey and op2.usage()["used"] == 1)   # (counter shared: 1 from the failed call above)
 
     # discovery
     db.put("sp_usage", {"month": op.month(), "count": 0})
@@ -111,13 +125,19 @@ def main():
     d = S.discover(op3, KC())
     check("discovery finds sport + league ids", d["sport_ids"] == {"basketball": 11, "american-football": 13, "ice-hockey": 15, "baseball": 14}
           and d["tournament_ids"] == {"NBA": 111, "NFL": 113, "NHL": 115, "MLB": 114}, (d["sport_ids"], d["tournament_ids"]))
-    check("discovery stays within its request budget (<= 14)", len(sess2.calls) <= 14 and op3.usage()["used"] == len(sess2.calls), len(sess2.calls))
-    check("discovery maps NFL fixtures to Kalshi", any(c[0].endswith("/fixtures/mapping") and c[1].get("bookmaker") == "kalshi" for c in sess2.calls))
-    check("raw responses stored for review", op3.raw("discover:mapping:NFL:kalshi")["body"][0]["bookmakerFixtureId"].startswith("KXNFLGAME"))
+    check("discovery stays within its request budget (<= 9)", len(sess2.calls) <= 9 and op3.usage()["used"] == len(sess2.calls), len(sess2.calls))
+    check("discovery pulls one finished NFL game's history (Pinnacle + prediction markets)",
+          any(c[0].endswith("/historical-odds") and c[1].get("fixtureId") == "id1" and "pinnacle" in c[1].get("bookmakers", "") for c in sess2.calls))
+    check("raw responses stored for review", "id1" in op3.raw("discover:historical:NFL")["body"])
     check("Kalshi game series listed", [s["ticker"] for s in d["kalshi"]["game_series"]] == ["KXNFLGAME", "KXNBAGAME"])
     conf["monthly_cap"] = op3.usage()["used"] + 3
-    d2 = S.discover(op3, None, max_requests=14)
-    check("discovery stops cleanly at the cap", any("budget" in (x.get("error") or "") for x in d2["steps"]) and op3.usage()["used"] <= conf["monthly_cap"])
+    d2 = S.discover(op3, None)
+    check("discovery stops cleanly at the cap", "budget" in (d2.get("stopped") or "") and op3.usage()["used"] <= conf["monthly_cap"], d2.get("stopped"))
+    conf["monthly_cap"] = 240
+    bad = {"oddspapi_key": "WRONGKEY_abcdefghijklmnop", "monthly_cap": 240}
+    sess3 = Sess()
+    d3 = S.discover(S.OddsPapi(lambda: bad, db, session=sess3), None)
+    check("invalid key: discovery stops after the first request", len(sess3.calls) == 1 and "401" in (d3.get("stopped") or ""), (len(sess3.calls), d3.get("stopped")))
 
     # API + config handling
     from fastapi.testclient import TestClient
@@ -145,7 +165,7 @@ def main():
     check("key never written to the audit trail", KEY not in aud and "monthly_cap" in aud)
     check("sports status: configured", c.get("/api/sports").json()["configured"] is True)
     check("discover needs the CSRF token", c.post("/api/sports/discover").status_code in (401, 403))
-    check("version 2.2.0", __import__("app").__version__ == "2.2.0")
+    check("version 2.2.1", __import__("app").__version__ == "2.2.1")
     check("no orders placed", not app.state.engine.db.query("SELECT 1 FROM orders_log LIMIT 1"))
 
 

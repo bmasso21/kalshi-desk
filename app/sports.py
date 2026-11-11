@@ -16,7 +16,7 @@ import time
 
 import requests
 
-ODDSPAPI = "https://v5.oddspapi.io/en"
+ODDSPAPI = "https://api.oddspapi.io/v4"     # free-signup keys are for v4 (v5 rejects them)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sp_calls (ts REAL, path TEXT, params TEXT, status INTEGER, bytes INTEGER, note TEXT);
@@ -29,13 +29,13 @@ class BudgetExceeded(Exception):
 
 
 class OddsPapi:
-    def __init__(self, cfg_getter, wdb, session=None, base=ODDSPAPI):
+    def __init__(self, cfg_getter, wdb, session=None, base=None):
         self._cfg = cfg_getter          # callable -> the "sports" config section (read fresh each call)
         self.db = wdb
         self.db.conn.executescript(SCHEMA)
         self.db.conn.commit()
         self.http = session or requests.Session()
-        self.base = base
+        self._base = base
         self.lock = threading.Lock()
 
     # ---- budget ----
@@ -58,6 +58,10 @@ class OddsPapi:
             self.db.put("sp_usage", {"month": u["month"], "count": u["used"] + n})
 
     @property
+    def base(self) -> str:
+        return self._base or self._cfg().get("api_base") or ODDSPAPI
+
+    @property
     def configured(self) -> bool:
         return bool((self._cfg().get("oddspapi_key") or "").strip())
 
@@ -67,16 +71,19 @@ class OddsPapi:
             raise RuntimeError("No OddsPapi key yet - add it in Settings")
         self._spend(1)                          # counted before sending: a failed call may still count upstream
         params = {k: v for k, v in (params or {}).items() if v is not None}
+        mode = self._cfg().get("auth_mode", "query")          # v4 documents the apiKey query parameter
+        q = dict(params, apiKey=key) if mode == "query" else params
+        hdr = {"X-API-Key": key} if mode == "header" else {}
+        red = lambda t: str(t).replace(key, "***")
         try:
-            r = self.http.get(self.base + path, params=params, headers={"X-API-Key": key}, timeout=60)
+            r = self.http.get(self.base + path, params=q, headers=hdr, timeout=60)
         except Exception as e:
-            self.db.execute("INSERT INTO sp_calls VALUES(?,?,?,?,?,?)", (time.time(), path, json.dumps(params), -1, 0, f"{note} {e}"[:300]))
-            raise
+            self.db.execute("INSERT INTO sp_calls VALUES(?,?,?,?,?,?)", (time.time(), path, json.dumps(params), -1, 0, red(f"{note} {e}")[:300]))
+            raise RuntimeError(red(f"OddsPapi {path}: {type(e).__name__}: {e}")) from None
         self.db.execute("INSERT INTO sp_calls VALUES(?,?,?,?,?,?)",
                         (time.time(), path, json.dumps(params), r.status_code, len(r.content), note[:200]))
         if r.status_code >= 400:
-            body = r.text[:300].replace(key, "***")
-            raise RuntimeError(f"OddsPapi {path} HTTP {r.status_code}: {body}")
+            raise RuntimeError(red(f"OddsPapi {path} HTTP {r.status_code}: {r.text[:300]}"))
         return r.json()
 
     def calls(self, limit=100) -> list[dict]:
@@ -93,11 +100,11 @@ class OddsPapi:
 SPORT_HINTS = {"basketball": "NBA", "american-football": "NFL", "ice-hockey": "NHL", "baseball": "MLB"}
 
 
-def discover(op: OddsPapi, kalshi_client=None, max_requests: int = 14) -> dict:
-    """Step 1 (≈12 requests): sports, the NBA/NFL/NHL/MLB tournament ids, Pinnacle + Kalshi bookmaker metadata,
-    moneyline market ids, this week's NFL fixtures and their Kalshi mapping. Raw responses are stored for review.
-    Kalshi side (free, public): which game series exist."""
-    out = {"started": time.time(), "steps": [], "kalshi": {}}
+def discover(op: OddsPapi, kalshi_client=None, max_requests: int = 9) -> dict:
+    """Step 1 (≈7 requests, v4 API): sports, NBA/NFL/NHL/MLB tournament ids, recent NFL fixtures, and ONE full
+    historical-odds pull for a finished NFL game (Pinnacle + Kalshi + Polymarket if offered) to learn the market
+    ids and data shape. Raw responses are stored for review. Kalshi side (free, public): game series + fee types."""
+    out = {"started": time.time(), "steps": [], "kalshi": {}, "api": op.base}
     start_used = op.usage()["used"]
 
     def step(name, path, params=None):
@@ -107,50 +114,51 @@ def discover(op: OddsPapi, kalshi_client=None, max_requests: int = 14) -> dict:
         try:
             body = op.get(path, params, note=f"discover:{name}")
             op.save_raw(f"discover:{name}", body)
-            n = len(body) if isinstance(body, list) else (len(body.get("data", [])) if isinstance(body, dict) and isinstance(body.get("data"), list) else None)
+            n = len(body) if isinstance(body, (list, dict)) else None
             out["steps"].append({"step": name, "ok": True, "items": n})
             return body
         except Exception as e:
             out["steps"].append({"step": name, "ok": False, "error": str(e)[:300]})
+            if "401" in str(e) or "budget" in str(e):
+                raise
             return None
 
-    sports = step("sports", "/sports") or []
-    rows = sports if isinstance(sports, list) else sports.get("data", []) if isinstance(sports, dict) else []
-    ids = {}
-    for s in rows:
-        slug = str(s.get("slug") or "").lower()
-        for k in SPORT_HINTS:
-            if slug == k:
-                ids[k] = s.get("sportId")
-    out["sport_ids"] = ids
-    step("bookmakers", "/bookmakers", {"bookmakers": "pinnacle,kalshi,polymarket"})
-    tourn = {}
-    for slug, sid in ids.items():
-        body = step(f"tournaments:{slug}", "/tournaments", {"sportId": sid}) or []
-        lst = body if isinstance(body, list) else body.get("data", []) if isinstance(body, dict) else []
-        want = SPORT_HINTS[slug]
-        for t in lst:
-            if str(t.get("tournamentName") or "").upper() == want or str(t.get("tournamentSlug") or "").lower() == want.lower():
-                tourn[want] = t.get("tournamentId")
-    out["tournament_ids"] = tourn
-    for slug, sid in ids.items():
-        step(f"markets:{slug}", "/markets", {"sportId": sid})
-    if tourn.get("NFL"):
-        now = int(time.time())
-        fx = step("fixtures:NFL", "/fixtures", {"tournamentId": tourn["NFL"], "startTimeFrom": now - 8 * 86400,
-                                                 "startTimeTo": now + 6 * 86400}) or []
-        lst = fx if isinstance(fx, list) else fx.get("data", []) if isinstance(fx, dict) else []
-        fids = [f.get("fixtureId") for f in lst if f.get("fixtureId")][:40]
-        if fids:
-            step("mapping:NFL:kalshi", "/fixtures/mapping", {"bookmaker": "kalshi", "fixtureIds": ",".join(fids)})
-    # Kalshi side (public, free): game-winner series
+    lst = lambda b: b if isinstance(b, list) else (b.get("data") if isinstance(b, dict) and isinstance(b.get("data"), list) else [])
+    try:
+        ids = {}
+        for s_ in lst(step("sports", "/sports") or []):
+            slug = str(s_.get("slug") or "").lower()
+            if slug in SPORT_HINTS:
+                ids[slug] = s_.get("sportId")
+        out["sport_ids"] = ids
+        tourn = {}
+        for slug, sid in ids.items():
+            want = SPORT_HINTS[slug]
+            for t in lst(step(f"tournaments:{slug}", "/tournaments", {"sportId": sid}) or []):
+                nm, sl = str(t.get("tournamentName") or ""), str(t.get("tournamentSlug") or "")
+                if (nm.upper() == want or sl.lower() == want.lower()) and want not in tourn:
+                    tourn[want] = t.get("tournamentId")
+        out["tournament_ids"] = tourn
+        if tourn.get("NFL"):
+            now = time.time()
+            fmt = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            fx = lst(step("fixtures:NFL", "/fixtures", {"tournamentId": tourn["NFL"], "from": fmt(now - 9 * 86400),
+                                                        "to": fmt(now + 3 * 86400)}) or [])
+            done = [f for f in fx if f.get("statusId") == 2 or str(f.get("statusName", "")).lower() in ("finished", "ended")]
+            out["nfl_fixtures"] = len(fx)
+            out["nfl_finished"] = len(done)
+            if done:
+                f = done[-1]
+                out["sample_fixture"] = {k: f.get(k) for k in ("fixtureId", "participant1Name", "participant2Name", "startTime")}
+                step("historical:NFL", "/historical-odds", {"fixtureId": f["fixtureId"], "bookmakers": "pinnacle,kalshi,polymarket"})
+    except Exception as e:
+        out["stopped"] = str(e)[:300]
     if kalshi_client is not None:
         try:
             ser = kalshi_client.series_list(category="Sports")
-            cand = [s for s in ser if any(x in (s.get("ticker") or "") for x in ("NFLGAME", "NBAGAME", "NHLGAME", "MLBGAME"))]
+            cand = [s_ for s_ in ser if (s_.get("ticker") or "") in ("KXNFLGAME", "KXNBAGAME", "KXNHLGAME", "KXMLBGAME", "KXNCAAFGAME")]
             out["kalshi"] = {"sports_series": len(ser),
-                             "game_series": [{k: s.get(k) for k in ("ticker", "title", "fee_type", "fee_multiplier", "tags")}
-                                             for s in cand][:20]}
+                             "game_series": [{k: s_.get(k) for k in ("ticker", "title", "fee_type", "fee_multiplier")} for s_ in cand]}
         except Exception as e:
             out["kalshi"] = {"error": str(e)[:300]}
     out["finished"] = time.time()
