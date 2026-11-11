@@ -345,6 +345,8 @@ def main():
             break
         time.sleep(0.1)
     check("API backtest completes and stores results", d["status"] == "done" and d["results"]["models"]["through"]["pnl"] == -6.54, d.get("error"))
+    pr = bt.procs.get(rid)
+    check("API backtest ran in a separate process (exit 0)", pr is not None and pr.wait(30) == 0 and pr.pid != __import__("os").getpid())
     lst = c.get("/api/backtests").json()["backtests"]
     check("API list shows summary per fill model", lst[0]["id"] == rid and lst[0]["summary"]["through"]["pnl"] == -6.54)
     check("unknown strategy rejected", c.post("/api/backtests", headers=HD, json={"strategy": "nope"}).status_code == 400)

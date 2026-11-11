@@ -303,7 +303,7 @@ class Backtester:
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, strategy TEXT, params TEXT, filters TEXT,
             status TEXT, error TEXT, duration REAL, results TEXT
         );""")
-        self.running: dict[int, dict] = {}
+        self.procs: dict = {}
 
     def load_markets(self, flt: dict) -> list[dict]:
         sql = ("SELECT m.*, s.fee_type, s.fee_multiplier FROM wh_markets m LEFT JOIN wh_series s "
@@ -335,46 +335,66 @@ class Backtester:
         return bars, trades
 
     def run(self, strategy: str, params: dict | None = None, filters: dict | None = None,
-            models: list[str] | None = None, slippage_cents: float = 0) -> dict:
+            models: list[str] | None = None, slippage_cents: float = 0, progress=None) -> dict:
+        """Streams market by market (only one market's trades in memory at a time)."""
         cls = STRATEGIES[strategy]
         p = {**cls.defaults, **(params or {})}
         flt = filters or {}
         models = models or (["through", "touch"] if cls.uses_maker else ["through"])
         markets = self.load_markets(flt)
-        data = {m["ticker"]: self.market_data(m["ticker"]) for m in markets}
-        out = {"strategy": strategy, "params": p, "filters": flt, "markets_in_scope": len(markets),
-               "slippage_cents": slippage_cents, "models": {}}
-        for model in models:
-            per = []
-            for m in markets:
-                bars, trades = data[m["ticker"]]
-                if not bars:
-                    continue
-                sim = MarketSim(m, bars, trades, cls(), p, m.get("fee_type"), m.get("fee_multiplier"), model,
-                                slippage_cents / 100)
-                per.append(sim.run())
-            out["models"][model] = summarize(per)
-        return out
+        per: dict[str, list] = {m: [] for m in models}
+        for i, mk in enumerate(markets):
+            bars, trades = self.market_data(mk["ticker"])
+            if bars:
+                for model in models:
+                    sim = MarketSim(mk, bars, trades, cls(), p, mk.get("fee_type"), mk.get("fee_multiplier"), model,
+                                    slippage_cents / 100)
+                    r = sim.run()
+                    if not r["fills"]:
+                        r = {k: v for k, v in r.items()}   # keep the light record only
+                    per[model].append(r)
+            if progress and i % 500 == 0:
+                progress(i, len(markets))
+        return {"strategy": strategy, "params": p, "filters": flt, "markets_in_scope": len(markets),
+                "slippage_cents": slippage_cents, "models": {m: summarize(per[m]) for m in models}}
 
-    # ---- stored, asynchronous runs ----------------------------------------------
+    # ---- stored runs, each in its own low-priority process ---------------------
     def start(self, strategy, params=None, filters=None, models=None, slippage_cents=0) -> int:
+        """Queue a run and execute it in a separate, low-priority Python process, so a big backtest can
+        never slow down or crash the trading app. Results land in wh_backtests."""
         if strategy not in STRATEGIES:
             raise ValueError(f"unknown strategy {strategy}")
-        cur = self.db.execute("INSERT INTO wh_backtests(ts,strategy,params,filters,status) VALUES(?,?,?,?, 'running')",
-                              (time.time(), strategy, json.dumps(params or {}), json.dumps(filters or {})))
+        cur = self.db.execute("INSERT INTO wh_backtests(ts,strategy,params,filters,status,results) VALUES(?,?,?,?, 'running', ?)",
+                              (time.time(), strategy, json.dumps(params or {}), json.dumps(filters or {}),
+                               json.dumps({"models_requested": models, "slippage_cents": slippage_cents})))
         rid = cur.lastrowid
-
-        def _go():
-            t0 = time.time()
-            try:
-                r = self.run(strategy, params, filters, models, slippage_cents)
-                self.db.execute("UPDATE wh_backtests SET status='done', duration=?, results=? WHERE id=?",
-                                (round(time.time() - t0, 2), json.dumps(r, default=str), rid))
-            except Exception as e:
-                self.db.execute("UPDATE wh_backtests SET status='error', error=?, duration=? WHERE id=?",
-                                (f"{e}\n{traceback.format_exc()[-1200:]}", round(time.time() - t0, 2), rid))
-        threading.Thread(target=_go, daemon=True, name=f"backtest-{rid}").start()
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+        root = Path(__file__).resolve().parent.parent
+        args = [sys.executable, "-m", "app.backtest", "--db", self.db.path, "--run", str(rid)]
+        kw = {"cwd": str(root), "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if os.name == "nt":
+            kw["creationflags"] = 0x00004000 | 0x08000000      # BELOW_NORMAL priority, no window
+        self.procs[rid] = subprocess.Popen(args, **kw)
         return rid
+
+    def execute_stored(self, rid: int):
+        row = self.db.query("SELECT * FROM wh_backtests WHERE id=?", (rid,))[0]
+        extra = json.loads(row["results"] or "{}")
+        t0 = time.time()
+
+        def prog(i, n):
+            self.db.execute("UPDATE wh_backtests SET error=? WHERE id=? AND status='running'", (f"progress {i}/{n}", rid))
+        try:
+            r = self.run(row["strategy"], json.loads(row["params"] or "{}"), json.loads(row["filters"] or "{}"),
+                         extra.get("models_requested"), float(extra.get("slippage_cents") or 0), progress=prog)
+            self.db.execute("UPDATE wh_backtests SET status='done', error=NULL, duration=?, results=? WHERE id=?",
+                            (round(time.time() - t0, 2), json.dumps(r, default=str), rid))
+        except Exception as e:
+            self.db.execute("UPDATE wh_backtests SET status='error', error=?, duration=? WHERE id=?",
+                            (f"{e}\n{traceback.format_exc()[-1200:]}", round(time.time() - t0, 2), rid))
 
 
 def summarize(per: list[dict]) -> dict:
@@ -427,3 +447,14 @@ def summarize(per: list[dict]) -> dict:
                         "fees": round(r["fees"], 2), "pnl": round(r["pnl"], 2), "closing_line": r["closing_line"]}
                        for r in traded[:500]],
     }
+
+
+if __name__ == "__main__":
+    import argparse
+
+    from .warehouse import WarehouseDB
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db", required=True)
+    ap.add_argument("--run", type=int, required=True)
+    a = ap.parse_args()
+    Backtester(WarehouseDB(a.db)).execute_stored(a.run)
