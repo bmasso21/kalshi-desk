@@ -151,21 +151,26 @@ class WxStore:
     def series_map(self) -> dict[str, dict]:
         """series_ticker -> {kind, cli, icao, asos, offset, city} for every temperature series we can price."""
         out = {}
-        rows = self.db.query("SELECT series_ticker, raw FROM wh_markets WHERE series_ticker LIKE 'KX%' "
-                             "AND raw LIKE '%temperature recorded at%' GROUP BY series_ticker")
-        for r in rows:
-            try:
-                raw = json.loads(r["raw"] or "{}")
-            except ValueError:
-                continue
-            p = parse_rules(raw.get("rules_primary"))
-            if not p:
-                continue
-            kind, cli = p
-            st = STATIONS.get(cli)
-            out[r["series_ticker"]] = {"kind": kind, "cli": cli, "icao": st[0] if st else None,
-                                       "asos": st[1] if st else None, "offset": st[2] if st else None,
-                                       "city": (raw.get("custom_strike") or {}).get("City"), "mapped": bool(st)}
+        series = [r["series_ticker"] for r in self.db.query(
+            "SELECT DISTINCT series_ticker FROM wh_markets WHERE series_ticker LIKE 'KX%' "
+            "AND raw LIKE '%temperature recorded at%'")]
+        for st in series:
+            # rule wording changed over time: use the newest market whose rules name a climate-report station
+            for r in self.db.query("SELECT raw FROM wh_markets WHERE series_ticker=? AND raw LIKE '%temperature recorded at%' "
+                                   "ORDER BY close_ts DESC LIMIT 40", (st,)):
+                try:
+                    raw = json.loads(r["raw"] or "{}")
+                except ValueError:
+                    continue
+                p = parse_rules(raw.get("rules_primary"))
+                if not p:
+                    continue
+                kind, cli = p
+                stn = STATIONS.get(cli)
+                out[st] = {"kind": kind, "cli": cli, "icao": stn[0] if stn else None,
+                           "asos": stn[1] if stn else None, "offset": stn[2] if stn else None,
+                           "city": (raw.get("custom_strike") or {}).get("City"), "mapped": bool(stn)}
+                break
         return out
 
     def stations(self) -> list[str]:
@@ -311,7 +316,10 @@ class WxCollector:
             self.state["phase"] = "forecasts"
             have = {r["runtime"]: r["n"] for r in self.store.db.query(
                 "SELECT runtime, count(DISTINCT station) n FROM wx_nbs WHERE runtime >= ? GROUP BY runtime", (start,))}
-            tried = set(self.store.db.get("wx_nbs_tried") or [])
+            tr = self.store.db.get("wx_nbs_tried") or {}
+            if not isinstance(tr, dict) or tr.get("stations") != icaos:
+                tr = {"stations": icaos, "runs": []}          # station list changed -> retry every run
+            tried = set(tr["runs"])
             todo = [rt for rt in self.runtimes(start, now - 3600)
                     if have.get(rt, 0) < len(icaos) and (rt not in tried or rt > now - 12 * 3600)]
             for i, rt in enumerate(todo):
@@ -327,8 +335,8 @@ class WxCollector:
                         self.state["error"] = f"nbs {rt}: {e}"
                 tried.add(rt)
                 if rt < now - 12 * 3600 and i % 20 == 0:
-                    self.store.db.put("wx_nbs_tried", sorted(tried)[-2000:])
-            self.store.db.put("wx_nbs_tried", sorted(tried)[-2000:])
+                    self.store.db.put("wx_nbs_tried", {"stations": icaos, "runs": sorted(tried)[-2000:]})
+            self.store.db.put("wx_nbs_tried", {"stations": icaos, "runs": sorted(tried)[-2000:]})
             # latest run (live): record when each run first appeared, to verify the backtest's publish lag
             for k in range(0, len(icaos), 6):
                 try:

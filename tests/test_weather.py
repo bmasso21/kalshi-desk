@@ -182,6 +182,11 @@ def main():
     check("series map from market rules", sm.get("KXHIGHCHI", {}).get("cli") == "MDW" and sm["KXLOWTCHI"]["kind"] == "low"
           and sm["KXHIGHCHI"]["offset"] == -6 and sm["KXHIGHCHI"]["mapped"], sm)
 
+    db.execute("INSERT INTO wh_markets(ticker,event_ticker,series_ticker,close_ts,raw) VALUES(?,?,?,?,?)",
+               ("KXHIGHCHI-OLD", "KXHIGHCHI-26JAN01", "KXHIGHCHI", 1.0,
+                json.dumps({"rules_primary": "If the highest temperature recorded at Chicago Midway, IL is above 40"})))
+    check("old rule wording on some markets doesn't hide the series", store.series_map().get("KXHIGHCHI", {}).get("cli") == "MDW")
+    db.execute("DELETE FROM wh_markets WHERE ticker='KXHIGHCHI-OLD'")
     model = W.WxModel(store)
     d = D0 + dt.timedelta(days=70)
     ds, de = W.day_window(d, OFF)
@@ -360,6 +365,13 @@ def main():
     check("collector: unmapped station reported, not fetched", col.state["unmapped"] == ["XYZ"] and
           not any("XYZ" in json.dumps(c[1]) for c in sess.calls))
     check("collector: run first-seen time recorded (publish-lag check)", db2.query("SELECT count(*) n FROM wx_runs")[0]["n"] == 1)
+    raw3 = json.dumps({"rules_primary": "If the minimum temperature recorded at Miami (CLIMIA) for x"})
+    db2.execute("INSERT INTO wh_markets(ticker,event_ticker,series_ticker,close_ts,raw) VALUES(?,?,?,?,?)",
+                ("KXLOWTMIA-26NOV10-B1", "KXLOWTMIA-26NOV10", "KXLOWTMIA", now - 86400, raw3))
+    k0 = len(sess.calls)
+    col.sync(now=now)
+    mia = [c for c in sess.calls[k0:] if c[0].endswith("mos.txt") and ("station", "KMIA") in c[1]]
+    check("collector: a newly mapped station gets the old runs backfilled", len(mia) >= 20, len(mia))
     n1 = len(sess.calls)
     col.sync(now=now)
     n_mos = sum(1 for c in sess.calls[n1:] if c[0].endswith("mos.txt"))
@@ -386,7 +398,7 @@ def main():
     b = c.get("/api/weather/board?days=2").json()
     check("API board responds (no open events in synthetic past world)", b["events"] == [] and "note" in b)
     check("API eval needs the CSRF token", c.post("/api/weather/eval").status_code in (401, 403))
-    check("version 2.1.0", c.get("/api/session").status_code == 200 and __import__("app").__version__ == "2.1.0")
+    check("version 2.1.1", c.get("/api/session").status_code == 200 and __import__("app").__version__ == "2.1.1")
     check("weather collection never places orders", not app.state.engine.db.query("SELECT 1 FROM orders_log LIMIT 1"))
     del tok
 
