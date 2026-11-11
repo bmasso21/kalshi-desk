@@ -386,7 +386,7 @@ class Backtester:
             sql += " AND COALESCE(m.volume,0) >= ?"
             args.append(float(flt["min_volume"]))
         sql += " ORDER BY m.close_ts LIMIT ?"
-        args.append(int(flt.get("max_markets", 20000)))
+        args.append(int(flt.get("max_markets", 200000)))
         return self.db.query(sql, args)
 
     def market_data(self, ticker, period=60):

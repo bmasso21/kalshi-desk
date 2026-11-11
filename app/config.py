@@ -112,6 +112,11 @@ DEFAULTS = {
         "request_gap_sec": 1.0,         # IEM rate-limits; it also backs off on HTTP 429
         "backoff_sec": [20, 60, 180],
     },
+    # --- sports odds research (2.2): OddsPapi free tier (250 requests/month) ------
+    "sports": {
+        "oddspapi_key": "",             # entered in Settings, never shown again
+        "monthly_cap": 240,             # hard stop below the free plan's 250 requests/month
+    },
     # --- scanner ----------------------------------------------------------
     "scanner": {
         "interval_sec": 120,
@@ -207,6 +212,9 @@ class Config:
         a = d.get("alerts", {})
         for k in ("pushover_user", "pushover_token"):
             a[k] = (a[k][:4] + "…") if a.get(k) else ""
+        sp = d.get("sports", {})
+        if sp.get("oddspapi_key"):
+            sp["oddspapi_key"] = sp["oddspapi_key"][:4] + "…"
         if a.get("healthcheck_url"):
             a["healthcheck_url"] = a["healthcheck_url"][:30] + "…"
         return d

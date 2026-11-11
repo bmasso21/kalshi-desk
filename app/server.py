@@ -34,6 +34,10 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     from .weather import WxCollector, WxModel, WxStore
     from .weather import board as wx_board
     wx_store = WxStore(wdb)
+    from .sports import BudgetExceeded, OddsPapi
+    from .sports import discover as sp_discover
+    oddspapi = OddsPapi(lambda: cfg.data.get("sports") or {}, wdb)
+    app_sp_state = {"running": False}
     eng.weather = WxCollector(eng, wx_store)
     wx_model: dict = {"m": None, "ts": 0.0}
 
@@ -277,6 +281,26 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 errors.append("Summary time must be HH:MM (24h)")
             for k in ("api_url_override",):
                 al.pop(k, None)              # test-only setting, never from the browser
+        if isinstance(patch.get("sports"), dict):
+            sp = {k: v for k, v in patch["sports"].items() if k in ("oddspapi_key", "monthly_cap")}
+            if "oddspapi_key" in sp:
+                v = str(sp["oddspapi_key"] or "").strip()
+                if not v or v.endswith("…"):
+                    sp.pop("oddspapi_key")
+                elif not re.fullmatch(r"[A-Za-z0-9_\-]{16,128}", v):
+                    sp.pop("oddspapi_key")
+                    errors.append("OddsPapi key should be 16-128 letters/digits (copy it from your OddsPapi dashboard)")
+                else:
+                    sp["oddspapi_key"] = v
+            if "monthly_cap" in sp:
+                try:
+                    sp["monthly_cap"] = max(0, min(250, int(sp["monthly_cap"])))
+                except (TypeError, ValueError):
+                    sp.pop("monthly_cap")
+                    errors.append("monthly cap must be a whole number 0-250")
+            patch["sports"] = sp
+            if not sp:
+                patch.pop("sports")
         if "auto" in patch and "strategies" in patch["auto"]:
             patch["auto"]["strategies"] = [s for s in patch["auto"]["strategies"] if s not in NEVER_AUTO]
         old_env = cfg.env
@@ -286,6 +310,8 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         if any(k in patch for k in ("env", "base_url_override")) or any(k.endswith(("_key_id", "_key_path")) for k in patch):
             eng.connect()
         safe = {k: v for k, v in patch.items() if "key" not in k}
+        if isinstance(safe.get("sports"), dict):
+            safe["sports"] = {k: v for k, v in safe["sports"].items() if k != "oddspapi_key"}
         if isinstance(safe.get("alerts"), dict):
             safe["alerts"] = {k: v for k, v in safe["alerts"].items() if k not in ("pushover_user", "pushover_token", "healthcheck_url")}
         db.audit("config", json.dumps(safe)[:1000])
@@ -379,6 +405,41 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             kw["creationflags"] = 0x00004000 | 0x08000000
         app.state.wx_eval_proc = subprocess.Popen([sys.executable, "-m", "app.weather", "--db", wdb.path, "--eval", "--store"], **kw)
         return {"ok": True}
+
+    # -------------------------------------------------------------- sports --
+    @app.get("/api/sports")
+    def sports_status():
+        return {"configured": oddspapi.configured, "usage": oddspapi.usage(), "running": app_sp_state["running"],
+                "calls": oddspapi.calls(60), "discover": wdb.get("sp_discover")}
+
+    @app.post("/api/sports/discover")
+    def sports_discover():
+        if not oddspapi.configured:
+            raise HTTPException(400, "Add your OddsPapi key in Settings first")
+        if app_sp_state["running"]:
+            raise HTTPException(409, "already running")
+        if oddspapi.usage()["left"] < 14:
+            raise HTTPException(400, "not enough OddsPapi requests left this month")
+
+        def run():
+            app_sp_state["running"] = True
+            try:
+                sp_discover(oddspapi, eng.warehouse.client)
+            except Exception as e:
+                db.audit("sports_error", str(e)[:500])
+            finally:
+                app_sp_state["running"] = False
+        import threading
+        threading.Thread(target=run, daemon=True, name="sports-discover").start()
+        return {"ok": True}
+
+    @app.get("/api/sports/raw/{k}")
+    def sports_raw(k: str, chars: int = 20000):
+        r = oddspapi.raw(k)
+        if not r:
+            raise HTTPException(404, "not found")
+        txt = json.dumps(r["body"])
+        return {"ts": r["ts"], "chars": len(txt), "body_text": txt[:max(100, min(chars, 200000))]}
 
     @app.get("/api/backtests")
     def backtests():

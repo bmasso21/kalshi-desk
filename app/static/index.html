@@ -267,7 +267,19 @@ async function loadSettings(){const j=await api('/api/config');CFG=j.config;cons
     ${strat.map(x=>`<label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" class="ss" value="${x}" ${s.strategies.includes(x)?'checked':''}>${x}</label>`).join('')}</div></div>
    <button class="b pri" onclick="saveSettings()">Save settings</button>
    <div class="card" style="margin-top:12px"><h3 style="margin-top:0">Remote access (Tailscale)</h3><div id="authBox" class="mut">Loading…</div></div>
-   <div class="card" style="margin-top:12px"><h3 style="margin-top:0">Phone alerts (Pushover)</h3><div id="alertsBox" class="mut">Loading…</div></div>`;$('#sEnv').value=c.env;loadAlerts();loadAuth()}
+   <div class="card" style="margin-top:12px"><h3 style="margin-top:0">Phone alerts (Pushover)</h3><div id="alertsBox" class="mut">Loading…</div></div>
+   <div class="card" style="margin-top:12px"><h3 style="margin-top:0">Sports odds research (OddsPapi, free plan)</h3><div id="sportsBox" class="mut">Loading…</div></div>`;$('#sEnv').value=c.env;loadAlerts();loadAuth();loadSportsCfg()}
+async function loadSportsCfg(){const sp=CFG.sports||{};let j={configured:false,usage:{used:0,cap:240,left:240,month:''},calls:[]};try{j=await api('/api/sports')}catch(e){}const u=j.usage,d=j.discover;
+  $('#sportsBox').innerHTML=`<p style="margin-top:0" class="${j.configured?'y':'w'}">${j.configured?'Key saved ('+esc(sp.oddspapi_key)+').':'No key yet: paste your OddsPapi API key below.'} <span class="mut">Requests this month (${esc(u.month)}): <b>${u.used}</b> of ${u.cap} allowed (free plan: 250). Every request is counted before it is sent; the app stops at the cap.</span></p>
+   <div class="row"><label class="f">OddsPapi API key<input id="spK" type="password" autocomplete="off" placeholder="paste key" style="width:320px"></label>
+   <label class="f">Monthly cap<input id="spC" type="number" min="0" max="250" value="${sp.monthly_cap??240}" style="width:80px"></label>
+   <button class="b pri" onclick="saveSports()">Save</button>
+   <button class="b" ${j.configured&&!j.running?'':'disabled'} onclick="if(confirm('Run discovery? Uses about 12 of this month\'s OddsPapi requests.'))api('/api/sports/discover',{method:'POST'}).then(()=>{toast('Discovery started');setTimeout(loadSportsCfg,8000)}).catch(e=>toast(e.message,'err'))">${j.running?'Discovery running…':'Run discovery (~12 requests)'}</button></div>
+   ${d?`<p style="font-size:12px">Last discovery ${ts(d.finished||d.started)}: ${(d.steps||[]).map(x=>esc(x.step)+(x.ok?' ✓':x.skipped?' skipped':' ✗ '+esc(x.error||''))).join(' · ')}</p>`:''}
+   <table><thead><tr><th>Time</th><th>Request</th><th>HTTP</th><th class="r">Bytes</th></tr></thead><tbody>${(j.calls||[]).slice(0,15).map(c=>`<tr><td>${ts(c.ts)}</td><td style="font-size:12px">${esc(c.path)} ${esc(c.params)}</td><td class="${c.status===200?'y':'n'}">${c.status}</td><td class="r">${c.bytes}</td></tr>`).join('')||'<tr><td colspan=4 class="mut">No requests yet</td></tr>'}</tbody></table>`;
+  if(j.running)setTimeout(loadSportsCfg,5000)}
+async function saveSports(){const b={monthly_cap:+$('#spC').value};const k=$('#spK').value.trim();if(k)b.oddspapi_key=k;
+  try{const r=await api('/api/config',{method:'POST',body:{sports:b}});CFG=r.config;toast('Saved','ok')}catch(e){toast(e.message,'err');try{CFG=(await api('/api/config')).config}catch(_){}}loadSportsCfg()}
 async function loadAuth(){const s=await api('/api/auth/status');let ss={sessions:[]};try{ss=await api('/api/auth/sessions')}catch(e){}
   $('#authBox').innerHTML=`<p style="margin-top:0">${s.remote_url?'Remote address: <a href="'+esc(s.remote_url)+'">'+esc(s.remote_url)+'</a> (only devices signed in to your Tailscale account can reach it).':'Remote address not set up yet.'}<br>
    ${s.password_set?'<span class="y">Password is set.</span>':'<span class="w">No password yet – remote access stays OFF until you set one (only possible on this computer).</span>'} You are ${s.local?'on the server computer':'remote ('+esc(s.tailscale_login||'tailnet device')+')'}.</p>
