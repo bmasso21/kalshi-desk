@@ -31,12 +31,19 @@ class Resp:
     def json(self):
         return self._js
 
+    def iter_content(self, n):
+        for i in range(0, len(self.content), n):
+            yield self.content[i:i + n]
+
+    def close(self):
+        pass
+
 
 class Sess:
     def __init__(self):
         self.calls = []
 
-    def get(self, url, params=None, headers=None, timeout=None):
+    def get(self, url, params=None, headers=None, timeout=None, stream=False):
         self.calls.append((url, dict(params or {}), dict(headers or {})))
         p = url.split("/v4", 1)[1]
         if params.get("apiKey") != KEY:
@@ -86,7 +93,7 @@ def study_tests(tmp):
         def __init__(self):
             self.calls, self.r429 = [], 0
 
-        def get(self, url, params=None, headers=None, timeout=None):
+        def get(self, url, params=None, headers=None, timeout=None, stream=False):
             self.calls.append((url, dict(params or {})))
             p = url.split("/v4", 1)[1]
             if p == "/sports":
@@ -186,6 +193,34 @@ def study_tests(tmp):
         pass
     check("pacing: waits out the 5 s historical cooldown before sending", sl2 and 4.8 <= sl2[0] <= 5.4, sl2)
 
+    # oversized response -> per-outcome fallback
+    class Big(OS):
+        def get(self, url, params=None, headers=None, timeout=None, stream=False):
+            if url.endswith("/historical-odds") and "outcomeId" not in params:
+                self.calls.append((url, dict(params or {})))
+                return Resp(200, {"x": "y" * 3000})
+            return super().get(url, params, headers, timeout)
+    db.execute("UPDATE sp_fixtures SET hist_pulled=NULL WHERE fixture_id='idA'")
+    db.execute("DELETE FROM sp_odds")
+    bg = Big()
+    bg.r429 = 1
+    opb = S.OddsPapi(lambda: conf, db, session=bg)
+    opb.sleep = lambda s: None
+    stb = S.Study(opb, db, KC(), WH())
+    import app.sports as SM
+    real = SM.OddsPapi.get
+
+    def small_cap(self, path, params=None, note="", max_bytes=None):
+        return real(self, path, params, note, 1000 if max_bytes and "outcomeId" not in (params or {}) else max_bytes)
+    SM.OddsPapi.get = small_cap
+    try:
+        n = stb.pull_history(db.query("SELECT * FROM sp_fixtures WHERE fixture_id='idA'")[0])
+    finally:
+        SM.OddsPapi.get = real
+    oc = [c[1].get("outcomeId") for c in bg.calls if c[0].endswith("/historical-odds") and "outcomeId" in c[1]]
+    check("too-big response aborted early, then one request per moneyline outcome", sorted(oc) == ["1411", "1412"] and n == 60, (oc, n))
+    check("schema created once per process (no CREATE on every screen refresh)", len([k for k in SM._SCHEMA_DONE if k[0] == id(db)]) == 2)
+
     # model: no-vig + lag
     m = S.SportsModel(db, lag_sec=60)
     t = T0 - 1800 * 5 + 30            # 30 s after a snapshot -> with 60 s lag the previous snapshot is used
@@ -239,7 +274,7 @@ def main():
     check("HTTP errors raised with the key redacted", "404" in err and KEY not in err and "***" in err, err)
 
     class Boom:
-        def get(self, url, params=None, headers=None, timeout=None):
+        def get(self, url, params=None, headers=None, timeout=None, stream=False):
             raise ConnectionError(f"failed to reach {url}?apiKey={params.get('apiKey')}")
     db.put("sp_usage", {"month": op.month(), "count": 0})
     opb = S.OddsPapi(lambda: conf, db, session=Boom())
@@ -307,7 +342,7 @@ def main():
     check("key never written to the audit trail", KEY not in aud and "monthly_cap" in aud)
     check("sports status: configured", c.get("/api/sports").json()["configured"] is True)
     check("discover needs the CSRF token", c.post("/api/sports/discover").status_code in (401, 403))
-    check("version 2.2.4", __import__("app").__version__ == "2.2.4")
+    check("version 2.2.5", __import__("app").__version__ == "2.2.5")
     check("no orders placed", not app.state.engine.db.query("SELECT 1 FROM orders_log LIMIT 1"))
 
 

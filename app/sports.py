@@ -33,12 +33,28 @@ class BudgetExceeded(Exception):
     pass
 
 
+class TooBig(Exception):
+    pass
+
+
+_SCHEMA_DONE: set = set()
+
+
+def ensure_schema(wdb, script: str):
+    """Create tables once per process, under the warehouse lock (other threads share this connection)."""
+    key = (id(wdb), hash(script))
+    if key in _SCHEMA_DONE:
+        return
+    with wdb.lock:
+        wdb.conn.executescript(script)
+    _SCHEMA_DONE.add(key)
+
+
 class OddsPapi:
     def __init__(self, cfg_getter, wdb, session=None, base=None):
         self._cfg = cfg_getter          # callable -> the "sports" config section (read fresh each call)
         self.db = wdb
-        self.db.conn.executescript(SCHEMA)
-        self.db.conn.commit()
+        ensure_schema(wdb, SCHEMA)
         self.http = session or requests.Session()
         self._base = base
         self.lock = threading.Lock()
@@ -72,7 +88,7 @@ class OddsPapi:
     def configured(self) -> bool:
         return bool((self._cfg().get("oddspapi_key") or "").strip())
 
-    def get(self, path: str, params: dict | None = None, note: str = "") -> object:
+    def get(self, path: str, params: dict | None = None, note: str = "", max_bytes: int | None = None) -> object:
         key = (self._cfg().get("oddspapi_key") or "").strip()
         if not key:
             raise RuntimeError("No OddsPapi key yet - add it in Settings")
@@ -85,7 +101,18 @@ class OddsPapi:
             self._pace(path)
             self._spend(1)                      # counted before sending: a failed call may still count upstream
             try:
-                r = self.http.get(self.base + path, params=q, headers=hdr, timeout=90)
+                r = self.http.get(self.base + path, params=q, headers=hdr, timeout=180, stream=True)
+                if max_bytes is not None and r.status_code == 200:
+                    buf = bytearray()
+                    for chunk in r.iter_content(1 << 20):
+                        buf += chunk
+                        if len(buf) > max_bytes:
+                            r.close()
+                            self.db.execute("INSERT INTO sp_calls VALUES(?,?,?,?,?,?)", (time.time(), path, json.dumps(params), 200, len(buf), f"{note} aborted: over {max_bytes} bytes"))
+                            raise TooBig(f"{path} response over {max_bytes // 1_000_000} MB")
+                    r._content = bytes(buf)
+            except TooBig:
+                raise
             except Exception as e:
                 self.db.execute("INSERT INTO sp_calls VALUES(?,?,?,?,?,?)", (time.time(), path, json.dumps(params), -1, 0, red(f"{note} {e}")[:300]))
                 raise RuntimeError(red(f"OddsPapi {path}: {type(e).__name__}: {e}")) from None
@@ -305,8 +332,7 @@ class Study:
 
     def __init__(self, op: OddsPapi, wdb, kalshi_client, warehouse=None):
         self.op, self.db, self.k, self.wh = op, wdb, kalshi_client, warehouse
-        self.db.conn.executescript(STUDY_SCHEMA)
-        self.db.conn.commit()
+        ensure_schema(wdb, STUDY_SCHEMA)
         self.state = self.db.get("sp_study") or {}
 
     def log(self, msg):
@@ -468,10 +494,19 @@ class Study:
     def pull_history(self, fixture: dict) -> int:
         """Pinnacle only (Kalshi comes free from Kalshi itself; asking OddsPapi for 'kalshi' returns every prop market
         and can be hundreds of MB). Only the moneyline market is stored."""
-        body = self.op.get("/historical-odds", {"fixtureId": fixture["fixture_id"], "bookmakers": "pinnacle"},
-                           note=f"hist:{fixture['league']}")
         mid = (self.meta(fixture["league"]) or {}).get("market_id")
-        rows = [r for r in walk_historical(body, fixture["fixture_id"]) if r[1] == "pinnacle" and (not mid or r[2] == str(mid))]
+        try:
+            body = self.op.get("/historical-odds", {"fixtureId": fixture["fixture_id"], "bookmakers": "pinnacle"},
+                               note=f"hist:{fixture['league']}", max_bytes=150_000_000)
+            rows = [r for r in walk_historical(body, fixture["fixture_id"]) if r[1] == "pinnacle" and (not mid or r[2] == str(mid))]
+        except TooBig:
+            # fall back to one small request per moneyline outcome
+            body, rows = {"fallback": "per-outcome"}, []
+            for o in (self.meta(fixture["league"]) or {}).get("outcomes") or []:
+                b = self.op.get("/historical-odds", {"fixtureId": fixture["fixture_id"], "bookmakers": "pinnacle", "outcomeId": o["id"]},
+                                note=f"hist-outcome:{fixture['league']}", max_bytes=150_000_000)
+                rows += [r for r in walk_historical(b, fixture["fixture_id"]) if r[1] == "pinnacle" and (not mid or r[2] == str(mid))]
+        rows = list(dict.fromkeys(rows))          # de-duplicate (fallback calls can overlap)
         if not self.db.get("sp_raw_hist_sample"):
             txt = json.dumps(body)
             self.op.save_raw("hist_sample", {"bytes": len(txt), "head": txt[:20000], "moneyline_rows": len(rows)})
@@ -549,7 +584,7 @@ class SportsModel:
 
     def __init__(self, wdb, lag_sec: float = 60.0):
         self.db = wdb
-        self.db.conn.executescript(STUDY_SCHEMA)
+        ensure_schema(wdb, STUDY_SCHEMA)
         self.lag = lag_sec
         self.meta = wdb.get("sp_meta") or {}
         self.by_market: dict[str, tuple] = {}
