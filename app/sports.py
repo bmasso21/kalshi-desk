@@ -454,23 +454,25 @@ class Study:
             ok += 1
         return {"matched": ok, "unmatched": bad, "kalshi_events_seen": len(events)}
 
-    def sync_kalshi(self, fixture: dict, window_before_h=48, window_after_h=5):
-        """1-minute candles + every trade from 48 h before the start to 5 h after, for both team markets."""
+    def sync_kalshi(self, fixture: dict, candle_hours=25, trade_hours=7):
+        """PREGAME ONLY (in-game volume is enormous - ~1M+ trades per NFL game): 1-minute candles for the last
+        `candle_hours` before the start and every trade for the last `trade_hours` (what the maker backtest needs)."""
         start = fixture["start_ts"]
-        a, b = int(start - window_before_h * 3600), int(min(time.time(), start + window_after_h * 3600))
+        a, b = int(start - candle_hours * 3600), int(start)
+        ta = int(start - trade_hours * 3600)
         cut = self.wh.cutoff() if self.wh else {}
         series = LEAGUES[fixture["league"]][2]
         for t in (fixture["p1_market"], fixture["p2_market"]):
             row = self.db.query("SELECT tier, settled_ts FROM wh_markets WHERE ticker=?", (t,))
             hist_tr = cut.get("trades_created_ts")
             routes = []
-            if hist_tr and a < hist_tr:
-                routes.append(("/historical/trades", a, int(min(b, hist_tr))))
+            if hist_tr and ta < hist_tr:
+                routes.append(("/historical/trades", ta, int(min(b, hist_tr))))
             if not hist_tr or b > hist_tr:
-                routes.append(("/markets/trades", int(max(a, hist_tr or 0)), b))
+                routes.append(("/markets/trades", int(max(ta, hist_tr or 0)), b))
             for path, x, y in routes:
                 batch = []
-                for tr in self.k.paginate(path, "trades", {"ticker": t, "min_ts": x, "max_ts": y, "limit": 1000}, max_items=300000):
+                for tr in self.k.paginate(path, "trades", {"ticker": t, "min_ts": x, "max_ts": y, "limit": 1000}, max_items=200000):
                     batch.append(tr)
                     if len(batch) >= 2000:
                         self.db.add_trades(batch)
@@ -478,8 +480,8 @@ class Study:
                 if batch:
                     self.db.add_trades(batch)
             hist = cut.get("market_settled_ts") and row and row[0]["settled_ts"] and row[0]["settled_ts"] < cut["market_settled_ts"]
-            for x in range(a, b, 4 * 86400):             # candle requests in <= 4-day chunks
-                y = min(b, x + 4 * 86400)
+            for x in range(a, b, 2 * 86400):             # candle requests in <= 2-day chunks
+                y = min(b, x + 2 * 86400)
                 path = f"/historical/markets/{t}/candlesticks" if hist else f"/series/{series}/markets/{t}/candlesticks"
                 try:
                     r = self.k.request("GET", path, {"start_ts": x, "end_ts": y, "period_interval": 1})
@@ -520,10 +522,27 @@ class Study:
     def stop(self):
         self.db.put("sp_stop", time.time())
 
+    def cleanup(self) -> int:
+        """Drop trades/candles for study markets outside the pregame window (frees disk from earlier versions)."""
+        n = 0
+        for f in self.db.query("SELECT start_ts, p1_market, p2_market FROM sp_fixtures WHERE p1_market IS NOT NULL"):
+            for t in (f["p1_market"], f["p2_market"]):
+                n += self.db.execute("DELETE FROM wh_trades WHERE ticker=? AND (ts > ? OR ts < ?)",
+                                     (t, f["start_ts"], f["start_ts"] - 8 * 3600)).rowcount or 0
+                self.db.execute("DELETE FROM wh_candles WHERE ticker=? AND period=1 AND end_ts > ?", (t, f["start_ts"] + 60))
+        return n
+
     def run(self, leagues=("NFL", "NBA"), days_back=21, max_games=20, refresh_fixtures=False) -> dict:
         self.state = {"running": True, "started": time.time(), "log": [], "leagues": list(leagues), "max_games": max_games}
         self.db.put("sp_study", self.state)
         try:
+            gone = self.cleanup()
+            if gone:
+                self.log(f"cleanup: removed {gone} in-game/out-of-window trades")
+            # games whose Odds were pulled but Kalshi sync didn't finish (e.g. interrupted) - finish them first, free
+            for f in self.db.query("SELECT * FROM sp_fixtures WHERE hist_pulled IS NOT NULL AND kalshi_synced IS NULL"):
+                self.sync_kalshi(f)
+                self.log(f"resumed Kalshi sync {f['league']} {f['p1']} vs {f['p2']}")
             for lg in leagues:
                 have = self.db.query("SELECT count(*) n FROM sp_fixtures WHERE league=?", (lg,))[0]["n"]
                 if refresh_fixtures or not have:

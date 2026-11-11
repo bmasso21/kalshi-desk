@@ -180,7 +180,13 @@ def study_tests(tmp):
     nt = db.query("SELECT count(*) n FROM wh_trades")[0]["n"]
     check("study: Kalshi 1-min candles + trades synced", nc > 400 and nt == 300, (nc, nt))
     check("study: series fee type stored", db.query("SELECT fee_type FROM wh_series WHERE series_ticker='KXNFLGAME'")[0]["fee_type"] == "quadratic_with_maker_fees")
+    db.executemany("INSERT INTO wh_trades VALUES(?,?,?,?,?,?,?,?)", [(f"ingame{i}", f"{ev}-LAC", T0 + 600 * (i + 1), 0.5, 10, "yes", "ask", 0) for i in range(5)])
+    db.execute("UPDATE sp_fixtures SET kalshi_synced=NULL WHERE fixture_id='idA'")
     res2 = st.run(("NFL",), 21, 10)
+    check("study: in-game trades cleaned up, unfinished Kalshi sync resumed (no OddsPapi request)",
+          db.query("SELECT count(*) n FROM wh_trades WHERE ts > ?", (T0,))[0]["n"] == 0
+          and db.query("SELECT kalshi_synced FROM sp_fixtures WHERE fixture_id='idA'")[0]["kalshi_synced"] is not None
+          and any("cleanup: removed 5" in x for x in res2["log"]), res2["log"])
     check("study: re-run doesn't re-pull the same game", len([c for c in os_.calls if c[0].endswith("/historical-odds")]) == 2)
     # pacing
     op2 = S.OddsPapi(lambda: conf, db, session=os_)
@@ -342,7 +348,7 @@ def main():
     check("key never written to the audit trail", KEY not in aud and "monthly_cap" in aud)
     check("sports status: configured", c.get("/api/sports").json()["configured"] is True)
     check("discover needs the CSRF token", c.post("/api/sports/discover").status_code in (401, 403))
-    check("version 2.2.5", __import__("app").__version__ == "2.2.5")
+    check("version 2.2.6", __import__("app").__version__ == "2.2.6")
     check("no orders placed", not app.state.engine.db.query("SELECT 1 FROM orders_log LIMIT 1"))
 
 
