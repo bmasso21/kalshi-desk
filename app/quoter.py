@@ -21,7 +21,7 @@ import time
 import traceback
 from decimal import Decimal
 
-from . import risk
+from . import mm, risk
 from .kalshi_client import KalshiError, d
 
 ONE = Decimal(1)
@@ -169,13 +169,18 @@ class Quoter:
         elig.sort(key=lambda t: -pools[t]["daily"])
         elig = elig[:200]  # pools are mostly flat (~$100/d), so check plenty of books
         books = client.orderbooks(elig) if elig else {}
-        size = d(self.cfg["size"])
+        size = float(self.cfg["size"])
         out, skipped_small = [], 0
         for t in elig:
             v, ob = pools[t], books.get(t, {})
-            dy = self._side_depth(ob.get("yes_dollars"), v["target"], v["df"])
-            dn = self._side_depth(ob.get("no_dollars"), v["target"], v["df"])
-            share = (size / (dy + size) + size / (dn + size)) / 2   # max score per snapshot is 2 (yes+no)
+            # Kalshi's scoring (see app/mm.py): your share of each side at the best bid, 0 if the book is
+            # too thin for the snapshot to count (it must hold Target Size on both sides).
+            yes_lv, no_lv = mm.book_levels(ob.get("yes_dollars")), mm.book_levels(ob.get("no_dollars"))
+            if not yes_lv or not no_lv:
+                continue
+            sc = mm.snapshot_score(yes_lv, no_lv, float(v["target"] or 100), float(v["df"]),
+                                   (yes_lv[0][0], size), (no_lv[0][0], size))
+            share = Decimal(str(round(sc["score"] / 2, 6)))
             est_daily = v["daily"] * share
             est_period = est_daily * min(v["left_days"], Decimal(31))
             if est_period < 1:   # Kalshi pays nothing under $1.00 per market program

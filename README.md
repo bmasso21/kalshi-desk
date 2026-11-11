@@ -112,6 +112,23 @@ market's rules (e.g. CLIMDW = Chicago Midway), calendar day in local STANDARD ti
 Nothing here places orders. Kalshi's weather-index endpoints (`/live_data/weather/{city}`) are the multi-station
 blend behind the *hourly* markets, not what the daily markets settle on, so v2.1 doesn't price from them.
 
+### Market-making study (v2.3) - paper only
+**Rewards** tab, top card. Nothing here places orders or touches your account; it uses production *public* data.
+- **Scan reward markets**: every active liquidity-incentive program (all pages), each market's book, and Kalshi's
+  published scoring (CFTC filing Jul 15 2026): bids walked from the best price down until Target Size; Reference
+  Price where the size first reaches Target/5; score = size x DiscountFactor^ticks below it; each side normalised;
+  snapshots without Target Size resting on *both* sides pay nothing; payouts under $1 per market program are zero.
+  Shows best-case $/day by quote size and capital budget (before any fills).
+- **Shadow quoter**: runs the live quoter's rules (join best YES/NO bid, 30-contract inventory cap, 4c jump pull +
+  10-min cool-down, stop 6h before settlement, re-place every 60s) on the top markets from the scan, with virtual
+  orders, polling the public book and trades (default 20 markets every 10s, ~2-3 requests/s). Reports rewards,
+  fills under **queue** (back of the queue; conservative) and **touch** (optimistic) models, maker fees, inventory
+  marked to the mid, net, and 1/10/60-minute markouts (adverse selection). It survives app restarts (open virtual
+  quotes are dropped, as real ones would expire) and stops itself after 21 days.
+- The liquidity program is listed through **Jan 1, 2027**; Kalshi can extend, change or end it.
+- The quoter's market picker now uses the same scoring (it used a simpler size ratio).
+- Backtester: filled/expired orders are dropped from the matching loop (same results, much faster on long runs).
+
 ### Updating a running install
 Drop an empty file named `restart.request` next to `run.py`. The app cancels quoter orders, exits, and the boot task restarts it about 15 seconds later.
 

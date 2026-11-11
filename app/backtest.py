@@ -95,7 +95,7 @@ class Ctx:
 
     @property
     def open_orders(self) -> list[Order]:
-        return [o for o in self._sim.orders if o.filled < o.count and o.expire > self.now]
+        return [o for o in self._sim.live if o.filled < o.count and o.expire > self.now]
 
     # actions --------------------------------------------------------------
     def buy(self, side: str, price: float | None = None, count: float = 1, maker: bool = False,
@@ -103,7 +103,7 @@ class Ctx:
         return self._sim.submit(side, price, count, maker, expire_hours, tag)
 
     def cancel_all(self):
-        for o in self._sim.orders:
+        for o in self._sim.live:
             o.expire = min(o.expire, self.now)
 
 
@@ -292,6 +292,7 @@ class MarketSim:
         self.fee_type, self.fee_mult = fee_type or "quadratic", fee_mult if fee_mult is not None else 1.0
         self.model, self.slip = maker_model, slippage
         self.orders: list[Order] = []
+        self.live: list[Order] = []      # orders that can still fill (pruned as they fill or expire)
         self.fills: list[Fill] = []
         self.pos = {"yes": 0.0, "no": 0.0}
         self.rejects = 0
@@ -313,7 +314,9 @@ class MarketSim:
                 self.rejects += 1          # post-only would cross
                 return False
             exp = min(close_ts, c.now + expire_hours * 3600) if expire_hours else close_ts
-            self.orders.append(Order(side, round(price, 4), count, True, c.now, exp, tag))
+            o = Order(side, round(price, 4), count, True, c.now, exp, tag)
+            self.orders.append(o)
+            self.live.append(o)
             return True
         # taker: fill now at the close quote (+ slippage), capped by the strategy's limit if any
         px = (ya if side == "yes" else (1 - yb if yb else None))
@@ -333,15 +336,19 @@ class MarketSim:
         self.pos[side] += count
 
     def _match(self, t: dict):
-        """Resting maker orders vs one public trade."""
+        """Resting maker orders vs one public trade. Filled and expired orders are dropped from the live
+        list here, so each trade only scans orders that can still fill (was: every order ever placed)."""
         yp, qty = t["yes_price"], t["count"] or 0
         if yp is None or qty <= 0:
             return
-        for o in self.orders:
-            if qty <= 0:
-                break
+        ts = t["ts"]
+        alive = []
+        for o in self.live:
             rem = o.count - o.filled
-            if rem <= 0 or o.placed >= t["ts"] or o.expire < t["ts"]:
+            if rem <= 0 or o.expire < ts:
+                continue
+            alive.append(o)
+            if qty <= 0 or o.placed >= ts:
                 continue
             if o.side == "yes":
                 through = yp < o.price - 1e-9
@@ -353,7 +360,8 @@ class MarketSim:
                 q = min(rem, qty)
                 o.filled += q
                 qty -= q
-                self._fill(o.side, o.price, q, True, t["ts"], o.tag)
+                self._fill(o.side, o.price, q, True, ts, o.tag)
+        self.live = alive
 
     def run(self) -> dict:
         ti = 0

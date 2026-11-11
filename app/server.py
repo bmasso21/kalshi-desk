@@ -41,6 +41,9 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     oddspapi = OddsPapi(lambda: cfg.data.get("sports") or {}, wdb)
     app_sp_state = {"running": False}
     eng.weather = WxCollector(eng, wx_store)
+    from . import mm as mmod
+    mm_scanner = mmod.Scanner(wdb, client=KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+    mm_shadow = mmod.Shadow(wdb, client=KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
     wx_model: dict = {"m": None, "ts": 0.0}
 
     def weather_model():
@@ -55,6 +58,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     app.state.backtester = bt
     app.state.auth = auth
     app.state.wdb = wdb
+    app.state.mm = (mm_scanner, mm_shadow)
     session_token = secrets.token_urlsafe(24)  # CSRF guard for state-changing calls
     prod_confirms: dict[str, float] = {}
 
@@ -64,10 +68,15 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             eng.start()
             eng.warehouse.start()
             eng.weather.start()
+            try:
+                mm_shadow.resume()
+            except Exception as e:
+                db.audit("mm_error", f"resume: {e}"[:500])
             eng.alerts.startup(__version__)
 
     @app.on_event("shutdown")
     def _stop():
+        mm_shadow.shutdown()
         eng.weather.stop()
         eng.warehouse.stop()
         eng.stop()
@@ -515,6 +524,66 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         r["results"] = json.loads(r["results"] or "null")
         r["params"] = json.loads(r["params"] or "{}")
         r["filters"] = json.loads(r["filters"] or "{}")
+        return r
+
+    # ------------------------------------------------- market making (2.3) --
+    mm_cache: dict = {"ts": 0.0, "r": None}
+
+    @app.get("/api/mm")
+    def mm_status():
+        sc = mm_scanner.latest()
+        if time.time() - mm_cache["ts"] > 60 or mm_cache["r"] is None:
+            mm_cache["r"], mm_cache["ts"] = mmod.report(wdb, live=mm_shadow), time.time()
+        return {"scan": sc, "scan_running": mm_scanner.running, "shadow": mm_shadow.status(), "report": mm_cache["r"],
+                "runs": wdb.query("SELECT id, ts, status, stopped_ts, note, scan_id FROM mm_runs ORDER BY id DESC LIMIT 20")}
+
+    @app.post("/api/mm/scan")
+    def mm_scan():
+        try:
+            sid = mm_scanner.start({"quoter": {k: cfg.quoter.get(k) for k in ("pull_hours", "max_spread", "min_mid", "max_mid")}})
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+        return {"id": sid}
+
+    @app.get("/api/mm/scan/rows")
+    def mm_rows(size: int = 10, sort: str = "per_capital", limit: int = 100, all: int = 0, scan: int = 0):
+        sc = mm_scanner.latest(done_only=True) if not scan else {"id": scan}
+        if not sc:
+            return {"rows": []}
+        return {"scan_id": sc["id"], "rows": mm_scanner.rows(sc["id"], size, max(1, min(limit, 2000)),
+                                                            sort if sort in ("per_capital", "daily", "pool") else "per_capital",
+                                                            quoter_ok_only=not all)}
+
+    @app.post("/api/mm/shadow/start")
+    async def mm_shadow_start(request: Request):
+        b = await request.json()
+        p = {"n_markets": max(1, min(40, int(b.get("n_markets") or 20))),
+             "size": max(1, min(500, int(b.get("size") or cfg.quoter.get("size") or 10))),
+             "poll_sec": max(5, min(120, int(b.get("poll_sec") or 10))),
+             "max_days": max(1, min(60, float(b.get("max_days") or 21))),
+             "per_series": max(1, min(40, int(b.get("per_series") or 3)))}
+        for k in ("max_inventory", "pull_hours", "jump_cents", "cooldown_min", "refresh_sec", "min_mid", "max_mid", "max_spread"):
+            p[k] = cfg.quoter.get(k)
+        try:
+            rid = mm_shadow.start(mm_scanner, p)
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+        mm_cache["ts"] = 0
+        db.audit("mm_shadow_start", json.dumps(p))
+        return {"id": rid, "params": p}
+
+    @app.post("/api/mm/shadow/stop")
+    def mm_shadow_stop():
+        mm_shadow.stop()
+        mm_cache["ts"] = 0
+        db.audit("mm_shadow_stop", "")
+        return {"ok": True}
+
+    @app.get("/api/mm/report")
+    def mm_report(run: int = 0):
+        r = mmod.report(wdb, run or None, live=mm_shadow)
+        if not r:
+            raise HTTPException(404, "no shadow run yet")
         return r
 
     # -------------------------------------------------------------- quoter --
