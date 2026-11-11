@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kalshi Desk</title>
+<style>
+:root{--bg:#0f1214;--panel:#171b1e;--line:#262c31;--txt:#e6e9eb;--mut:#8b959c;--yes:#2fbf71;--no:#e5484d;--acc:#4c9aff;--warn:#f5a524}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.45 -apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5;flex-wrap:wrap}
+h1{font-size:16px;margin:0 12px 0 0;letter-spacing:.3px}
+.pill{padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--line)}
+.demo{background:#1d2a3a;color:#9cc5ff}.prod{background:#3a1d1d;color:#ff9c9c;border-color:#7a2a2a}
+nav button{background:none;border:0;color:var(--mut);padding:6px 10px;cursor:pointer;font-size:14px;border-radius:6px}
+nav button.on{color:var(--txt);background:var(--panel)}
+.spacer{flex:1}
+button.b{background:var(--panel);border:1px solid var(--line);color:var(--txt);padding:6px 12px;border-radius:6px;cursor:pointer}
+button.b:hover{border-color:#3a434a}button.yes{background:#173d29;border-color:#24603f}button.no{background:#41191b;border-color:#6b2427}
+button.kill{background:#5a1416;border-color:#8a2024;font-weight:700}button.pri{background:#173257;border-color:#24508c}
+main{padding:16px;max-width:1400px;margin:0 auto}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:500}td.r,th.r{text-align:right}
+.mut{color:var(--mut)}.y{color:var(--yes)}.n{color:var(--no)}.w{color:var(--warn)}
+input,select{background:#0c0f11;border:1px solid var(--line);color:var(--txt);padding:6px 8px;border-radius:6px;font-size:13px}
+.grid{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:12px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.ev{padding:10px;border-bottom:1px solid var(--line);cursor:pointer}.ev:hover{background:#1c2125}
+.mk{display:flex;justify-content:space-between;gap:8px;padding:3px 0 3px 10px;font-size:13px;cursor:pointer}.mk:hover{color:var(--acc)}
+.book td{padding:3px 6px}.tag{font-size:11px;padding:1px 6px;border-radius:4px;background:#222a30;color:var(--mut);margin-right:4px}
+#toast{position:fixed;bottom:16px;right:16px;max-width:420px;z-index:9}
+.t{background:#222a30;border:1px solid var(--line);padding:10px 12px;border-radius:8px;margin-top:8px}
+.t.err{border-color:#8a2024}.t.ok{border-color:#24603f}
+label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mut)}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.big{font-size:22px;font-weight:600}.hide{display:none}a{color:var(--acc);text-decoration:none}
+@media(max-width:700px){main{padding:10px}.card{overflow-x:auto}nav{order:5;width:100%;overflow-x:auto;white-space:nowrap}#scanInfo{display:none}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Kalshi Desk</h1>
+  <span id="envPill" class="pill demo">DEMO</span>
+  <span id="authPill" class="pill">…</span>
+  <span id="autoPill" class="pill">auto off</span>
+  <nav id="nav">
+    <button data-t="scanner" class="on">Scanner</button><button data-t="markets">Markets</button>
+    <button data-t="rewards">Rewards</button><button data-t="portfolio">Portfolio</button><button data-t="ledger">Ledger</button><button data-t="settings">Settings</button>
+  </nav>
+  <span class="spacer"></span>
+  <span id="scanInfo" class="mut" style="font-size:12px"></span>
+  <button class="b kill" id="killBtn">KILL SWITCH</button>
+</header>
+<main>
+<!-- SCANNER -->
+<section id="t-scanner">
+  <div class="card row"><button class="b pri" onclick="api('/api/scan',{method:'POST'}).then(()=>toast('Scan queued'))">Scan now</button>
+  <select id="sigFilter" onchange="loadSignals()"><option value="">All strategies</option><option>basket_no</option><option>basket_yes</option><option>fair_value</option><option>wide_spread</option><option>movers</option></select>
+  <span class="mut" id="scanStats"></span></div>
+  <div class="card"><table><thead><tr><th>Strategy</th><th>Market / Event</th><th>Detail</th><th class="r">Edge $/unit</th><th>Action</th></tr></thead><tbody id="sigBody"></tbody></table></div>
+</section>
+<!-- MARKETS -->
+<section id="t-markets" class="hide">
+  <div class="card row"><input id="q" placeholder="Search events or outcomes…" style="flex:1;min-width:200px">
+    <select id="cat"><option value="">All categories</option></select>
+    <button class="b" onclick="loadEvents()">Search</button><span class="mut" id="evCount"></span></div>
+  <div class="grid">
+    <div class="card" style="max-height:78vh;overflow:auto;padding:0" id="evList"></div>
+    <div id="detail"><div class="card mut">Pick a market on the left.</div></div>
+  </div>
+</section>
+<!-- REWARDS -->
+<section id="t-rewards" class="hide">
+  <div class="card row" id="rwTop"></div>
+  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Liquidity quoter</h3><span id="qState" class="mut"></span></div>
+    <p class="mut" style="font-size:12px;margin:6px 0">Posts post-only bids at the top of both sides of markets with Kalshi liquidity rewards. You get paid for resting orders even when they don't fill; the cost is being filled right before the price moves. Turn it on in Settings. Every quote expires on its own within ~2 minutes if the app stops.</p>
+    <h4 style="margin:10px 0 4px">Markets selected</h4><table><thead><tr><th>Market</th><th class="r">Pool $/day</th><th class="r">Your est. share</th><th class="r">Est. $/day</th></tr></thead><tbody id="qSel"></tbody></table>
+    <p class="mut" style="font-size:12px">Estimate = pool × your size ÷ (your size + competing size near the top), averaged over both sides, at today's book. Markets where your share would pay under Kalshi's $1 minimum are skipped. Real payouts are lower when the book is thin (Kalshi excludes those snapshots).</p>
+    <h4 style="margin:10px 0 4px">Live quotes</h4><table><thead><tr><th>Ticker</th><th>Side</th><th class="r">Price</th><th>Expires</th></tr></thead><tbody id="qQuotes"></tbody></table></div>
+  <div class="card"><h3 style="margin-top:0">All Kalshi credits (last 30 days)</h3><table><thead><tr><th>Date</th><th>Type</th><th class="r">Amount</th><th>Reason</th></tr></thead><tbody id="rwCredits"></tbody></table></div>
+  <div class="card"><h3 style="margin-top:0">Quoter log</h3><table><tbody id="qLog"></tbody></table></div>
+</section>
+<!-- PORTFOLIO -->
+<section id="t-portfolio" class="hide">
+  <div class="card row" id="balRow"></div>
+  <div class="card"><h3 style="margin-top:0">Positions</h3><table><thead><tr><th>Market</th><th>Side</th><th class="r">Qty</th><th class="r">Exposure</th><th class="r">Mark (bid)</th><th class="r">Realized P&L</th><th class="r">Fees</th><th></th></tr></thead><tbody id="posBody"></tbody></table></div>
+  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Resting orders</h3><button class="b no" onclick="cancelAll()">Cancel all</button></div><table><thead><tr><th>Ticker</th><th>Side</th><th class="r">YES px</th><th class="r">Remaining</th><th>Created</th><th></th></tr></thead><tbody id="ordBody"></tbody></table></div>
+  <div class="card"><h3 style="margin-top:0">Recent fills</h3><table><thead><tr><th>Time</th><th>Ticker</th><th>Side</th><th class="r">Count</th><th class="r">YES px</th><th class="r">Fee</th><th>Taker</th></tr></thead><tbody id="fillBody"></tbody></table></div>
+  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Settlements</h3><button class="b" onclick="loadSettlements()">Load</button></div><div id="setlSum" class="mut"></div><table><thead><tr><th>Settled</th><th>Ticker</th><th>Result</th><th class="r">YES cost</th><th class="r">NO cost</th><th class="r">Revenue</th><th class="r">Fees</th></tr></thead><tbody id="setlBody"></tbody></table></div>
+</section>
+<!-- LEDGER -->
+<section id="t-ledger" class="hide">
+  <div class="card" id="spent"></div>
+  <div class="card"><h3 style="margin-top:0">Order log (every attempt)</h3><table><thead><tr><th>Time</th><th>Env</th><th>Source</th><th>Ticker</th><th>Intent</th><th class="r">Px</th><th class="r">Count</th><th class="r">Cost</th><th>Status</th><th class="r">Filled</th><th>Error</th></tr></thead><tbody id="logBody"></tbody></table></div>
+  <div class="card"><h3 style="margin-top:0">Audit</h3><table><tbody id="auditBody"></tbody></table></div>
+</section>
+<!-- SETTINGS -->
+<section id="t-settings" class="hide"><div id="settingsBox"></div></section>
+</main>
+<div id="toast"></div>
+<script>
+let TOKEN='', CFG=null, EVENTS=[], CUR=null;
+const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money=x=>x==null||x===''?'':'$'+Number(x).toFixed(2), px=x=>x==null||x===''?'–':Number(x).toFixed(2), ts=t=>t?new Date(typeof t==='number'?(t>1e12?t:t*1000):t).toLocaleString():'';
+function toast(m,k=''){const e=document.createElement('div');e.className='t '+k;e.textContent=m;$('#toast').appendChild(e);setTimeout(()=>e.remove(),k==='err'?9000:4000)}
+async function api(u,o={}){o.headers={'Content-Type':'application/json','X-Desk-Token':TOKEN,...(o.headers||{})};
+  if(o.body&&typeof o.body!=='string')o.body=JSON.stringify(o.body);
+  const r=await fetch(u,o);let j={};try{j=await r.json()}catch(e){}
+  if(r.status===409&&j.needs_confirm){if(confirm(j.message)){const b=JSON.parse(o.body||'{}');b.confirm_token=j.confirm_token;return api(u,{...o,body:b})}throw new Error('Cancelled')}
+  if(!r.ok)throw new Error(j.error||j.detail||('HTTP '+r.status));return j}
+// tabs
+document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x===b));
+  document.querySelectorAll('main>section').forEach(s=>s.classList.toggle('hide',s.id!=='t-'+b.dataset.t));
+  ({scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:loadRewards,portfolio:loadPortfolio,ledger:loadLedger,settings:loadSettings})[b.dataset.t]()});
+async function loadRewards(){try{const [q,r]=await Promise.all([api('/api/quoter'),api('/api/rewards')]);const st=q.state;
+  $('#qState').innerHTML=(q.config.enabled?(st.running?'<b class="y">RUNNING</b>':'<b class="w">enabled, not running (kill switch or no key)</b>'):'<b class="mut">OFF</b>')+` · ${q.env.toUpperCase()} · ${st.resting} quotes resting · $${st.committed} committed / $${q.config.max_capital} cap`+(st.error?` · <span class="n">${esc(st.error)}</span>`:'');
+  $('#qSel').innerHTML=q.selected.map(s=>`<tr><td><a href="#" onclick="openMarket('${esc(s.ticker)}');return false">${esc(s.title)}</a> <span class="mut">${esc(s.sub||'')} · ${esc(s.ticker)}</span></td><td class="r">$${esc(s.daily_reward)}</td><td class="r">${esc(s.share)}%</td><td class="r y">$${esc(s.est_daily)}</td></tr>`).join('')||'<tr><td colspan=4 class="mut">None yet (quoter off, or no pools meet your minimum)</td></tr>';
+  $('#qQuotes').innerHTML=q.quotes.map(x=>`<tr><td>${esc(x.ticker)}</td><td class="${x.side==='yes'?'y':'n'}">Buy ${x.side.toUpperCase()}</td><td class="r">${px(x.price)}</td><td>${new Date(x.expires*1000).toLocaleTimeString()}</td></tr>`).join('')||'<tr><td colspan=4 class="mut">No live quotes</td></tr>';
+  $('#qLog').innerHTML=q.events.map(e=>`<tr><td class="mut" style="width:160px">${ts(e.ts)}</td><td style="width:90px">${esc(e.kind)}</td><td style="font-size:12px">${esc(e.msg)}</td></tr>`).join('')||'<tr><td class="mut">Nothing yet</td></tr>';
+  if(r.authenticated){const p=r.pnl_today;$('#rwTop').innerHTML=`<div><div class="mut">Liquidity rewards (30d)</div><div class="big y">${money(r.credits_total)}</div><div class="mut" style="font-size:12px">other credits ${money(r.other_credits_total)}</div></div>
+   <div><div class="mut">P&L today</div><div class="big ${p&&+p.pnl<0?'n':'y'}">${p?money(p.pnl):'–'}</div><div class="mut" style="font-size:12px">loss limit ${money(r.max_daily_loss)}</div></div>
+   <div><div class="mut">Filled buys today</div><div class="big">${money(r.spent_today.all)}</div><div class="mut" style="font-size:12px">auto/quoter ${money(r.spent_today.auto)}</div></div>
+   <div><div class="mut">Quoter orders today</div><div class="big">${r.quoter_orders_today}</div></div><button class="b" onclick="loadRewards()">Refresh</button>`;
+   $('#rwCredits').innerHTML=r.credits.map(c=>`<tr><td>${ts(c.created_time)}</td><td>${esc(c.type)}</td><td class="r y">${money(c.amount_dollars)}</td><td style="font-size:12px">${esc(c.reason)}</td></tr>`).join('')||'<tr><td colspan=4 class="mut">No credits yet. Liquidity rewards are paid in a daily run after each period closes.</td></tr>'}
+  else $('#rwTop').innerHTML='<span class="w">Add your API key in Settings.</span>'}catch(e){toast(e.message,'err')}}
+// status
+async function status(){try{const s=await api('/api/status');const p=$('#envPill');p.textContent=s.env.toUpperCase()+(s.env==='prod'?' · REAL MONEY':'');p.className='pill '+s.env;
+  $('#authPill').textContent=s.authenticated?'API key ✓':'no API key (read-only)';$('#authPill').style.color=s.authenticated?'var(--yes)':'var(--warn)';
+  $('#autoPill').textContent=s.auto?'AUTO ON':'auto off';$('#autoPill').style.color=s.auto?'var(--warn)':'';
+  const k=$('#killBtn');k.textContent=s.kill_switch?'KILL SWITCH ON – click to release':'KILL SWITCH';k.dataset.on=s.kill_switch?'1':'';
+  const sc=s.scan;$('#scanInfo').textContent=(sc.running?'scanning… ':'')+(sc.last?'last scan '+new Date(sc.last*1000).toLocaleTimeString():'')+(sc.error?' · ERROR: '+sc.error:'')+(s.exchange&&s.exchange.trading_active===false?' · exchange trading paused':'');
+}catch(e){$('#scanInfo').textContent='server unreachable'}}
+$('#killBtn').onclick=async()=>{const on=!$('#killBtn').dataset.on;if(on&&!confirm('Kill switch: block all new orders, turn off auto, and cancel every resting order?'))return;
+  const r=await api('/api/kill',{method:'POST',body:{on}});toast(on?`Kill switch ON. Cancelled ${r.cancelled.length} orders.`:'Kill switch released','ok');status()};
+// scanner
+async function loadSignals(){const j=await api('/api/signals');const f=$('#sigFilter').value;const st=j.scan.stats||{};
+  $('#scanStats').textContent=st.events?`${st.events} events / ${st.markets} markets scanned in ${st.secs}s · ${st.signals} signals`:'';
+  const rows=j.signals.filter(s=>!f||s.strategy===f);
+  $('#sigBody').innerHTML=rows.length?rows.map(s=>`<tr><td><span class="tag">${esc(s.strategy)}</span></td><td>${esc(s.title)}<div class="mut" style="font-size:12px">${s.legs.map(l=>esc(l.ticker)).slice(0,4).join(', ')}${s.legs.length>4?' …':''}</div></td>
+   <td>${esc(s.detail)}${s.note?`<div class="w" style="font-size:12px">${esc(s.note)}</div>`:''}</td><td class="r ${Number(s.edge)>0?'y':''}">${Number(s.edge).toFixed(4)}</td>
+   <td>${s.actionable?`<div class="row"><input type="number" min="1" style="width:70px" id="cnt${s.id}" value="${Math.max(1,Math.min(s.legs[0]?.count||1,s.max_fit||1))}" title="${s.legs.length>1?'baskets':'contracts'} (depth ${s.legs[0]?.count}, your limits allow ${s.max_fit})"><button class="b yes" onclick="approve(${s.id},${s.legs.length})">Approve</button></div>`:(s.legs[0]?`<button class="b" onclick="openMarket('${esc(s.legs[0].ticker)}')">Open</button>`:'')}
+   <button class="b" style="margin-top:4px" onclick="dismiss(${s.id})">Dismiss</button></td></tr>`).join(''):'<tr><td colspan=5 class="mut">No signals right now. That is normal: real edges are rare. Add fair values on markets you have an opinion on.</td></tr>'}
+async function approve(id,n){const c=+$('#cnt'+id).value;if(!confirm(`Place ${n>1?n+' legs × '+c+' contracts (fill-or-kill each)':c+' contracts'}?`))return;
+  try{const r=await api(`/api/signals/${id}/approve`,{method:'POST',body:{count:c}});toast('Signal '+r.status+': '+r.results.map(x=>x.ticker+(x.ok?' ✓':' ✗ '+(x.error||'not filled'))).join(' · '),r.status==='executed'?'ok':'err');loadSignals()}catch(e){toast(e.message,'err')}}
+async function dismiss(id){await api(`/api/signals/${id}/dismiss`,{method:'POST'});loadSignals()}
+// markets
+async function loadCats(){try{const j=await api('/api/categories');const cats=Object.keys(j.tags_by_categories||{}).sort();$('#cat').innerHTML='<option value="">All categories</option>'+cats.map(c=>`<option>${esc(c)}</option>`).join('')}catch(e){}}
+async function loadEvents(){$('#evList').innerHTML='<div class="ev mut">Loading…</div>';
+  try{const j=await api(`/api/events?q=${encodeURIComponent($('#q').value)}&category=${encodeURIComponent($('#cat').value)}`);EVENTS=j.events;$('#evCount').textContent=`${j.total} open events`;
+  $('#evList').innerHTML=EVENTS.map(e=>`<div class="ev"><div><span class="tag">${esc(e.category)}</span>${e.mutually_exclusive?'<span class="tag">mutually exclusive</span>':''}<b>${esc(e.title)}</b> <span class="mut">${esc(e.sub_title||'')}</span></div>
+   ${(e.markets||[]).slice(0,12).map(m=>`<div class="mk" onclick="openMarket('${esc(m.ticker)}')"><span>${esc(m.yes_sub_title||m.title)}</span><span><span class="y">Y ${px(m.yes_ask_dollars)}</span> · <span class="n">N ${px(m.no_ask_dollars)}</span></span></div>`).join('')}
+   ${(e.markets||[]).length>12?`<div class="mut" style="padding-left:10px">+${e.markets.length-12} more (search to narrow)</div>`:''}</div>`).join('')||'<div class="ev mut">Nothing found.</div>'}catch(e){$('#evList').innerHTML=`<div class="ev n">${esc(e.message)}</div>`}}
+$('#q').onkeydown=e=>{if(e.key==='Enter')loadEvents()};$('#cat').onchange=loadEvents;
+async function openMarket(t){document.querySelector('#nav button[data-t=markets]').click();$('#detail').innerHTML='<div class="card mut">Loading…</div>';
+  try{const j=await api('/api/market/'+encodeURIComponent(t));CUR=j;renderDetail()}catch(e){$('#detail').innerHTML=`<div class="card n">${esc(e.message)}</div>`}}
+function renderDetail(){const j=CUR,m=j.market,b=j.book;const lv=(a,cls)=>a.slice(0,8).map(([p,c])=>`<tr><td class="${cls}">${px(p)}</td><td class="r">${Number(c).toFixed(0)}</td></tr>`).join('')||'<tr><td class="mut">empty</td></tr>';
+  $('#detail').innerHTML=`<div class="card"><div class="mut" style="font-size:12px">${esc(j.event.category)} · ${esc(m.ticker)} · ${esc(m.status)} · closes ${ts(m.close_time)}</div>
+   <h3 style="margin:6px 0">${esc(m.title)}</h3><div>${esc(m.yes_sub_title||'')}</div>
+   <div class="row" style="margin:10px 0"><div><div class="mut">YES ask</div><div class="big y">${px(m.yes_ask_dollars)}</div></div><div><div class="mut">NO ask</div><div class="big n">${px(m.no_ask_dollars)}</div></div>
+   <div><div class="mut">Last</div><div class="big">${px(m.last_price_dollars)}</div></div><div><div class="mut">24h vol</div><div class="big">${Number(m.volume_24h_fp||0).toFixed(0)}</div></div><div><div class="mut">Open int.</div><div class="big">${Number(m.open_interest_fp||0).toFixed(0)}</div></div></div>
+   <div class="grid" style="grid-template-columns:1fr 1fr"><div><div class="mut">Buy YES (asks)</div><table class="book">${lv(b.yes_asks,'y')}</table></div><div><div class="mut">Buy NO (asks)</div><table class="book">${lv(b.no_asks,'n')}</table></div></div>
+   <details style="margin-top:8px"><summary class="mut">Rules</summary><p>${esc(m.rules_primary)}</p><p class="mut">${esc(m.rules_secondary||'')}</p></details></div>
+   <div class="card"><h3 style="margin-top:0">Order ticket</h3><div class="row">
+    <label class="f">Action<select id="oInt"><option value="buy_yes">Buy YES</option><option value="buy_no">Buy NO</option><option value="sell_yes">Sell YES (close)</option><option value="sell_no">Sell NO (close)</option></select></label>
+    <label class="f">Limit price ($)<input id="oPx" type="number" step="0.01" min="0.01" max="0.99" style="width:90px"></label>
+    <label class="f">Contracts<input id="oCnt" type="number" min="1" value="10" style="width:80px"></label>
+    <label class="f">Type<select id="oTif"><option value="good_till_canceled">Limit (rests)</option><option value="immediate_or_cancel">Take now (IOC)</option><option value="fill_or_kill">All-or-nothing (FOK)</option></select></label>
+    <label class="f" style="flex-direction:row;align-items:center;gap:5px"><input type="checkbox" id="oPost">post-only</label></div>
+    <div id="oSum" class="mut" style="margin:8px 0"></div><button class="b pri" onclick="sendOrder()">Review &amp; send</button></div>
+   <div class="card"><h3 style="margin-top:0">Your fair value</h3><div class="row"><label class="f">Fair YES prob ($)<input id="fv" type="number" step="0.01" min="0.01" max="0.99" style="width:90px" value="${j.fair_value?j.fair_value.fair_yes:''}"></label>
+    <label class="f" style="flex:1">Note (source)<input id="fvn" value="${esc(j.fair_value?j.fair_value.note:'')}" placeholder="e.g. Pinnacle no-vig, my model"></label>
+    <button class="b" onclick="saveFV()">Save</button>${j.fair_value?'<button class="b" onclick="delFV()">Remove</button>':''}</div>
+    <div class="mut" style="font-size:12px;margin-top:6px">The scanner flags this market when the ask beats your number by the minimum edge after fees.</div></div>`;
+  const setPx=()=>{const i=$('#oInt').value;$('#oPx').value=px(i==='buy_yes'?m.yes_ask_dollars:i==='buy_no'?m.no_ask_dollars:i==='sell_yes'?m.yes_bid_dollars:m.no_bid_dollars);summ()};
+  $('#oInt').onchange=setPx;['#oPx','#oCnt','#oTif','#oPost'].forEach(s=>$(s).oninput=summ);setPx()}
+async function summ(){const p=+$('#oPx').value,c=+$('#oCnt').value,i=$('#oInt').value;if(!p||!c){$('#oSum').textContent='';return}
+  const maker=$('#oPost').checked;let f={taker:'?',maker:'?'};try{f=await api(`/api/fee?price=${p}&count=${c}&fee_type=${CUR.fee_type||'quadratic'}&multiplier=${CUR.fee_multiplier??1}`)}catch(e){}
+  const buy=i.startsWith('buy');const fe=maker?f.maker:f.taker;
+  $('#oSum').innerHTML=buy?`Cost <b>${money(p*c)}</b> + est. fee ${money(fe)} → pays <b>${money(c)}</b> if ${i==='buy_yes'?'YES':'NO'}. Profit if right ${money(c-p*c-fe)} · break-even ${(100*(p+fe/c)).toFixed(1)}%`
+   :`Sell ${c} @ ${money(p)} → receive ${money(p*c)} − est. fee ${money(fe)}`}
+async function sendOrder(){const b={ticker:CUR.market.ticker,intent:$('#oInt').value,price:$('#oPx').value,count:$('#oCnt').value,time_in_force:$('#oTif').value,post_only:$('#oPost').checked};
+  if(!confirm(`${b.intent.replace('_',' ').toUpperCase()} ${b.count} × ${CUR.market.ticker} @ $${b.price} (${b.time_in_force})?`))return;
+  try{const r=await api('/api/order',{method:'POST',body:b});const k=r.kalshi;toast(`Order ${k.order_id.slice(0,8)}… filled ${k.fill_count}, resting ${k.remaining_count}${k.average_fee_paid?' · fee/contract $'+k.average_fee_paid:''}`,'ok');openMarket(CUR.market.ticker)}catch(e){toast(e.message,'err')}}
+async function saveFV(){try{await api('/api/fair_values',{method:'POST',body:{ticker:CUR.market.ticker,fair_yes:$('#fv').value,note:$('#fvn').value}});toast('Fair value saved – included in next scan','ok')}catch(e){toast(e.message,'err')}}
+async function delFV(){await api('/api/fair_values/'+CUR.market.ticker,{method:'DELETE'});openMarket(CUR.market.ticker)}
+// portfolio
+async function loadPortfolio(){try{const j=await api('/api/portfolio');if(!j.authenticated){$('#balRow').innerHTML='<span class="w">Add your API key in Settings to see your portfolio and trade.</span>';return}
+  const bal=j.balance;$('#balRow').innerHTML=`<div><div class="mut">Cash</div><div class="big">${money(bal.balance_dollars??bal.balance/100)}</div></div><div><div class="mut">Positions value</div><div class="big">${money((bal.portfolio_value||0)/100)}</div></div><button class="b" onclick="loadPortfolio()">Refresh</button>`;
+  $('#posBody').innerHTML=j.positions.map(p=>`<tr><td><a href="#" onclick="openMarket('${esc(p.ticker)}');return false">${esc(p.title||p.ticker)}</a><div class="mut" style="font-size:12px">${esc(p.sub||'')} · ${esc(p.status||'')}</div></td><td class="${p.side==='YES'?'y':'n'}">${p.side}</td><td class="r">${Number(p.qty).toFixed(2)}</td><td class="r">${money(p.market_exposure_dollars)}</td><td class="r">${money(p.mark_value)} <span class="mut">(${px(p.mark)})</span></td><td class="r">${money(p.realized_pnl_dollars)}</td><td class="r">${money(p.fees_paid_dollars)}</td><td><button class="b" onclick="closePos('${esc(p.ticker)}','${p.side}','${p.qty}','${p.mark}')">Close</button></td></tr>`).join('')||'<tr><td colspan=8 class="mut">No open positions</td></tr>';
+  $('#ordBody').innerHTML=j.orders.map(o=>`<tr><td>${esc(o.ticker)}</td><td>${esc(o.book_side||o.side)} ${esc(o.outcome_side||'')}</td><td class="r">${px(o.yes_price_dollars)}</td><td class="r">${Number(o.remaining_count_fp||0).toFixed(2)}</td><td>${ts(o.created_time)}</td><td><button class="b" onclick="cancelOrd('${o.order_id}','${esc(o.ticker)}')">Cancel</button></td></tr>`).join('')||'<tr><td colspan=6 class="mut">None</td></tr>';
+  $('#fillBody').innerHTML=j.fills.slice(0,100).map(f=>`<tr><td>${ts(f.created_time)}</td><td>${esc(f.ticker||f.market_ticker)}</td><td>${esc(f.book_side||'')} ${esc(f.outcome_side||f.side||'')}</td><td class="r">${Number(f.count_fp||0).toFixed(2)}</td><td class="r">${px(f.yes_price_dollars)}</td><td class="r">${f.fee_cost??''}</td><td>${f.is_taker?'taker':'maker'}</td></tr>`).join('')||'<tr><td colspan=7 class="mut">None</td></tr>'}catch(e){toast(e.message,'err')}}
+async function closePos(t,side,q,mark){const intent=side==='YES'?'sell_yes':'sell_no';const p=prompt(`Close ${q} ${side} on ${t}. Limit price ($, current bid ${mark}):`,mark);if(!p)return;
+  try{const r=await api('/api/order',{method:'POST',body:{ticker:t,intent,price:p,count:q,time_in_force:'immediate_or_cancel'}});toast(`Closed ${r.kalshi.fill_count} of ${q}`,'ok');loadPortfolio()}catch(e){toast(e.message,'err')}}
+async function cancelOrd(id,t){try{await api(`/api/order/${id}?ticker=${encodeURIComponent(t)}`,{method:'DELETE'});toast('Cancelled','ok');loadPortfolio()}catch(e){toast(e.message,'err')}}
+async function cancelAll(){if(!confirm('Cancel ALL resting orders?'))return;const r=await api('/api/cancel_all',{method:'POST'});toast(`Cancelled ${r.cancelled}`,'ok');loadPortfolio()}
+async function loadSettlements(){const j=await api('/api/settlements');let cost=0,rev=0,fee=0;
+  $('#setlBody').innerHTML=j.settlements.map(s=>{const c=(+s.yes_total_cost_dollars||0)+(+s.no_total_cost_dollars||0);cost+=c;rev+=(s.revenue||0)/100;fee+=+(s.fee_cost||0);
+   return `<tr><td>${ts(s.settled_time)}</td><td>${esc(s.ticker)}</td><td>${esc(s.market_result)}</td><td class="r">${money(s.yes_total_cost_dollars)}</td><td class="r">${money(s.no_total_cost_dollars)}</td><td class="r">${money((s.revenue||0)/100)}</td><td class="r">${s.fee_cost??''}</td></tr>`}).join('')||'<tr><td colspan=7 class="mut">None</td></tr>';
+  $('#setlSum').innerHTML=j.settlements.length?`${j.settlements.length} settled · cost ${money(cost)} · payouts ${money(rev)} · net <b class="${rev-cost>=0?'y':'n'}">${money(rev-cost)}</b> (fees shown separately; check Kalshi statements for tax figures)`:''}
+// ledger
+async function loadLedger(){const j=await api('/api/ledger');$('#spent').innerHTML=`Spent on new positions today (${CFG?.env||''}): <b>${money(j.spent_today)}</b>`;
+  $('#logBody').innerHTML=j.orders.map(o=>`<tr><td>${ts(o.ts)}</td><td>${o.env}</td><td>${esc(o.source)}${o.strategy?' / '+esc(o.strategy):''}</td><td>${esc(o.ticker)}</td><td>${esc(o.intent)}</td><td class="r">${px(o.price)}</td><td class="r">${esc(o.count)}</td><td class="r">${money(o.cost)}</td><td class="${o.status==='placed'?'y':'n'}">${o.status}</td><td class="r">${esc(o.fill_count||'')}</td><td class="n" style="font-size:12px">${esc(o.error||'')}</td></tr>`).join('')||'<tr><td colspan=11 class="mut">No orders yet</td></tr>';
+  $('#auditBody').innerHTML=j.audit.map(a=>`<tr><td class="mut" style="width:170px">${ts(a.ts)}</td><td style="width:110px">${esc(a.kind)}</td><td style="font-size:12px">${esc(a.message)}</td></tr>`).join('')}
+// settings
+async function loadSettings(){const j=await api('/api/config');CFG=j.config;const c=CFG,r=c.risk,a=c.auto,s=c.scanner;const strat=['basket_no','basket_yes','fair_value','wide_spread','movers'];
+  const num=(id,v,st='0.01')=>`<input id="${id}" type="number" step="${st}" value="${v}" style="width:100px">`;
+  $('#settingsBox').innerHTML=`<div class="card"><h3 style="margin-top:0">Connection</h3><div class="row">
+   <label class="f">Environment<select id="sEnv"><option value="demo">Demo (fake money)</option><option value="prod">Production (REAL MONEY)</option></select></label></div>
+   <p class="mut">Keys stay on this computer. Demo and production keys are different; generate demo keys at demo.kalshi.co.</p>
+   ${['demo','prod'].map(e=>`<div class="row" style="margin-bottom:8px"><b style="width:50px">${e}</b><label class="f">API Key ID ${c[e+'_key_id']?'(set: '+esc(c[e+'_key_id'])+')':''}<input id="k_${e}" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" style="width:300px"></label>
+    <label class="f">Private key file path ${c[e+'_private_key_path']?'(set)':'<span class="w">(not set)</span>'}<input id="p_${e}" placeholder="C:\\Projects\\KalshiDesk\\keys\\kalshi-desk-${e}.txt" style="width:380px"></label></div>`).join('')}
+   <p class="mut" style="font-size:12px">Key ID = the short ID shown on Kalshi's API Keys page. Private key = the downloaded file; enter its full path here, never its contents.</p></div>
+   <div class="card"><h3 style="margin-top:0">Risk limits (every order)</h3><div class="row">
+    <label class="f">Max $ per order${num('r1',r.max_order_cost)}</label><label class="f">Max $ new buys / day${num('r2',r.max_daily_spend)}</label>
+    <label class="f">Max $ per market${num('r3',r.max_market_exposure)}</label><label class="f">Max $ total exposure${num('r4',r.max_total_exposure)}</label>
+    <label class="f">Max contracts / order${num('r5',r.max_contracts_per_order,'1')}</label><label class="f">Max $ loss / day (trips kill switch)${num('r9',r.max_daily_loss)}</label><label class="f">Min buy price${num('r6',r.min_price)}</label><label class="f">Max buy price${num('r7',r.max_price)}</label>
+    <label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" id="r8" ${r.require_confirm_prod?'checked':''}>Double-confirm prod orders</label></div></div>
+   <div class="card"><h3 style="margin-top:0">Auto-trading</h3><p class="w">Off by default. When on, scanner signals from the selected strategies are placed without asking, inside the tighter auto limits below. ${j.never_auto.join(', ')} can never auto-trade.</p><div class="row">
+    <label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" id="a1" ${a.enabled?'checked':''}>Enable auto-trading</label>
+    ${strat.filter(x=>!j.never_auto.includes(x)).map(x=>`<label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" class="as" value="${x}" ${a.strategies.includes(x)?'checked':''}>${x}</label>`).join('')}
+    <label class="f">Auto max $ / order${num('a2',a.max_order_cost)}</label><label class="f">Auto max $ / day${num('a3',a.max_daily_spend)}</label></div></div>
+   <div class="card"><h3 style="margin-top:0">Liquidity quoter</h3><p class="w">Off by default. Quoter orders also count against the auto limits above ($ per order, $ per day of fills).</p><div class="row">
+    <label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" id="q1" ${c.quoter.enabled?'checked':''}>Enable quoter</label>
+    <label class="f">Markets at once${num('q2',c.quoter.max_markets,'1')}</label><label class="f">Contracts / quote${num('q3',c.quoter.size,'1')}</label>
+    <label class="f">Min pool $/day${num('q4',c.quoter.min_daily_reward)}</label><label class="f">Max net contracts / market${num('q5',c.quoter.max_inventory,'1')}</label>
+    <label class="f">Max $ committed${num('q6',c.quoter.max_capital)}</label><label class="f">Stop N hours before settle${num('q7',c.quoter.pull_hours,'1')}</label>
+    <label class="f">Pull on move (¢)${num('q8',c.quoter.jump_cents,'1')}</label></div></div>
+   <div class="card"><h3 style="margin-top:0">Scanner</h3><div class="row"><label class="f">Every (sec)${num('s1',s.interval_sec,'10')}</label><label class="f">Min edge $/contract after fees${num('s2',s.min_edge)}</label>
+    <label class="f">Min 24h volume${num('s3',s.min_volume_24h,'1')}</label><label class="f">Max events scanned${num('s4',s.max_markets_scanned,'100')}</label>
+    ${strat.map(x=>`<label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" class="ss" value="${x}" ${s.strategies.includes(x)?'checked':''}>${x}</label>`).join('')}</div></div>
+   <button class="b pri" onclick="saveSettings()">Save settings</button>`;$('#sEnv').value=c.env}
+async function saveSettings(){const v=id=>+$('#'+id).value,env=$('#sEnv').value;
+  if(env==='prod'&&CFG.env!=='prod'&&!confirm('Switch to PRODUCTION? Orders will use real money.'))return;
+  const patch={env,risk:{max_order_cost:v('r1'),max_daily_spend:v('r2'),max_market_exposure:v('r3'),max_total_exposure:v('r4'),max_contracts_per_order:v('r5'),min_price:v('r6'),max_price:v('r7'),require_confirm_prod:$('#r8').checked,max_daily_loss:v('r9')},
+   quoter:{enabled:$('#q1').checked,max_markets:v('q2'),size:v('q3'),min_daily_reward:v('q4'),max_inventory:v('q5'),max_capital:v('q6'),pull_hours:v('q7'),jump_cents:v('q8')},
+   auto:{enabled:$('#a1').checked,strategies:[...document.querySelectorAll('.as:checked')].map(x=>x.value),max_order_cost:v('a2'),max_daily_spend:v('a3')},
+   scanner:{interval_sec:v('s1'),min_edge:v('s2'),min_volume_24h:v('s3'),max_markets_scanned:v('s4'),strategies:[...document.querySelectorAll('.ss:checked')].map(x=>x.value)}};
+  for(const e of ['demo','prod']){const k=$('#k_'+e).value.trim(),p=$('#p_'+e).value.trim();if(k)patch[e+'_key_id']=k;if(p)patch[e+'_private_key_path']=p}
+  if(patch.auto.enabled&&!CFG.auto.enabled&&!confirm('Turn ON auto-trading? Orders will be placed without asking you.'))return;
+  if(patch.quoter.enabled&&!CFG.quoter.enabled&&!confirm(`Turn ON the liquidity quoter in ${env.toUpperCase()}? It will place and cancel resting orders automatically.`))return;
+  try{const r=await api('/api/config',{method:'POST',body:patch});toast(r.authenticated?'Saved – API key is working':'Saved – no working key for '+r.config.env.toUpperCase()+' yet','ok');loadSettings();status()}catch(e){toast(e.message,'err');loadSettings();status()}}
+// boot
+(async()=>{const s=await api('/api/session');TOKEN=s.token;CFG=(await api('/api/config')).config;status();loadSignals();loadCats();setInterval(status,5000);setInterval(()=>{if(!$('#t-scanner').classList.contains('hide'))loadSignals()},20000)})();
+</script>
+</body>
+</html>
