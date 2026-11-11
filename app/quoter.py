@@ -53,6 +53,7 @@ class Quoter:
         self._lock = threading.RLock()
         self.mid_hist: dict[str, collections.deque] = {}
         self.last_cycle = 0.0
+        self.last_sweep = 0.0
         self.cycles = 0
 
     # ------------------------------------------------------------ helpers --
@@ -90,6 +91,30 @@ class Quoter:
             if e.status != 404:  # 404 = already filled/expired/cancelled
                 self.log("cancel_error", f"{ticker} {side}: {e}")
             return False
+
+    def sweep_strays(self, client) -> int:
+        """Cancel resting orders the quoter sent but is not tracking (a request whose reply was lost, or orders left
+        from before a crash). Matched by the client order ids in our own order log, so manual orders are never touched."""
+        ttl = max(120, int(self.cfg.get("quote_ttl_sec") or 600))
+        mine = {r["client_order_id"] for r in self.e.db.query(
+            "SELECT client_order_id FROM orders_log WHERE env=? AND source='quoter' AND ts>=? AND client_order_id IS NOT NULL",
+            (self.e.cfg.env, time.time() - ttl - 900))}
+        if not mine:
+            return 0
+        tracked = {q["oid"] for sides in self.quotes.values() for q in sides.values()}
+        n = 0
+        for o in client.orders(status="resting", max_items=1000):
+            if o.get("client_order_id") in mine and o.get("order_id") not in tracked:
+                try:
+                    client.cancel_order(o["order_id"], o.get("ticker"))
+                    n += 1
+                    self.log("stray", f"{o.get('ticker')}: cancelled untracked quoter order {o['order_id']}")
+                except KalshiError as e:
+                    if e.status != 404:
+                        self.log("cancel_error", f"stray {o.get('order_id')}: {e}")
+        if n:
+            self.e.db.audit("quoter_stray", f"cancelled {n} untracked quoter order(s)")
+        return n
 
     def on_feed(self, kind, msg):
         """Wake the quoter when a quoted market's book or one of our orders changes."""
@@ -182,6 +207,10 @@ class Quoter:
         if not self.active():
             if self.quotes:
                 self.cancel_all("quoter disabled / kill switch")
+                self.last_sweep = 0.0
+            if self.e.client.authenticated and time.time() - self.last_sweep >= 300:
+                self.last_sweep = time.time()      # also when off: nothing of the quoter's may stay resting
+                self.sweep_strays(self.e.client)
             if getattr(self.e, "feed", None):
                 self.e.feed.want("quoter", ())
             return
@@ -227,7 +256,11 @@ class Quoter:
                     self.log("gone", f"{t} {side} @{q['price']} no longer resting (filled or expired)")
 
         committed = sum((exposure.get(t, Decimal(0)) for t in sel), Decimal(0)) + sum(
-            (d(q["price"]) * d(self.cfg["size"]) for sides in self.quotes.values() for q in sides.values()), Decimal(0))
+            (d(q["price"]) * d(q.get("count") or self.cfg["size"]) for sides in self.quotes.values()
+             for q in sides.values() if not q.get("reduce")), Decimal(0))
+        if now - self.last_sweep >= 60:
+            self.last_sweep = now
+            self.sweep_strays(client)
 
         for t in sorted(sel):
             m = markets.get(t)
@@ -249,11 +282,22 @@ class Quoter:
                 continue
             pos = held.get(t, Decimal(0))
             inv = d(self.cfg["max_inventory"])
+            size = d(self.cfg["size"])
+            tick = Decimal("0.01")
+            # Each side: (intent, price in that side's terms, count, reducing?). A side that REDUCES the position is
+            # sent as a sell (same order on Kalshi's book as buying the other side), so it is never blocked by the
+            # capital cap or the buy limits - exiting must always be possible. At the inventory cap it steps 1c inside
+            # the spread when there is room, to get out ahead of the queue.
+            step = tick if (self.cfg.get("exit_step_in", True) and abs(pos) >= inv and ya - yb >= 2 * tick) else Decimal(0)
             want = {}
-            if pos < inv:
-                want["yes"] = ("buy_yes", yb)               # join best YES bid
-            if -pos < inv:
-                want["no"] = ("buy_no", ONE - ya)           # join best NO bid (= YES ask)
+            if pos < 0:
+                want["yes"] = ("sell_no", ONE - (yb + step), min(size, -pos), True)     # bid YES at yb(+1c) = sell NO
+            elif pos < inv:
+                want["yes"] = ("buy_yes", yb, size, False)                               # join best YES bid
+            if pos > 0:
+                want["no"] = ("sell_yes", ya - step, min(size, pos), True)               # ask YES at ya(-1c) = sell YES
+            elif -pos < inv:
+                want["no"] = ("buy_no", ONE - ya, size, False)                           # join best NO bid (= YES ask)
             for side in ("yes", "no"):
                 q = self.quotes.get(t, {}).get(side)
                 if side not in want:
@@ -261,25 +305,28 @@ class Quoter:
                         self._cancel(t, side)
                         self.log("inventory", f"{t}: net position {pos}; stopped quoting {side.upper()}")
                     continue
-                intent, px = want[side]
-                if q and d(q["price"]) == px and q["exp"] - now > 60:
-                    continue  # still at the top and not about to expire
+                intent, px, cnt, reduce = want[side]
+                if q and q.get("intent", intent) == intent and d(q["price"]) == px and d(q.get("count") or size) == cnt \
+                        and q["exp"] - now > 60:
+                    continue  # unchanged and not about to expire
                 if q:
                     self._cancel(t, side)
-                    committed -= d(q["price"]) * d(self.cfg["size"])
-                add = px * d(self.cfg["size"])
-                if committed + add > d(self.cfg["max_capital"]):
+                    if not q.get("reduce"):
+                        committed -= d(q["price"]) * d(q.get("count") or size)
+                add = Decimal(0) if reduce else px * cnt
+                if not reduce and committed + add > d(self.cfg["max_capital"]):
                     continue
                 # longer-lived quotes keep their place in the queue; still expire on their own if the app dies
                 exp = int(now + max(120, int(self.cfg.get("quote_ttl_sec") or 600), int(self.cfg["refresh_sec"]) * 6))
                 try:
-                    r = self.e.place(ticker=t, intent=intent, price=px, count=self.cfg["size"], source="quoter",
+                    r = self.e.place(ticker=t, intent=intent, price=px, count=cnt, source="quoter",
                                      strategy="liquidity", time_in_force="good_till_canceled", post_only=True,
                                      expiration_time=exp, market=m)
                     k = r["kalshi"]
                     if d(k.get("remaining_count")) > 0:
                         self.quotes.setdefault(t, {})[side] = {"oid": k["order_id"], "price": str(px), "exp": exp,
-                                                               "client": client, "placed": time.time()}
+                                                               "client": client, "placed": time.time(), "intent": intent,
+                                                               "count": str(cnt), "reduce": reduce}
                         committed += add
                     if d(k.get("fill_count")) > 0:
                         self.log("fill", f"{t} {intent} {k['fill_count']} @ {px} filled on placement")
@@ -330,6 +377,7 @@ class Quoter:
 
     def snapshot(self):
         return {"state": self.state, "selected": self._fmt(self.selected),
-                "quotes": [{"ticker": t, "side": s, "price": q["price"], "expires": q["exp"]}
+                "quotes": [{"ticker": t, "side": s, "price": q["price"], "expires": q["exp"], "reduce": bool(q.get("reduce")),
+                            "count": q.get("count")}
                            for t, sides in self.quotes.items() for s, q in sides.items()],
                 "events": list(self.events)[:100]}

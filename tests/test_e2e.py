@@ -208,6 +208,73 @@ def run(keytype: str):
     q.cycle()
     sides = {x["side"] for x in c.get("/api/quoter").json()["quotes"]}
     check("inventory cap: long 35 YES -> only NO quoted", sides == {"no"}, sides)
+    lo = [o for o in mock.state.S["orders"].values() if o["ticker"] == "KXA-1" and o["status"] == "resting"]
+    check("exit: at the cap the reducing quote is 1c inside the spread (ask YES .56 between .55/.57)",
+          len(lo) == 1 and lo[0]["book_side"] == "ask" and lo[0]["yes_price_dollars"] == "0.5600", lo)
+    lg = db.query("SELECT intent, count FROM orders_log WHERE source='quoter' ORDER BY id DESC LIMIT 1")[0]
+    check("exit: sent as a SELL of the held YES (closing order, exempt from buy limits)", lg["intent"] == "sell_yes" and float(lg["count"]) == 10, lg)
+    # capital cap can't block an exit; small position -> exit sized to the position, other side still opens
+    old_cap = cfg.quoter["max_capital"]
+    cfg.update({"quoter": {"max_capital": 1}})
+    mock.state.S["positions"]["KXA-1"] = {"pos": d("4"), "exp": d("2"), "fees": d("0")}
+    eng.positions_cache["ts"] = 0
+    q.cycle()
+    qs = {x["side"]: x for x in c.get("/api/quoter").json()["quotes"]}
+    check("exit: allowed even when the capital cap is used up; opening side blocked by the cap",
+          set(qs) == {"no"} and qs["no"]["reduce"] and float(qs["no"]["count"]) == 4 and qs["no"]["price"] == "0.5700", qs)   # sell YES at the .57 ask
+    cfg.update({"quoter": {"max_capital": old_cap}})
+    q.cycle()
+    qs = {x["side"]: x for x in c.get("/api/quoter").json()["quotes"]}
+    check("small long: YES side keeps bidding, NO side exits", set(qs) == {"yes", "no"} and not qs["yes"]["reduce"] and qs["no"]["reduce"], qs)
+    mock.state.S["positions"]["KXA-1"] = {"pos": d("-35"), "exp": d("17"), "fees": d("0")}
+    eng.positions_cache["ts"] = 0
+    q.cycle()
+    lg = db.query("SELECT intent, price, count FROM orders_log WHERE source='quoter' AND status='placed' ORDER BY id DESC LIMIT 1")[0]
+    lo = [o for o in mock.state.S["orders"].values() if o["ticker"] == "KXA-1" and o["status"] == "resting"]
+    check("short 35 (NO) at the cap: only a reducing bid, 1c inside (bid YES .56 = sell NO .44)",
+          len(lo) == 1 and lo[0]["book_side"] == "bid" and lo[0]["yes_price_dollars"] == "0.5600" and lg["intent"] == "sell_no", (lo, lg))
+    mock.state.S["positions"]["KXA-1"] = {"pos": d("35"), "exp": d("17"), "fees": d("0")}
+    eng.positions_cache["ts"] = 0
+    q.cycle()
+    # stray orders: one the quoter sent but lost track of is cancelled; a manual order is never touched
+    tracked = {x["oid"] for sd in q.quotes.values() for x in sd.values()}
+    lost = eng.place(ticker="KXA-1", intent="buy_yes", price="0.50", count=1, source="quoter", strategy="liquidity", post_only=True)
+    r_man = c.post("/api/order", headers=H, json={"ticker": "KXB-1", "intent": "buy_yes", "price": "0.30", "count": 1}).json()
+    man_oid = r_man["kalshi"]["order_id"]
+    n = q.sweep_strays(eng.client)
+    O = mock.state.S["orders"]
+    check("stray sweep: untracked quoter order cancelled", n == 1 and O[lost["kalshi"]["order_id"]]["status"] == "canceled", n)
+    check("stray sweep: tracked quotes and manual orders untouched", O[man_oid]["status"] == "resting"
+          and all(O[o]["status"] == "resting" for o in tracked))
+    c.delete(f"/api/order/{man_oid}?ticker=KXB-1", headers=H)
+    # lost reply: logged as unknown with its client id
+    real_create = eng.client.create_order
+
+    def boom(*a, **k):
+        import requests as _rq
+        raise _rq.ConnectionError("Connection aborted.")
+    eng.client.create_order = boom
+    try:
+        eng.place(ticker="KXB-1", intent="buy_yes", price="0.30", count=1, source="manual")
+        unk = False
+    except Exception:
+        unk = True
+    eng.client.create_order = real_create
+    row = db.query("SELECT status, client_order_id, error FROM orders_log ORDER BY id DESC LIMIT 1")[0]
+    check("lost reply: order logged as 'unknown' with its client id + audit", unk and row["status"] == "unknown" and row["client_order_id"]
+          and db.query("SELECT 1 FROM audit WHERE kind='order_unknown'"), row)
+    # resting buy orders count toward exposure limits
+    lim = cfg.risk["max_market_exposure"]
+    r1 = c.post("/api/order", headers=H, json={"ticker": "KXB-1", "intent": "buy_yes", "price": "0.30", "count": 60})   # $18 resting
+    cfg.update({"risk": {"max_market_exposure": 30}})
+    r2 = c.post("/api/order", headers=H, json={"ticker": "KXB-1", "intent": "buy_yes", "price": "0.30", "count": 60})   # 18 + 18 > 30
+    check("resting orders count toward the per-market limit", r1.status_code == 200 and r2.status_code == 400 and "resting" in r2.text, r2.text)
+    r3 = c.post("/api/order", headers=H, json={"ticker": "KXB-1", "intent": "buy_yes", "price": "0.30", "count": 30})   # 18 + 9 <= 30
+    check("...and an order that still fits is accepted", r3.status_code == 200, r3.text)
+    for o in list(O.values()):
+        if o["ticker"] == "KXB-1" and o["status"] == "resting":
+            c.delete(f"/api/order/{o['order_id']}?ticker=KXB-1", headers=H)
+    cfg.update({"risk": {"max_market_exposure": lim}})
     cfg.update({"quoter": {"enabled": False}})
     q.cycle()
     still = [o for o in mock.state.S["orders"].values() if o["ticker"] == "KXA-1" and o["status"] == "resting"]

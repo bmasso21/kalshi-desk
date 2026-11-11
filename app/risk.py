@@ -28,7 +28,8 @@ def order_cost(intent: str, price) -> Decimal:
 
 
 def check(cfg, *, intent: str, price, count, market: dict | None, positions: dict | None,
-          spent: dict, source: str = "manual", category: str | None = None) -> Decimal:
+          spent: dict, source: str = "manual", category: str | None = None,
+          resting: list | None = None) -> Decimal:
     """Raise RiskError if the order breaks a limit. Returns $ cost of the order.
     spent = {"all": $ filled on buys today, "auto": $ filled by auto/quoter today}."""
     r = cfg.risk
@@ -66,14 +67,28 @@ def check(cfg, *, intent: str, price, count, market: dict | None, positions: dic
 
     if positions is not None and market is not None:
         mps = positions.get("market_positions", [])
+        # resting orders could all fill: count their worst-case cost too (None = caller has its own cap, e.g. the quoter)
+        rest_mkt = sum((resting_cost(o) for o in resting or [] if o.get("ticker") == market.get("ticker")), Decimal(0))
+        rest_all = sum((resting_cost(o) for o in resting or []), Decimal(0))
         mkt_exp = sum((abs(d(mp.get("market_exposure_dollars"))) for mp in mps
                        if mp.get("ticker") == market.get("ticker")), Decimal(0))
-        if mkt_exp + cost > d(r["max_market_exposure"]):
-            raise RiskError(f"Market exposure ${mkt_exp:.2f} + ${cost:.2f} > ${r['max_market_exposure']}")
+        if mkt_exp + rest_mkt + cost > d(r["max_market_exposure"]):
+            raise RiskError(f"Market exposure ${mkt_exp:.2f} + ${rest_mkt:.2f} resting + ${cost:.2f} > ${r['max_market_exposure']}")
         tot = sum((abs(d(mp.get("market_exposure_dollars"))) for mp in mps), Decimal(0))
-        if tot + cost > d(r["max_total_exposure"]):
-            raise RiskError(f"Total exposure ${tot:.2f} + ${cost:.2f} > ${r['max_total_exposure']}")
+        if tot + rest_all + cost > d(r["max_total_exposure"]):
+            raise RiskError(f"Total exposure ${tot:.2f} + ${rest_all:.2f} resting + ${cost:.2f} > ${r['max_total_exposure']}")
     return cost
+
+
+def resting_cost(o: dict) -> Decimal:
+    """Worst-case $ a resting order costs if it fills: a bid on the YES book buys YES at its price, an ask buys NO
+    at 1 - price (an ask that only closes a YES position is over-counted: conservative)."""
+    rem = d(o.get("remaining_count_fp") if o.get("remaining_count_fp") is not None else o.get("remaining_count"))
+    if rem <= 0 or (o.get("status") or "resting") != "resting":
+        return Decimal(0)
+    yp = d(o.get("yes_price_dollars"))
+    side = o.get("book_side") or ("bid" if (o.get("outcome_side") or o.get("side")) == "yes" else "ask")
+    return rem * (yp if side == "bid" else Decimal(1) - yp)
 
 
 def to_book(intent: str, price) -> tuple[str, Decimal]:

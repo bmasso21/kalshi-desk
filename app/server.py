@@ -73,6 +73,8 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             except Exception as e:
                 db.audit("mm_error", f"resume: {e}"[:500])
             eng.alerts.startup(__version__)
+            if getattr(cfg, "recovered", None):
+                db.audit("connect_error", f"SETTINGS FILE WAS DAMAGED: {cfg.recovered}. Check Settings (keys, limits, alerts).")
 
     @app.on_event("shutdown")
     def _stop():
@@ -269,6 +271,8 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 errors.append(f"Circuit breaker tripped for {', '.join(blocked)} - reset it first")
         if isinstance(patch.get("quoter"), dict):
             qp = patch["quoter"]
+            if "exit_step_in" in qp:
+                qp["exit_step_in"] = bool(qp["exit_step_in"])
             for k, lo, hi in (("quote_ttl_sec", 120, 3600), ("max_volume_24h", 0, 10 ** 9)):
                 if k in qp:
                     try:
@@ -646,6 +650,8 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                           ("burst_contracts", 0, 10 ** 7), ("burst_pull_min", 1, 240)):
             if b.get(k) is not None:
                 p[k] = max(lo, min(hi, float(b[k])))
+        if b.get("exit_step_in"):
+            p["exit_step_in"] = True
         if b.get("name"):
             p["name"] = str(b["name"])[:80]
         try:

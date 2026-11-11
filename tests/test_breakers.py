@@ -173,7 +173,31 @@ def api_tests(tmp):
     check("tax export: total = cash flow - fees", "net 5.37" in lines[-1] and ",5.71,0.34" in lines[-1], lines[-1])
 
 
+def config_tests(tmp):
+    from app.config import Config
+    p = Path(tmp) / "c" / "config.json"
+    p.parent.mkdir()
+    cfg = Config(p)
+    cfg.update({"risk": {"max_order_cost": 7}})
+    cfg.update({"risk": {"max_order_cost": 9}})
+    bak = p.with_suffix(".json.bak")
+    check("config save is atomic: no temp file left, previous good copy kept as .bak",
+          not p.with_suffix(".json.tmp").exists() and json.loads(bak.read_text())["risk"]["max_order_cost"] == 7
+          and json.loads(p.read_text())["risk"]["max_order_cost"] == 9)
+    p.write_text('{"env": "demo", "risk": {"max_ord')          # simulate a file cut off mid-write
+    c2 = Config(p)
+    check("damaged config: restored from the backup instead of silently resetting", c2.data["risk"]["max_order_cost"] == 7
+          and "restored" in (c2.recovered or "") and p.with_suffix(".json.damaged").exists(), c2.recovered)
+    check("restored config is written back as valid JSON", json.loads(p.read_text())["risk"]["max_order_cost"] == 7)
+    p.write_text("")
+    bak.unlink()
+    c3 = Config(p)
+    check("damaged config with no backup: safe defaults (demo, quoter and auto off)", c3.env == "demo" and not c3.quoter["enabled"]
+          and not c3.auto["enabled"] and "defaults" in c3.recovered, c3.recovered)
+
+
 if __name__ == "__main__":
+    config_tests(tempfile.mkdtemp())
     unit_tests()
     api_tests(tempfile.mkdtemp())
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")

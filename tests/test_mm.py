@@ -192,6 +192,13 @@ def sim_tests():
     # -> ours qualifies, df 1.0 -> share 10/260
     exp = 0.001 * 10 * (0 + 10 / 260) / 2
     check("offset: scored per Kalshi's walk (YES behind the walk earns 0, NO qualifies)", close(d2.s["reward"], exp, 1e-12), (d2.s["reward"], exp))
+    d3 = mm.SimQuoter(INFO, {**P, "exit_step_in": True}, "queue")
+    d3.s["pos_yes"] = 30
+    d3.requote(8000, MK, YES, NO)
+    check("exit step-in: at the cap, only the reducing side quotes, 1c inside with nobody ahead",
+          set(d3.s["quotes"]) == {"no"} and d3.s["quotes"]["no"]["px"] == 0.59 and d3.s["quotes"]["no"]["ahead"] == 0, d3.s["quotes"])
+    d3.requote(8001, MK, YES, [(0.59, 50.0)])
+    check("exit step-in: no step when the spread is 1c", d3.s["quotes"]["no"]["px"] == 0.59 and (1 - 0.59) - 0.40 < 0.02)
     s.settle("no")
     check("settled market: quotes dropped, value = payout", not s.s["quotes"] and s.value(0.5) == s.s["pos_no"])
 
@@ -261,7 +268,7 @@ def integration_tests(tmp):
     ids = sh3.start_set(sc, {"n_markets": 5, "size": 10, "poll_sec": 10, "per_series": 3})
     names = [json.loads(r["params"])["name"] for r in wdb.query(f"SELECT params FROM mm_runs WHERE id IN ({','.join(map(str, ids))}) ORDER BY id")]
     check("variant set: quiet-market preset skipped when no market qualifies (mock volume 500)",
-          len(ids) == 3 and not any("quiet" in n for n in names) and any("quiet" in x for x in sh3.last_skipped), (names, sh3.last_skipped))
+          len(ids) == 4 and not any("quiet" in n for n in names) and any("quiet" in x for x in sh3.last_skipped), (names, sh3.last_skipped))
     clock["t"] += 10
     sh3.step()
     off = next(r for r in sh3.runs.values() if r.p.get("offset_ticks"))
@@ -283,9 +290,9 @@ def integration_tests(tmp):
     check("pull variant: YES side paused after its fill", ps["side_pause"].get("yes", 0) > clock["t"] and ps["fill_pauses"] >= 1, ps)
     check("baseline keeps quoting after the same trade", "yes" in base_run.sims[("KXA-1", "queue")].s["quotes"])
     reps = [mm.report(wdb, i, live=sh3, now=clock["t"]) for i in ids]
-    check("reports per run carry the variant name", all(r["name"] for r in reps) and len(reps) == 3)
+    check("reports per run carry the variant name", all(r["name"] for r in reps) and len(reps) == 4)
     sh3.stop(ids[0])
-    check("stop one run keeps the others", ids[0] not in sh3.runs and len(sh3.runs) == 2
+    check("stop one run keeps the others", ids[0] not in sh3.runs and len(sh3.runs) == 3
           and wdb.query("SELECT status FROM mm_runs WHERE id=?", (ids[0],))[0]["status"] == "stopped")
     sh3.stop()
     check("stop all", not sh3.runs)
@@ -320,11 +327,11 @@ def integration_tests(tmp):
     check("a second run can start alongside (offset clamped to 5)", r2.status_code == 200 and r2.json()["params"]["offset_ticks"] == 5
           and len(app.state.mm[1].runs) == 2, r2.text)
     r3 = c.post("/api/mm/shadow/start_set", headers=H, json={"n_markets": 5})
-    check("variant set via API (quiet preset skipped on the mock)", r3.status_code == 200 and len(r3.json()["ids"]) == 3 and r3.json()["skipped"], r3.text)
+    check("variant set via API (quiet preset skipped on the mock)", r3.status_code == 200 and len(r3.json()["ids"]) == 4 and r3.json()["skipped"], r3.text)
     check("shadow re-places like the live quoter (quote lifetime - 60s)", r3.json()["params"]["requeue_sec"] == 540)
     time.sleep(0.5)
     j = c.get("/api/mm").json()
-    check("status lists every run", len(j["shadow"]["runs"]) == 5 and len(j["reports"]) == 5, j["shadow"])
+    check("status lists every run", len(j["shadow"]["runs"]) == 6 and len(j["reports"]) == 6, j["shadow"])
     time.sleep(0.5)
     check("shadow stop", c.post("/api/mm/shadow/stop", headers=H).status_code == 200 and not app.state.mm[1].status()["alive"])
     check("report endpoint", c.get("/api/mm/report").status_code == 200)

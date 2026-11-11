@@ -549,13 +549,16 @@ class SimQuoter:
         net = s["pos_yes"] - s["pos_no"]
         off = int(p.get("offset_ticks") or 0) * TICK          # quote this far behind the best bid
         ylv, nlv = dict(yes_lv), dict(no_lv)
+        # like the live quoter: at the inventory cap the reducing side steps 1c inside the spread when there is room
+        room = (1 - nb) - yb >= 2 * TICK - EPS
+        step = TICK if (p.get("exit_step_in") and abs(net) >= inv and room) else 0.0
         want = {}
         if net < inv and s["side_pause"].get("yes", 0.0) <= now:
-            px = round(yb - off, 4)
+            px = round(yb + step, 4) if (step and net < 0) else round(yb - off, 4)
             if px >= 0.01:
                 want["yes"] = (px, ylv.get(px, 0.0))
         if -net < inv and s["side_pause"].get("no", 0.0) <= now:
-            px = round(nb - off, 4)
+            px = round(nb + step, 4) if (step and net > 0) else round(nb - off, 4)
             if px >= 0.01:
                 want["no"] = (px, nlv.get(px, 0.0))
         requeue = float(p.get("requeue_sec", 60))
@@ -593,6 +596,7 @@ PRESETS = [
     {"name": "quiet markets only (<= 10 contracts traded in 24h)", "max_volume_24h": 10},
     {"name": "1c behind the best bid", "offset_ticks": 1},
     {"name": "pull after fills / bursts", "pull_after_fill_min": 10, "burst_contracts": 200, "burst_pull_min": 10},
+    {"name": "exit: step 1c inside at the inventory cap", "exit_step_in": True},
 ]
 
 
@@ -666,7 +670,7 @@ class Shadow:
             p = {"name": "custom", "n_markets": 20, "size": 10, "poll_sec": 15, "max_days": 21, "max_inventory": 30,
                  "pull_hours": 6, "jump_cents": 4, "cooldown_min": 10, "refresh_sec": 15, "min_mid": 0.15, "max_mid": 0.85,
                  "max_spread": 0.06, "requeue_sec": 60, "per_series": 3, "offset_ticks": 0, "max_volume_24h": 0,
-                 "pull_after_fill_min": 0, "burst_contracts": 0, "burst_pull_min": 10, **params}
+                 "pull_after_fill_min": 0, "burst_contracts": 0, "burst_pull_min": 10, "exit_step_in": False, **params}
             sc, k, picked = self._pick(scanner, p)
             fee_types: dict[str, dict] = {}
             for r in picked:

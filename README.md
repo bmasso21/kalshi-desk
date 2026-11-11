@@ -134,6 +134,18 @@ blend behind the *hourly* markets, not what the daily markets settle on, so v2.1
 - The quoter's market picker now uses the same scoring (it used a simpler size ratio).
 - Backtester: filled/expired orders are dropped from the matching loop (same results, much faster on long runs).
 
+### Hardening (v3.1)
+- **Quoter exits.** The side that reduces a position is sent as a sell of what you hold (sized to the position), so it is
+  never blocked by the capital cap or the buy limits. At the inventory cap it steps 1c inside the spread when the spread is
+  2c or wider (*exit_step_in*, on by default). Without this, a full cap stopped the quoter until settlement.
+- **Stray orders.** If Kalshi's reply to an order is lost, the order is logged as `unknown` with its client id and audited.
+  Every minute (and when it is switched off) the quoter cancels any resting order it sent but is not tracking - matched by
+  client id, so manual orders are never touched. Also cleans up after a crash.
+- **Resting orders count** toward the per-market and total exposure limits (worst case: they all fill). The quoter is
+  governed by its own capital cap instead.
+- **Settings file** is written atomically with a `.bak` of the last good copy; a damaged file is restored from it (or safe
+  defaults) and you are alerted.
+
 ### Circuit breakers (v3.0) - Settings
 Every 5 minutes, for the current environment:
 - **Per strategy**: P&L of that strategy's own fills (today and last 7 days), each fill marked to the market (settled

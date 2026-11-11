@@ -1,5 +1,5 @@
-fastapi>=0.110
-uvicorn>=0.29
-requests>=2.31
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+requests>=2.31,<3
 cryptography>=42
-websockets>=15.0
+websockets>=15.0,<17

@@ -210,8 +210,13 @@ class Engine:
                 except Exception:
                     pass
             spent = self.spent_today(max_age=0 if source != "quoter" else 5) if intent.startswith("buy") else {}
+            resting = None
+            if intent.startswith("buy") and source != "quoter":      # the quoter has its own capital cap
+                resting = self.feed.resting_orders() if getattr(self, "feed", None) else None
+                if resting is None:
+                    resting = self.client.orders(status="resting", max_items=1000)
             cost = risk.check(self.cfg, intent=intent, price=price, count=count, market=market,
-                              positions=positions, spent=spent, source=source, category=cat)
+                              positions=positions, spent=spent, source=source, category=cat, resting=resting)
             if intent.startswith("sell"):
                 held = self._held(positions, ticker)
                 want = d(count)
@@ -233,6 +238,13 @@ class Engine:
                                             client_order_id=coid)
         except KalshiError as e:
             rid = self.db.log_order(**base, status="rejected", error=str(e), raw=e.payload)
+            raise
+        except Exception as e:
+            # connection dropped mid-request: Kalshi may or may not have the order. Logged with its client id so it
+            # can be found (the quoter cancels its own strays; manual ones show under Resting orders).
+            self.db.log_order(**base, status="unknown", error=f"no response - order may be live on Kalshi: {e}"[:300])
+            self.db.audit("order_unknown", f"{ticker} {intent} {count}@{price} ({source}): no response from Kalshi; "
+                                           f"check Resting orders. client_order_id {coid}")
             raise
         rid = self.db.log_order(**base, status="placed", order_id=resp.get("order_id"),
                                 fill_count=resp.get("fill_count"), avg_fill_price=resp.get("average_fill_price"),

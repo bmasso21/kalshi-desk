@@ -62,6 +62,7 @@ DEFAULTS = {
         "max_spread": 0.06,
         "quote_ttl_sec": 600,           # each quote expires on its own after this (re-placed 60s before; keeps queue priority)
         "max_volume_24h": 0,            # skip markets that traded more than this in 24h (0 = no limit)
+        "exit_step_in": True,           # at the inventory cap, the reducing quote steps 1c inside the spread (if >= 2c wide)
     },
     # --- circuit breakers (Phase 3) - every limit 0 = off until you set it ----------
     "breakers": {
@@ -163,14 +164,49 @@ class Config:
     def load(self):
         with self._lock:
             if self.path.exists():
-                self.data = _merge(DEFAULTS, json.loads(self.path.read_text("utf-8")))
+                try:
+                    raw = json.loads(self.path.read_text("utf-8"))
+                    if not isinstance(raw, dict):
+                        raise ValueError("config is not an object")
+                    self.recovered = None
+                except (ValueError, OSError) as e:
+                    # damaged file (e.g. power loss mid-write on an older version): use the last good copy
+                    bak = self.path.with_suffix(".json.bak")
+                    raw = json.loads(bak.read_text("utf-8")) if bak.exists() else {}
+                    self.recovered = f"config.json unreadable ({e}); " + ("restored from config.json.bak" if raw else "defaults loaded")
+                    try:
+                        self.path.replace(self.path.with_suffix(".json.damaged"))
+                    except OSError:
+                        pass
+                    self.data = _merge(DEFAULTS, raw)
+                    self._write()
+                    return
+                self.data = _merge(DEFAULTS, raw)
             else:
+                self.recovered = None
                 self.data = json.loads(json.dumps(DEFAULTS))
-                self.path.write_text(json.dumps(self.data, indent=2), "utf-8")
+                self._write()
+
+    def _write(self):
+        """Atomic: write a temp file, flush to disk, then swap it in. The previous good file is kept as .bak."""
+        txt = json.dumps(self.data, indent=2)
+        tmp = self.path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(txt)
+            f.flush()
+            os.fsync(f.fileno())
+        if self.path.exists():
+            try:
+                json.loads(self.path.read_text("utf-8"))
+                bak = self.path.with_suffix(".json.bak")
+                bak.write_bytes(self.path.read_bytes())
+            except (ValueError, OSError):
+                pass
+        os.replace(tmp, self.path)
 
     def save(self):
         with self._lock:
-            self.path.write_text(json.dumps(self.data, indent=2), "utf-8")
+            self._write()
 
     def update(self, patch: dict):
         self.data = _merge(self.data, patch)

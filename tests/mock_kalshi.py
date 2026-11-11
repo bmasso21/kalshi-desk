@@ -247,7 +247,7 @@ def create_mock(public_keys: dict[str, object]):
             S["fills"].append({"ticker": b["ticker"], "book_side": b["side"], "count_fp": f"{fill:.2f}",
                                "yes_price_dollars": f"{fillpx:.4f}", "fee_cost": "0.0200", "is_taker": True,
                                "created_time": "2026-11-10T21:00:00Z"})
-        S["orders"][oid] = {"order_id": oid, "ticker": b["ticker"], "book_side": b["side"],
+        S["orders"][oid] = {"order_id": oid, "client_order_id": b.get("client_order_id"), "ticker": b["ticker"], "book_side": b["side"],
                             "outcome_side": "yes" if b["side"] == "bid" else "no",
                             "status": "resting" if remaining > 0 else "executed",
                             "yes_price_dollars": b["price"], "no_price_dollars": f"{1 - p:.4f}",
