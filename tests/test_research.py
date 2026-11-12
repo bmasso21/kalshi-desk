@@ -178,6 +178,32 @@ def main():
     q = wdb.query
     tick = {r["ticker"]: r for r in q("SELECT * FROM wh_markets")}
     check("sync ran without errors", st["errors"] == 0 and wh.state["error"] is None, (st, wh.state))
+    # rate limits (HTTP 429) are shared with the scanner / quoter / paper test: retried, and one bad series never aborts a sync
+    from app.kalshi_client import KalshiError
+    type(wh).RETRY_429 = (0, 0, 0)
+    calls = {"n": 0}
+    real_sm = wh._sync_markets
+
+    def flaky(s_, since_, cut_):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise KalshiError(429, {"code": "too_many_requests"})
+        return real_sm(s_, since_, cut_)
+    wh._sync_markets = flaky
+    st2 = wh.sync()
+    check("sync: 429 on the market list is retried, sync completes", st2["errors"] == 0 and calls["n"] == 3 and wh.state["error"] is None
+          and wh.state["last_sync"], (st2, calls, wh.state["error"]))
+    n_err = len(eng.db.query("SELECT 1 FROM audit WHERE kind='warehouse_error'"))
+
+    def always(s_, since_, cut_):
+        raise KalshiError(429, {"code": "too_many_requests"})
+    wh._sync_markets = always
+    st3 = wh.sync()
+    check("sync: a series that keeps failing is counted, the rest of the sync still finishes (no crash entry in the audit log)",
+          st3["errors"] >= 1 and wh.state["last_sync"] and len(eng.db.query("SELECT 1 FROM audit WHERE kind='warehouse_error'")) == n_err, st3)
+    wh._sync_markets = real_sm
+    wh.state["error"] = None
+    type(wh).RETRY_429 = (5, 15, 45)
     check("tag filter: untagged weather series (hurricanes) skipped", "KXHURR-26NOV-X" not in tick and
           not any(qp.get("series_ticker") == "KXHURR" for _, qp in dm.state.calls))
     check("only in-scope series collected (weather, not NFL)", set(r["series_ticker"] for r in tick.values()) == {"KXHIGHNY"}

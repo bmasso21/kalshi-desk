@@ -68,6 +68,8 @@ DEFAULTS = {
         "universe": "all",              # trading-first candidates: "all" open markets, or "rewards" = only markets with a reward program
         "min_volume_24h": 50,           # trading-first, markets without a reward program: need at least this 24h volume
         "exit_step_in": True,           # at the inventory cap, the reducing quote steps 1c inside the spread (if >= 2c wide)
+        "offset_ticks": 0,              # opening quotes rest this many cents BEHIND the best bid (0 = join the best bid)
+        "max_move": 0,                  # trading-first: skip markets whose price moved more than this since yesterday's close (0 = off; 0.03 = 3c)
     },
     # --- limits that scale with the account (see app/scaling.py); tiers default to scaling.DEFAULT_TIERS ---
     "scaling": {

@@ -219,6 +219,19 @@ def run(keytype: str):
     n_orders = len(mock.state.S["orders"])
     q.cycle()
     check("unchanged book -> no requote churn", len(mock.state.S["orders"]) == n_orders)
+    r_ = c.post("/api/config", headers=H, json={"quoter": {"offset_ticks": 1, "max_move": 0.03}})
+    check("quoter options saved (1c behind, calm markets)", r_.status_code == 200 and cfg.quoter["offset_ticks"] == 1 and cfg.quoter["max_move"] == 0.03, r_.text)
+    q.cycle()
+    qs = {x["side"]: x for x in c.get("/api/quoter").json()["quotes"]}
+    check("offset 1: the opening quote rests 1c behind the best bid; the quote that reduces the position does not move back",
+          qs["no"]["price"] == "0.4700" and not qs["no"]["reduce"] and qs["yes"]["price"] == "0.5000" and qs["yes"]["reduce"], qs)
+    c.post("/api/config", headers=H, json={"quoter": {"offset_ticks": 99}})
+    check("offset is capped at 5c", cfg.quoter["offset_ticks"] == 5)
+    c.post("/api/config", headers=H, json={"quoter": {"offset_ticks": 0, "max_move": 0}})
+    q.cycle()
+    qs = {x["side"]: x for x in c.get("/api/quoter").json()["quotes"]}
+    check("offset 0: back at the best bid", qs["yes"]["price"] == "0.5000" and qs["no"]["price"] == "0.4800", qs)
+    n_orders = len(mock.state.S["orders"])
     mk = mock.state.S["events"][0]["markets"][0]
     mk.update(yes_bid_dollars="0.5500", yes_ask_dollars="0.5700", no_bid_dollars="0.4300", no_ask_dollars="0.4500")
     q.cycle()

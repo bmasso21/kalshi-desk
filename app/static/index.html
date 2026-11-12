@@ -378,7 +378,9 @@ async function loadSettings(){const j=await api('/api/config');CFG=j.config;cons
     <label class="f">Pull on move (¢)${num('q8',c.quoter.jump_cents,'1')}</label><label class="f">Quote lifetime (sec)${num('q9',c.quoter.quote_ttl_sec,'10')}</label>
     <label class="f">Skip markets with 24h volume above (0 = no limit)${num('q10',c.quoter.max_volume_24h,'1')}</label>
     <label class="f">Pick markets by<select id="q11"><option value="trading" ${c.quoter.select_by!=='rewards'?'selected':''}>Trading edge first (rewards = bonus)</option><option value="rewards" ${c.quoter.select_by==='rewards'?'selected':''}>Reward payout</option></select></label>
-    <label class="f">Min spread (trading-first)${num('q12',c.quoter.min_spread??0.02)}</label></div></div>
+    <label class="f">Min spread (trading-first)${num('q12',c.quoter.min_spread??0.02)}</label>
+    <label class="f" title="Opening quotes rest this many cents behind the best bid. 0 = join the best bid. Fewer fills, more spread kept per fill.">Quote N¢ behind the best bid${num('q13',c.quoter.offset_ticks??0,'1')}</label>
+    <label class="f" title="Trading-first: skip markets whose price moved more than this since yesterday's close. 0 = off; 0.03 = 3 cents.">Calm markets only: max move since yesterday (0 = off)${num('q14',c.quoter.max_move??0)}</label></div></div>
    <div class="card" data-g="strat"><h3 style="margin-top:0">Scanner</h3><div class="row"><label class="f">Every (sec)${num('s1',s.interval_sec,'10')}</label><label class="f">Min edge $/contract after fees${num('s2',s.min_edge)}</label>
     <label class="f">Min 24h volume${num('s3',s.min_volume_24h,'1')}</label><label class="f">Max events scanned${num('s4',s.max_markets_scanned,'100')}</label>
     ${strat.map(x=>`<label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" class="ss" value="${x}" ${s.strategies.includes(x)?'checked':''}>${x}</label>`).join('')}</div></div>
@@ -470,7 +472,7 @@ async function saveSettings(){const v=id=>+$('#'+id).value,env=$('#sEnv').value;
   const patch={env,risk:{max_order_cost:v('r1'),max_daily_spend:v('r2'),max_market_exposure:v('r3'),max_total_exposure:v('r4'),max_contracts_per_order:v('r5'),min_price:v('r6'),max_price:v('r7'),require_confirm_prod:$('#r8').checked,max_daily_loss:v('r9')},
    scaling:{enabled:$('#sc1').checked},
    breakers:{strategy_daily_loss:v('b1'),strategy_7d_loss:v('b2'),account_drawdown:v('b3'),drawdown_days:v('b4')},
-   quoter:{enabled:$('#q1').checked,max_markets:v('q2'),size:v('q3'),min_daily_reward:v('q4'),max_inventory:v('q5'),max_capital:v('q6'),pull_hours:v('q7'),jump_cents:v('q8'),quote_ttl_sec:v('q9'),max_volume_24h:v('q10'),select_by:$('#q11').value,min_spread:v('q12')},
+   quoter:{enabled:$('#q1').checked,max_markets:v('q2'),size:v('q3'),min_daily_reward:v('q4'),max_inventory:v('q5'),max_capital:v('q6'),pull_hours:v('q7'),jump_cents:v('q8'),quote_ttl_sec:v('q9'),max_volume_24h:v('q10'),select_by:$('#q11').value,min_spread:v('q12'),offset_ticks:v('q13'),max_move:v('q14')},
    auto:{enabled:$('#a1').checked,strategies:[...document.querySelectorAll('.as:checked')].map(x=>x.value),max_order_cost:v('a2'),max_daily_spend:v('a3')},
    scanner:{interval_sec:v('s1'),min_edge:v('s2'),min_volume_24h:v('s3'),max_markets_scanned:v('s4'),strategies:[...document.querySelectorAll('.ss:checked')].map(x=>x.value)}};
   for(const e of ['demo','prod']){const k=$('#k_'+e).value.trim(),p=$('#p_'+e).value.trim();if(k)patch[e+'_key_id']=k;if(p)patch[e+'_private_key_path']=p}

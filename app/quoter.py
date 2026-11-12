@@ -232,7 +232,7 @@ class Quoter:
         if trading_first:
             picked = mm.pick_trading_first(rows, size, int(c["max_markets"]), float(c["max_capital"]),
                                            float(c.get("min_spread") or 0.02), float(c.get("max_volume_24h") or 0),
-                                           fee_of=lambda st: self._series_fee(client, st))
+                                           fee_of=lambda st: self._series_fee(client, st), max_move=float(c.get("max_move") or 0))
         else:
             picked = mm.pick_for_quoter(rows, size, int(c["max_markets"]), float(c["max_capital"]),
                                         float(c.get("max_volume_24h") or 0))
@@ -247,7 +247,9 @@ class Quoter:
             am = info.get("all_markets")
             return chosen, (f"TRADING-FIRST: {info['programs']} programs" + (f" + {am['seen']} open markets screened ({am['candidates']} candidates)" if am else "")
                             + f"; {len(rows)} markets pass the filters; picked {len(chosen)} with "
-                            f"spread >= {float(c.get('min_spread') or 0.02):.2f} and a positive estimated edge before rewards "
+                            f"spread >= {float(c.get('min_spread') or 0.02):.2f} and a positive estimated edge before rewards"
+                            + (f", calm only (moved <= {100 * float(c.get('max_move')):.0f}c since yesterday)" if float(c.get("max_move") or 0) > 0 else "")
+                            + (f", quoting {int(float(c.get('offset_ticks')))}c behind the best bid" if float(c.get("offset_ticks") or 0) > 0 else "") + " "
                             f"(capital ${sum(x['capital'] for x in chosen):.2f} of ${c['max_capital']}): "
                             + ", ".join(f"{x['ticker']} (edge {x['edge_cents']}c/contract, spread {x['spread_cents']}c, "
                                         f"bonus ~${x['est_daily']:.2f}/d)" for x in chosen))
@@ -363,15 +365,18 @@ class Quoter:
             # capital cap or the buy limits - exiting must always be possible. At the inventory cap it steps 1c inside
             # the spread when there is room, to get out ahead of the queue.
             step = tick if (self.cfg.get("exit_step_in", True) and abs(pos) >= inv and ya - yb >= 2 * tick) else Decimal(0)
+            # opening quotes can rest N cents behind the best bid (offset_ticks): fewer fills, more spread per fill.
+            # Quotes that reduce a position never move back - getting out comes first.
+            off = tick * max(0, min(5, int(float(self.cfg.get("offset_ticks") or 0))))
             want = {}
             if pos < 0:
                 want["yes"] = ("sell_no", ONE - (yb + step), min(size, -pos), True)     # bid YES at yb(+1c) = sell NO
-            elif pos < inv and open_ok:
-                want["yes"] = ("buy_yes", yb, size, False)                               # join best YES bid
+            elif pos < inv and open_ok and yb - off >= tick:
+                want["yes"] = ("buy_yes", yb - off, size, False)                         # best YES bid (minus the offset)
             if pos > 0:
                 want["no"] = ("sell_yes", ya - step, min(size, pos), True)               # ask YES at ya(-1c) = sell YES
-            elif -pos < inv and open_ok:
-                want["no"] = ("buy_no", ONE - ya, size, False)                           # join best NO bid (= YES ask)
+            elif -pos < inv and open_ok and ONE - ya - off >= tick:
+                want["no"] = ("buy_no", ONE - ya - off, size, False)                     # best NO bid (minus the offset)
             for side in ("yes", "no"):
                 q = self.quotes.get(t, {}).get(side)
                 if side not in want:

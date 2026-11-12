@@ -349,7 +349,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             qp = patch["quoter"]
             if "universe" in qp and qp["universe"] not in ("all", "rewards"):
                 qp.pop("universe")
-            for k, lo, hi in (("market_loss_pct", 0, 100), ("min_volume_24h", 0, 10 ** 9)):
+            for k, lo, hi in (("market_loss_pct", 0, 100), ("min_volume_24h", 0, 10 ** 9), ("max_move", 0, 0.5)):
                 if k in qp:
                     try:
                         qp[k] = max(lo, min(hi, float(qp[k])))
@@ -365,6 +365,11 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                     qp.pop("min_spread")
             if "exit_step_in" in qp:
                 qp["exit_step_in"] = bool(qp["exit_step_in"])
+            if "offset_ticks" in qp:
+                try:
+                    qp["offset_ticks"] = max(0, min(5, int(float(qp["offset_ticks"]))))
+                except (TypeError, ValueError):
+                    qp.pop("offset_ticks")
             for k, lo, hi in (("quote_ttl_sec", 120, 3600), ("max_volume_24h", 0, 10 ** 9)):
                 if k in qp:
                     try:

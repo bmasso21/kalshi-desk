@@ -256,7 +256,7 @@ class Warehouse:
         since = time.time() - lookback
         self.state.update(running=True, error=None, phase="series")
         try:
-            series = self.scope_series()
+            series = self._retry(self.scope_series)
             stats["series"] = len(series)
             cut = self.cutoff()
             self.db.put("cutoff", cut)
@@ -265,7 +265,11 @@ class Warehouse:
                 if self._stop.is_set():
                     break
                 self.state["progress"] = f"markets {i + 1}/{len(series)} {s['ticker']}"
-                stats["markets"] += self._sync_markets(s, since, cut)
+                try:
+                    stats["markets"] += self._retry(self._sync_markets, s, since, cut)
+                except Exception as e:              # one series failing must not abort the whole sync
+                    stats["errors"] += 1
+                    self.state["error"] = f"{s['ticker']}: {e}"[:300]
             # 2) trades + candles for markets that still need them
             todo = self.db.query(
                 "SELECT ticker, series_ticker, tier, open_ts, close_ts, settled_ts, status, volume, trades_synced_to, "
@@ -278,7 +282,7 @@ class Warehouse:
                 if i % 25 == 0:
                     self.state["progress"] = f"market data {i + 1}/{len(todo)}"
                 try:
-                    a, b = self._sync_market_data(m, cut)
+                    a, b = self._retry(self._sync_market_data, m, cut)
                     stats["trades"] += a
                     stats["candles"] += b
                 except Exception as e:
@@ -295,6 +299,20 @@ class Warehouse:
         finally:
             self.state.update(running=False, phase="idle", progress="")
         return stats
+
+    RETRY_429 = (5, 15, 45)
+
+    def _retry(self, fn, *a):
+        """Kalshi's rate limit is shared with the scanner, the quoter and the paper test: on HTTP 429 wait and try
+        again (writes are idempotent upserts) instead of failing the whole sync."""
+        for w in self.RETRY_429 + (None,):
+            try:
+                return fn(*a)
+            except KalshiError as e:
+                if e.status != 429 or w is None:
+                    raise
+                if self._stop.wait(w):
+                    raise
 
     def _sync_markets(self, s, since, cut) -> int:
         st, cat = s["ticker"], s.get("category")
