@@ -135,10 +135,12 @@ class Engine:
                     continue
                 px = d(mine["price"])
                 auto = mine["source"] in ("auto", "quoter")
-            elif o.get("outcome_side") == "yes" and o.get("book_side") == "bid":
+            elif (o.get("action") or "buy") == "sell":
+                continue                    # an outside order that closes a position (Kalshi labels a YES sale "sell no")
+            elif o.get("book_side") == "bid":
                 px, auto = d(o.get("yes_price_dollars")), False
-            elif o.get("outcome_side") == "no" and o.get("book_side") == "ask":
-                px, auto = d(o.get("no_price_dollars")), False
+            elif o.get("book_side") == "ask":
+                px, auto = (d(o.get("no_price_dollars")) or (Decimal(1) - d(o.get("yes_price_dollars")))), False
             else:
                 continue
             s_all += fc * px

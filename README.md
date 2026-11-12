@@ -135,6 +135,9 @@ blend behind the *hourly* markets, not what the daily markets settle on, so v2.1
 - Backtester: filled/expired orders are dropped from the matching loop (same results, much faster on long runs).
 
 ### v3.4
+- **Checked against the real demo exchange (v3.4.2).** Kalshi reports every fill on the YES book and labels a YES sale
+  `action=sell, side=no`. The tax export now replays fills in order with the position held at the time (a sale of YES is
+  +YES price, not +NO price), fill alerts describe the YES book, and outside closing orders no longer count as buys.
 - **Exit rules** now need the condition on 2 checks in a row (one thin quote can't trigger a sale) and cancel every order
   of yours resting in that market before selling, so sells can never add up to more than the position.
 - **Quoter per-market loss stop**: when today's quoter fills in one market are down 10% of its capital (marked to the mid),

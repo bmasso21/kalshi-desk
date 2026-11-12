@@ -138,12 +138,12 @@ def main():
          "ts_ms": int(time.time() * 1000)}
     eng._on_feed("fill", f); flush()
     check("fill -> one normal alert with details", len(msgs) == n0 + 1 and msgs[-1]["message"] ==
-          "BUY YES 3 x KXB-1 @ $0.57 (fee $0.03, taker)" and msgs[-1]["title"] == "Fill (DEMO)", msgs[-1])
+          "3 x KXB-1: BOUGHT YES / closed NO @ YES $0.57 (fee $0.03, taker)" and msgs[-1]["title"] == "Fill (DEMO)", msgs[-1])
     eng._on_feed("fill", f); flush()
     check("same fill again (reconnect replay) -> no duplicate alert", len(msgs) == n0 + 1)
     fn = dict(f, trade_id="T-2", purchased_side="no", is_taker=False, fee_cost="0")
     eng._on_feed("fill", fn); flush()
-    check("NO fill shows the NO price (1 - yes)", "BUY NO 3 x KXB-1 @ $0.43 (fee $0.00, maker)" == msgs[-1]["message"], msgs[-1])
+    check("NO fill shows the NO price (1 - yes)", "3 x KXB-1: SOLD YES / bought NO @ YES $0.57 (NO $0.43) (fee $0.00, maker)" == msgs[-1]["message"], msgs[-1])
     cfg.data["alerts"]["fill_batch_sec"] = 1
     n0 = len(msgs)
     for i in range(3):

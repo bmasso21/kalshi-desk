@@ -138,15 +138,19 @@ class Alerter:
 
     @staticmethod
     def fill_line(f: dict) -> str:
+        """Described on the YES book, which is how Kalshi reports fills (its own action/side labels name the other
+        side: a YES sale arrives as 'sell no'). bid = bought YES or closed NO; ask = sold YES or bought NO."""
         t = f.get("market_ticker") or f.get("ticker") or "?"
-        side = (f.get("purchased_side") or f.get("outcome_side") or f.get("side") or "").upper()
-        act = (f.get("action") or "").upper() or ("BUY" if f.get("book_side") == "bid" else "")
         yp = d(f.get("yes_price_dollars"))
-        px = (Decimal(1) - yp) if side == "NO" and yp else yp
         cnt = d(f.get("count_fp") or f.get("count"))
+        bs = f.get("book_side")
+        if bs not in ("bid", "ask"):
+            act, side = (f.get("action") or "buy").lower(), (f.get("purchased_side") or f.get("outcome_side") or f.get("side") or "yes").lower()
+            bs = "bid" if (act == "buy") == (side == "yes") else "ask"
+        what = f"BOUGHT YES / closed NO @ YES ${yp:.2f}" if bs == "bid" else f"SOLD YES / bought NO @ YES ${yp:.2f} (NO ${(Decimal(1) - yp):.2f})"
         fee = f.get("fee_cost") if f.get("fee_cost") is not None else f.get("fee_cost_dollars")
         role = "taker" if f.get("is_taker") else "maker"
-        s = f"{act} {side} {cnt.normalize():f} x {t} @ ${px:.2f}"
+        s = f"{cnt.normalize():f} x {t}: {what}"
         if fee not in (None, ""):
             s += f" (fee ${d(fee):.2f}, {role})"
         return s

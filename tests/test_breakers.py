@@ -153,25 +153,35 @@ def api_tests(tmp):
     check("check endpoint", c.post("/api/breakers/check", headers=H).status_code == 200)
     check("settings page has the breaker card", "Circuit breakers" in c.get("/").text)
 
-    # tax export (mock: one taker fill, one settlement, one reward credit, all 2026)
-    mock.state.S["fills"] = [{"ticker": "KXA-1", "action": "buy", "side": "yes", "count_fp": "10.00", "yes_price_dollars": "0.4000",
-                              "no_price_dollars": "0.6000", "fee_cost": "0.1700", "is_taker": True, "created_time": "2026-03-01T12:00:00Z"},
-                             {"ticker": "KXA-1", "book_side": "ask", "count_fp": "5.00", "yes_price_dollars": "0.3000",
-                              "fee_cost": "0.0000", "created_time": "2026-03-02T12:00:00Z"},
-                             {"ticker": "KXA-1", "action": "buy", "side": "yes", "count_fp": "1.00", "yes_price_dollars": "0.5000",
-                              "fee_cost": "0.0100", "created_time": "2025-12-31T23:59:59Z"}]
+    # tax export. Fills shaped exactly like Kalshi's (seen on the demo account): everything is on the YES book, and a
+    # YES sale arrives labelled action=sell, side=no - so only book_side may be trusted.
+    def kf(day, bs, yp, n, fee="0.0000", taker=True):
+        lab = {"bid": ("buy", "yes"), "ask": ("sell", "no")}[bs]
+        return {"ticker": "KXA-1", "market_ticker": "KXA-1", "book_side": bs, "action": lab[0], "side": lab[1], "outcome_side": lab[1],
+                "count_fp": f"{n:.2f}", "yes_price_dollars": f"{yp:.4f}", "no_price_dollars": f"{1 - yp:.4f}", "fee_cost": fee,
+                "is_taker": taker, "created_time": day + "T12:00:00Z"}
+    mock.state.S["fills"] = [kf("2026-03-03", "ask", 0.30, 8, "0.0200"),       # closes the last 6 YES, opens 2 NO
+                             kf("2026-03-02", "ask", 0.30, 5, taker=False),     # sells 5 of the 11 YES
+                             kf("2026-03-01", "bid", 0.40, 10, "0.1700"),      # buys 10 YES (1 already held from 2025)
+                             kf("2025-12-31", "bid", 0.50, 1, "0.0100")]
     r = c.get("/api/export/tax?year=2026")
     lines = r.text.strip().splitlines()
     check("tax export: CSV download named by env and year", r.status_code == 200 and "text/csv" in r.headers["content-type"]
           and 'kalshi-desk-demo-2026.csv' in r.headers.get("content-disposition", ""), r.headers)
     body = "\n".join(lines)
-    check("tax export: only rows inside the year", "2025-12-31" not in body and body.count("fill,") == 2, body)
-    check("tax export: buy YES cash flow = -price x n, fee separate", ",fill,KXA-1,buy yes (taker),10.0,0.4,-4.0,0.17" in body, body)
-    check("tax export: V2 ask fill = buy NO at 1 - YES price", ",fill,KXA-1,buy no (maker),5.0,0.7,-3.5,0.0" in body, body)
+    check("tax export: only rows inside the year (earlier fills still set the starting position)", "2025-12-31" not in body and body.count(",fill,") == 4, body)
+    check("tax export: buying YES = -price x n, fee separate", ",fill,KXA-1,buy YES (taker),10.0,0.4,-4.0,0.17" in body, body)
+    check("tax export: an ask while holding YES is a SALE of YES at the YES price (not 'sell no' at 0.70)",
+          ",fill,KXA-1,sell YES to close (maker),5.0,0.3,1.5,0.0" in body, body)
+    check("tax export: a fill that closes and flips is split - 6 sold, 2 NO bought at 0.70; fee counted once",
+          ",fill,KXA-1,sell YES to close (taker),6.0,0.3,1.8,0.02" in body and ",fill,KXA-1,buy NO (taker),2.0,0.7,-1.4,0" in body, body)
     check("tax export: settlement revenue and reward credit included", ",settlement,KXOLD-1,settled yes,,,10.0,0.17" in body
           and ",credit,,liquidity_incentive: Liquidity incentive KXA-1,,,3.21,0" in body, body)
-    check("tax export: total = cash flow - fees", "net 5.37" in lines[-1] and ",5.71,0.34" in lines[-1], lines[-1])
-
+    check("tax export: total = cash flow - fees", "net 10.75" in lines[-1] and ",11.11,0.36" in lines[-1], lines[-1])
+    from app.alerts import Alerter
+    check("fill alert describes the YES book, not Kalshi's 'sell no' label",
+          Alerter.fill_line(kf("2026-03-02", "ask", 0.33, 1, "0.0155")) == "1 x KXA-1: SOLD YES / bought NO @ YES $0.33 (NO $0.67) (fee $0.02, taker)",
+          Alerter.fill_line(kf("2026-03-02", "ask", 0.33, 1, "0.0155")))
 
 def config_tests(tmp):
     from app.config import Config
