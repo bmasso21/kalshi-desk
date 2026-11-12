@@ -266,6 +266,28 @@ def integration_tests(tmp):
     check("shadow: rewards accrue between polls", q["reward"] > 0 and close(q["total_sec"], 10), (q["reward"], q["total_sec"]))
     sh.step()
     check("shadow: the same trade is never counted twice", sh.sims[("KXA-1", "queue")].s["pos_yes"] == 10)
+    check("shadow: fee type confirmed at start", sh.markets["KXA-1"].get("fee_known") is True and sh.markets["KXA-1"]["fee_type"] == "quadratic")
+    vf = sh.verify_fees()
+    check("verify fees: nothing to change when the stored type is right", vf["changed"] == [] and vf["confirmed"] == vf["series"] == 1 and vf["fees_added"] == 0, vf)
+    real_series = sh.client.series
+    sh.client.series = lambda t_: {"ticker": t_, "fee_type": "quadratic_with_maker_fees", "fee_multiplier": 1}
+    vf = sh.verify_fees(apply=False)
+    check("verify fees (look only): difference reported, nothing changed", len(vf["changed"]) == 1 and sh.sims[("KXA-1", "queue")].s["fees"] == 0 and vf["applied"] is False, vf)
+    vf = sh.verify_fees()
+    fq = sh.sims[("KXA-1", "queue")].s["fees"]
+    check("verify fees: wrong stored type corrected and every recorded fill re-priced (10 @ .50 maker = 5c)",
+          close(fq, 0.05) and close(vf["fees_added"], 0.10) and sh.markets["KXA-1"]["fee_type"] == "quadratic_with_maker_fees"
+          and all(close(r_["fee"], 0.05) for r_ in wdb.query("SELECT fee FROM mm_fills WHERE run_id=?", (rid,))), (fq, vf))
+    sh.client.series = real_series
+    vf = sh.verify_fees()
+    check("verify fees: corrected back, fees return to 0", sh.sims[("KXA-1", "queue")].s["fees"] == 0 and close(vf["fees_added"], -0.10), vf)
+    def boom(t_): raise RuntimeError("down")
+    sh.client.series = boom
+    vf = sh.verify_fees()
+    check("verify fees: lookup failure -> charged as maker fees and listed as unconfirmed",
+          close(sh.sims[("KXA-1", "queue")].s["fees"], 0.05) and "KXA" in vf["unconfirmed"] and sh.markets["KXA-1"]["fee_known"] is False, vf)
+    sh.client.series = real_series
+    sh.verify_fees()
     sh._persist()
     rep = mm.report(wdb, rid, now=clock["t"] + 7200)
     m = rep["models"]["queue"]
@@ -290,7 +312,7 @@ def integration_tests(tmp):
     ids = sh3.start_set(sc, {"n_markets": 5, "size": 10, "poll_sec": 10, "per_series": 3})
     names = [json.loads(r["params"])["name"] for r in wdb.query(f"SELECT params FROM mm_runs WHERE id IN ({','.join(map(str, ids))}) ORDER BY id")]
     check("variant set: quiet-market preset skipped when no market qualifies (mock volume 500)",
-          len(ids) == 6 and not any("quiet" in n for n in names) and any("quiet" in x for x in sh3.last_skipped), (names, sh3.last_skipped))
+          len(ids) == 7 and not any("quiet" in n for n in names) and any("quiet" in x for x in sh3.last_skipped), (names, sh3.last_skipped))
     clock["t"] += 10
     sh3.step()
     off = next(r for r in sh3.runs.values() if r.p.get("offset_ticks"))
@@ -312,9 +334,9 @@ def integration_tests(tmp):
     check("pull variant: YES side paused after its fill", ps["side_pause"].get("yes", 0) > clock["t"] and ps["fill_pauses"] >= 1, ps)
     check("baseline keeps quoting after the same trade", "yes" in base_run.sims[("KXA-1", "queue")].s["quotes"])
     reps = [mm.report(wdb, i, live=sh3, now=clock["t"]) for i in ids]
-    check("reports per run carry the variant name", all(r["name"] for r in reps) and len(reps) == 6)
+    check("reports per run carry the variant name", all(r["name"] for r in reps) and len(reps) == 7)
     sh3.stop(ids[0])
-    check("stop one run keeps the others", ids[0] not in sh3.runs and len(sh3.runs) == 5
+    check("stop one run keeps the others", ids[0] not in sh3.runs and len(sh3.runs) == 6
           and wdb.query("SELECT status FROM mm_runs WHERE id=?", (ids[0],))[0]["status"] == "stopped")
     sh3.stop()
     check("stop all", not sh3.runs)
@@ -351,11 +373,18 @@ def integration_tests(tmp):
     check("a second run can start alongside (offset clamped to 5)", r2.status_code == 200 and r2.json()["params"]["offset_ticks"] == 5
           and len(app.state.mm[1].runs) == 2, r2.text)
     r3 = c.post("/api/mm/shadow/start_set", headers=H, json={"n_markets": 5})
-    check("variant set via API (quiet preset skipped on the mock)", r3.status_code == 200 and len(r3.json()["ids"]) == 6 and r3.json()["skipped"], r3.text)
+    check("variant set via API (quiet preset skipped on the mock)", r3.status_code == 200 and len(r3.json()["ids"]) == 7 and r3.json()["skipped"], r3.text)
     check("shadow re-places like the live quoter (quote lifetime - 60s)", r3.json()["params"]["requeue_sec"] == 540)
     time.sleep(0.5)
     j = c.get("/api/mm").json()
-    check("status lists every run", len(j["shadow"]["runs"]) == 8 and len(j["reports"]) == 8, j["shadow"])
+    vr = c.post("/api/mm/shadow/verify_fees", headers=H)
+    check("verify fees via API", vr.status_code == 200 and vr.json()["confirmed"] == vr.json()["series"] >= 1 and vr.json()["changed"] == [], vr.text)
+    r9 = c.post("/api/mm/shadow/start", headers=H, json={"n_markets": 5, "select_by": "trading", "max_move": 0.03, "offset_ticks": 1, "name": "calm"})
+    check("calm-market run can be started via API (max_move stored) or is refused cleanly",
+          (r9.status_code == 200 and r9.json()["params"]["max_move"] == 0.03) or r9.status_code == 409, r9.text)
+    if r9.status_code == 200:
+        c.post(f"/api/mm/shadow/stop?run={r9.json()['id']}", headers=H)
+    check("status lists every run", len(j["shadow"]["runs"]) == 9 and len(j["reports"]) == 9, j["shadow"])
     time.sleep(0.5)
     check("shadow stop", c.post("/api/mm/shadow/stop", headers=H).status_code == 200 and not app.state.mm[1].status()["alive"])
     check("report endpoint", c.get("/api/mm/report").status_code == 200)
@@ -408,6 +437,29 @@ def trading_first_tests():
     check("trading-first: respects max markets", pk == ["WIDE", "MIDR"], pk)
     pk = [r["ticker"] for r in mm.pick_trading_first(rows, 10, 10, 15, 0.02)]
     check("trading-first: respects the capital cap", pk == ["WIDE"], pk)
+    calm = [row("CALM", 0.40, 0.46, prev=0.44), row("JUMPY", 0.40, 0.50, prev=0.50), row("NOPREV", 0.40, 0.46)]
+    pk = [r["ticker"] for r in mm.pick_trading_first(calm, 10, 10, 1000, 0.02)]
+    check("calm filter off: a market that moved 5c still qualifies on its spread", "JUMPY" in pk, pk)
+    pk = [r["ticker"] for r in mm.pick_trading_first(calm, 10, 10, 1000, 0.02, max_move=0.03)]
+    check("calm filter: moved more than 3c since yesterday -> excluded; 1c move and no history kept", sorted(pk) == ["CALM", "NOPREV"], pk)
+    check("combined preset present (trading-first, 1c behind, exit step-in, calm)",
+          any(p_.get("max_move") == 0.03 and p_.get("offset_ticks") == 1 and p_.get("exit_step_in") and p_.get("select_by") == "trading" for p_ in mm.PRESETS))
+
+    class C:                                    # fee lookups never make a paper result look better
+        def __init__(self, reply): self.reply, self.n = reply, 0
+        def series(self, t):
+            self.n += 1
+            if isinstance(self.reply, Exception):
+                raise self.reply
+            return self.reply
+    f = mm.series_fees(C({"fee_type": "quadratic", "fee_multiplier": 1}), "S")
+    check("fee lookup: confirmed type stored", f["fee_type"] == "quadratic" and f["fee_known"] is True, f)
+    f = mm.series_fees(C(RuntimeError("boom")), "S")
+    check("fee lookup failed -> maker fees assumed, flagged unconfirmed", f["fee_type"] == "quadratic_with_maker_fees" and f["fee_known"] is False, f)
+    f = mm.series_fees(C({"ticker": "S"}), "S")
+    check("fee lookup without a fee type -> maker fees assumed, flagged", f["fee_type"] == "quadratic_with_maker_fees" and f["fee_known"] is False, f)
+    f = mm.series_fees(C({"fee_type": "brand_new_type"}), "S")
+    check("unknown fee type -> maker fees assumed, flagged", f["fee_known"] is False and "not in the fee table" in f["fee_note"], f)
 
 
 def retry_tests():

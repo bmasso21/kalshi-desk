@@ -795,7 +795,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 p[k] = max(lo, min(hi, float(b[k])))
         if b.get("exit_step_in"):
             p["exit_step_in"] = True
-        for k, lo, hi in (("max_capital", 0, 10 ** 7), ("market_loss_stop", 0, 10 ** 6)):
+        for k, lo, hi in (("max_capital", 0, 10 ** 7), ("market_loss_stop", 0, 10 ** 6), ("max_move", 0, 1)):
             if b.get(k) is not None:
                 p[k] = max(lo, min(hi, float(b[k])))
         if b.get("select_by") == "trading":
@@ -823,6 +823,13 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         skipped = getattr(mm_shadow, "last_skipped", [])
         db.audit("mm_shadow_start_set", json.dumps({"ids": ids, "skipped": skipped, **p}))
         return {"ids": ids, "skipped": skipped, "params": p}
+
+    @app.post("/api/mm/shadow/verify_fees")
+    def mm_shadow_verify_fees(apply: int = 1):
+        out = mm_shadow.verify_fees(apply=bool(apply))
+        mm_cache["ts"] = 0
+        db.audit("mm_verify_fees", json.dumps({k: out[k] for k in ("series", "confirmed", "fees_added", "applied")} | {"changed": len(out["changed"])}))
+        return out
 
     @app.post("/api/mm/shadow/stop")
     def mm_shadow_stop(run: int = 0):

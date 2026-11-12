@@ -39,7 +39,7 @@ import threading
 import time
 import traceback
 
-from .fees import fee
+from .fees import MAKER as MAKER_TYPES, fee
 from .kalshi_client import KalshiClient, KalshiError, TokenBucket
 from .warehouse import PROD_URL, iso_ts
 
@@ -235,6 +235,25 @@ def with_retry(fn, *a, sleep=time.sleep, **kw):
             sleep(w)
 
 
+UNKNOWN_FEE = {"fee_type": "quadratic_with_maker_fees", "fee_multiplier": 1.0}
+
+
+def series_fees(client, series: str, sleep=time.sleep) -> dict:
+    """The series' fee type straight from Kalshi (retried on 429). When the lookup fails or the reply has no fee type,
+    the costlier case (maker fees) is assumed and fee_known is False - a paper result must never look better
+    because a lookup failed."""
+    try:
+        s = with_retry(client.series, series, sleep=sleep) or {}
+    except Exception as e:
+        return {**UNKNOWN_FEE, "fee_known": False, "fee_note": f"lookup failed: {e}"[:160]}
+    ft = s.get("fee_type")
+    if not ft:
+        return {**UNKNOWN_FEE, "fee_known": False, "fee_note": "Kalshi returned no fee type"}
+    if ft not in MAKER_TYPES:
+        return {**UNKNOWN_FEE, "fee_known": False, "fee_note": f"fee type '{ft}' not in the fee table"}
+    return {"fee_type": ft, "fee_multiplier": fnum(s.get("fee_multiplier")) or 1.0, "fee_known": True, "fee_note": ""}
+
+
 def fetch_programs(client, max_pages=200, pace=None) -> tuple[list[dict], int]:
     progs, cur, pages = [], None, 0
     while True:
@@ -332,7 +351,7 @@ def trading_score(r: dict, fee_type: str | None = "quadratic", fee_mult: float =
 
 
 def pick_trading_first(rows: list[dict], size: int, max_markets: int, max_capital: float, min_spread: float = 0.02,
-                       max_volume_24h: float = 0, fee_of=None, per_series: int = 0) -> list[dict]:
+                       max_volume_24h: float = 0, fee_of=None, per_series: int = 0, max_move: float = 0) -> list[dict]:
     """Trading edge first, rewards as the tie-breaker / bonus. A market qualifies only if its spread is at least
     `min_spread` and its estimated trading edge per contract (trading_score) is positive WITHOUT rewards; qualifying
     markets are ranked by that edge, then by estimated reward per $ of capital. Markets need no reward to be picked."""
@@ -348,6 +367,8 @@ def pick_trading_first(rows: list[dict], size: int, max_markets: int, max_capita
         ts_ = trading_score(r, (ft or {}).get("fee_type"), (ft or {}).get("fee_multiplier") or 1.0)
         if ts_["score"] <= 0:
             continue
+        if max_move and ts_["move"] > max_move + EPS:
+            continue                        # calm markets only: the price has moved more than max_move since yesterday's close
         cands.append((ts_["score"], (sz.get("est_daily") or 0) / sz["capital"], r, ts_))
     cands.sort(key=lambda x: (-x[0], -x[1]))
     out, used, seen = [], 0.0, {}
@@ -743,6 +764,9 @@ PRESETS = [
     {"name": "trading-first picks (spread >= 2c, edge before rewards)", "select_by": "trading", "min_spread": 0.02},
     {"name": "as live: trading-first + $80 capital cap + $8 per-market stop + exit step-in", "select_by": "trading",
      "min_spread": 0.02, "max_capital": 80, "market_loss_stop": 8, "exit_step_in": True},
+    {"name": "combined: trading-first + 1c behind + exit step-in + calm markets (moved <= 3c since yesterday)",
+     "select_by": "trading", "min_spread": 0.02, "offset_ticks": 1, "exit_step_in": True, "max_move": 0.03,
+     "max_capital": 80, "market_loss_stop": 8},
 ]
 
 
@@ -800,7 +824,7 @@ class Shadow:
         mv = float(p.get("max_volume_24h") or 0)
         if p.get("select_by") == "trading":
             picked = pick_trading_first(rows, int(k), int(p["n_markets"]), 1e12, float(p.get("min_spread") or 0.02), mv,
-                                        per_series=int(p["per_series"]))
+                                        per_series=int(p["per_series"]), max_move=float(p.get("max_move") or 0))
             if not picked:
                 raise RuntimeError("no market passes the trading-first screen (spread >= min, positive edge before rewards)")
             return sc, k, picked
@@ -824,17 +848,12 @@ class Shadow:
                  "pull_hours": 6, "jump_cents": 4, "cooldown_min": 10, "refresh_sec": 15, "min_mid": 0.15, "max_mid": 0.85,
                  "max_spread": 0.06, "requeue_sec": 60, "per_series": 3, "offset_ticks": 0, "max_volume_24h": 0,
                  "pull_after_fill_min": 0, "burst_contracts": 0, "burst_pull_min": 10, "exit_step_in": False,
-                 "max_capital": 0, "market_loss_stop": 0, "select_by": "rewards", "min_spread": 0.02, **params}
+                 "max_capital": 0, "market_loss_stop": 0, "select_by": "rewards", "min_spread": 0.02, "max_move": 0, **params}
             sc, k, picked = self._pick(scanner, p)
             fee_types: dict[str, dict] = {}
             for r in picked:
                 if r["series"] not in fee_types:
-                    try:
-                        s = self.client.series(r["series"]) or {}
-                    except Exception:
-                        s = {}
-                    fee_types[r["series"]] = {"fee_type": s.get("fee_type") or "quadratic",
-                                              "fee_multiplier": fnum(s.get("fee_multiplier")) or 1.0}
+                    fee_types[r["series"]] = series_fees(self.client, r["series"])
             cur = self.db.execute("INSERT INTO mm_runs(ts,params,status,scan_id) VALUES(?,?, 'running', ?)",
                                   (self.clock(), json.dumps(p), sc["id"]))
             rid = cur.lastrowid
@@ -864,6 +883,52 @@ class Shadow:
             raise RuntimeError("; ".join(skipped))
         self.last_skipped = skipped
         return ids
+
+    def verify_fees(self, apply: bool = True) -> dict:
+        """Re-read every running market's fee type from Kalshi and, when it differs from what the run stored (or was
+        never confirmed), store it and re-price the fees of every recorded fill, so each run's P&L carries the right
+        fees from its start. Unconfirmed lookups are charged as maker-fee series (the costlier case)."""
+        with self.lock:
+            series = sorted({i["series"] for r in self.runs.values() for i in r.markets.values()})
+        got = {sr: series_fees(self.client, sr) for sr in series}
+        changed, refee = [], 0.0
+        with self.lock:
+            for r in self.runs.values():
+                for t, info in r.markets.items():
+                    g = got.get(info["series"])
+                    if not g:
+                        continue
+                    old = (info.get("fee_type") or "quadratic", float(info.get("fee_multiplier") or 1))
+                    same = old == (g["fee_type"], float(g["fee_multiplier"]))
+                    if same and info.get("fee_known") == g["fee_known"]:
+                        continue
+                    if not apply:
+                        if not same:
+                            changed.append({"run": r.rid, "ticker": t, "was": old[0], "now": g["fee_type"], "known": g["fee_known"]})
+                        continue
+                    info.update(g)
+                    self.db.execute("UPDATE mm_markets SET info=? WHERE run_id=? AND ticker=?", (json.dumps(info), r.rid, t))
+                    if same:
+                        continue
+                    for md in MODELS:
+                        tot = 0.0
+                        for f in self.db.query("SELECT rowid AS rid_, price, count FROM mm_fills WHERE run_id=? AND ticker=? AND model=?",
+                                               (r.rid, t, md)):
+                            fe = float(fee(f["price"], f["count"], g["fee_type"], g["fee_multiplier"], maker=True))
+                            self.db.execute("UPDATE mm_fills SET fee=? WHERE rowid=?", (fe, f["rid_"]))
+                            tot += fe
+                        sim = r.sims.get((t, md))
+                        if sim:
+                            refee += tot - float(sim.s.get("fees") or 0)
+                            sim.s["fees"] = tot
+                    changed.append({"run": r.rid, "ticker": t, "was": old[0], "now": g["fee_type"], "known": g["fee_known"]})
+            if apply and changed:
+                self._persist()
+        self.fee_check = out = {"ts": self.clock(), "series": len(series), "confirmed": sum(1 for g in got.values() if g["fee_known"]),
+                "unconfirmed": {sr: g["fee_note"] for sr, g in got.items() if not g["fee_known"]},
+                "types": {sr: g["fee_type"] for sr, g in got.items() if g["fee_known"]},
+                "changed": changed, "fees_added": round(refee, 2), "applied": bool(apply)}
+        return out
 
     def resume(self) -> list[int]:
         """Continue runs that were going when the app stopped (open quotes are dropped: the real quoter's
@@ -1062,7 +1127,7 @@ class Shadow:
 
     # ---- report ------------------------------------------------------------------
     def status(self) -> dict:
-        return {**self.state, "run_id": self.run_id, "runs": sorted(self.runs),
+        return {**self.state, "run_id": self.run_id, "runs": sorted(self.runs), "fee_check": getattr(self, "fee_check", None),
                 "markets": len({t for r in self.runs.values() for t in r.markets}),
                 "alive": bool(self.thread and self.thread.is_alive())}
 
@@ -1135,7 +1200,7 @@ def report(wdb, run_id: int | None = None, live: Shadow | None = None, now: floa
                    "eligible_pct": round(100 * s["elig_sec"] / s["total_sec"], 1) if s["total_sec"] else None,
                    "jumps": s.get("jumps", 0), "bursts": s.get("bursts", 0), "fill_pauses": s.get("fill_pauses", 0),
                    "settled": s.get("settled"), "max_capital": round(s.get("max_capital", 0.0), 2),
-                   "volume_24h": info.get("volume_24h")}
+                   "volume_24h": info.get("volume_24h"), "fee_type": info.get("fee_type"), "fee_known": info.get("fee_known")}
             per.append(row)
             for k in ("reward", "cost", "fees", "contracts", "fills", "total_sec", "elig_sec", "quoted_sec", "jumps"):
                 tot[k] += s.get(k, 0.0)
