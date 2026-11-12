@@ -43,7 +43,14 @@ class Maintenance:
                 src_conn.backup(out)
         finally:
             out.close()
-        os.replace(tmp, dest)
+        for attempt in range(5):                  # Windows: the old backup can be briefly locked (antivirus, a viewer)
+            try:
+                os.replace(tmp, dest)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(1.0)
 
     def _rotate(self, prefix: str, keep: int):
         files = sorted(p for p in self.dir.glob(f"{prefix}-*") if not p.name.endswith(".tmp"))

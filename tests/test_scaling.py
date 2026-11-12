@@ -319,7 +319,9 @@ def api_tests(tmp):
     import sqlite3 as _sq
     day = res["day"]
     bk = mt.dir / f"kalshi_desk-{day}.db"
-    n = _sq.connect(str(bk)).execute("SELECT COUNT(*) FROM orders_log").fetchone()[0]
+    _c = _sq.connect(str(bk))
+    n = _c.execute("SELECT COUNT(*) FROM orders_log").fetchone()[0]
+    _c.close()                                    # Windows keeps an open database file locked
     check("backup: ledger copy is a readable database with the orders in it; settings and research data copied",
           n == db.query("SELECT COUNT(*) n FROM orders_log")[0]["n"] and (mt.dir / f"config-{day}.json").exists()
           and (mt.dir / f"warehouse-{day}.db").exists(), res)
