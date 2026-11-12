@@ -15,6 +15,16 @@ the condition still holds. No bid at all = nothing to sell into, so nothing is s
 is flat, flips side, or the market closes. Sells are always allowed by the risk limits and work with the kill switch on.
 
 A stop-loss sells at whatever the bid is: in a thin market that can be well below fair value. Use `floor` to bound it.
+
+Saving a rule (v3.5): a level that the current bid has already passed is refused - a stop-loss at or above the bid, or a
+take-profit at or below it, would fire on the next check - with the bid shown in the message.
+
+Suggested levels (v3.5): `suggest(ticker)` proposes take / stop / floor from the position itself. It is risk
+arithmetic, NOT a forecast - it says nothing about whether the trade is good:
+  stop   = bid - distance, distance = the largest of 3c, twice the bid/ask spread, and the move since yesterday's close
+           (so normal noise doesn't trigger it); tightened if the loss at the stop would exceed half the daily loss limit
+  floor  = stop - the larger of 2c and the spread (room for a thin book)
+  take   = entry + 1.5 x (entry - stop), capped at 0.99 and always above the bid
 """
 from __future__ import annotations
 
@@ -53,14 +63,85 @@ class Exits:
         sql = "SELECT * FROM exit_rules WHERE env=?" + (" AND status='active'" if active_only else "") + " ORDER BY created DESC"
         return self.db.query(sql, (self.e.cfg.env,))
 
-    def _pos(self, ticker) -> float:
+    def _mp(self, ticker) -> dict:
         pos = self.e.positions(max_age=0) or {}
         for mp in pos.get("market_positions", []):
             if mp.get("ticker") == ticker:
-                return float(d(mp.get("position_fp")))
-        return 0.0
+                return mp
+        return {}
 
-    def set_rule(self, ticker: str, take_profit=None, stop_loss=None, floor=None) -> dict:
+    def _pos(self, ticker) -> float:
+        return float(d(self._mp(ticker).get("position_fp")))
+
+    def _quote(self, ticker: str, side: str) -> dict:
+        """Best bid / ask and yesterday's close for the side held (NO prices for a NO position); None where missing."""
+        try:
+            ms = self.e.client.markets(status=None, tickers=[ticker], exclude_combos=False)
+        except Exception:
+            ms = []
+        m = next((x for x in ms if x.get("ticker") == ticker), None) or {}
+        yb, ya, pv = float(d(m.get("yes_bid_dollars"))), float(d(m.get("yes_ask_dollars"))), float(d(m.get("previous_price_dollars")))
+        if side == "yes":
+            bid, ask, prev = yb, ya, pv
+        else:
+            bid, ask, prev = (1 - ya if ya > 0 else 0.0), (1 - yb if yb > 0 else 0.0), (1 - pv if pv > 0 else 0.0)
+        ok = lambda x: round(x, 4) if 0 < x < 1 else None
+        return {"bid": ok(bid), "ask": ok(ask), "prev": ok(prev), "status": m.get("status")}
+
+    def suggest(self, ticker: str) -> dict:
+        mp = self._mp(ticker)
+        pos = float(d(mp.get("position_fp")))
+        if pos == 0:
+            raise ValueError("you hold no position in that market")
+        side, qty = ("yes" if pos > 0 else "no"), abs(pos)
+        q = self._quote(ticker, side)
+        bid = q["bid"]
+        if bid is None:
+            raise ValueError(f"no {side.upper()} bid in that market right now - nothing to base a suggestion on")
+        cost = float(d(mp.get("market_exposure_dollars")))
+        entry = round(cost / qty, 4) if cost > 0 else bid
+        entry = min(max(entry, 0.01), 0.99)
+        spread = round(q["ask"] - bid, 4) if q["ask"] and q["ask"] > bid else 0.01
+        move = abs(bid - q["prev"]) if q["prev"] else 0.0
+        dist = max(0.03, 2 * spread, move)
+        notes = []
+        cap = float(self.e.cfg.risk.get("max_daily_loss") or 0) / 2
+        stop = bid - dist
+        if cap > 0 and (entry - stop) * qty > cap:
+            tight = entry - cap / qty
+            if tight < bid - 0.02 + 1e-9:
+                stop = max(stop, tight)
+                notes.append(f"Stop tightened so the loss at the stop stays near ${cap:.2f} (half your daily loss limit).")
+            else:
+                stop = bid - 0.02
+                notes.append(f"This position is large for your limits: even a stop 2c under the bid loses about "
+                             f"${(entry - stop) * qty:.2f}, more than half your daily loss limit (${cap:.2f}).")
+        stop = round(max(0.01, int(stop * 100 + 1e-6) / 100), 2)
+        if stop >= bid:
+            raise ValueError(f"the {side.upper()} bid ({bid:.2f}) is too low to place a stop under it")
+        floor = round(max(0.01, stop - max(0.02, spread)), 2)
+        risk_c = max(entry - stop, 0.01)
+        take = min(0.99, entry + 1.5 * risk_c)
+        take = round(max(take, bid + 0.01), 2)
+        take = min(take, 0.99)
+        if take <= bid:
+            take = None
+            notes.append("The bid is already at 0.99: there is no room for a take-profit.")
+        gain_c = (take - entry) if take else 0.0
+        if take and gain_c < risk_c - 1e-9:
+            notes.append(f"At this entry the most the take-profit can earn is {gain_c * 100:.0f}c a contract against "
+                         f"{risk_c * 100:.0f}c at risk to the stop - the price is too close to $1 for a better ratio.")
+        if stop >= entry:
+            notes.append("The stop is above what you paid: it locks in a gain rather than limiting a loss.")
+        return {"ticker": ticker, "side": side, "qty": qty, "entry": round(entry, 4), "bid": bid, "ask": q["ask"], "spread": spread,
+                "take_profit": take, "stop_loss": stop, "floor": floor,
+                "at_stop": round((stop - entry) * qty, 2), "at_take": round(gain_c * qty, 2) if take else None,
+                "basis": f"stop {dist * 100:.0f}c under the bid (largest of 3c, 2x the {spread * 100:.0f}c spread, "
+                         f"{move * 100:.0f}c move since yesterday); floor allows a thin book; take-profit 1.5x the risk",
+                "notes": notes,
+                "disclaimer": "Risk arithmetic from your position and limits - not a forecast and not a view on whether the trade is good."}
+
+    def set_rule(self, ticker: str, take_profit=None, stop_loss=None, floor=None, check_prices: bool = True) -> dict:
         def num(x, name):
             if x in (None, "", 0, "0"):
                 return None
@@ -79,6 +160,16 @@ class Exits:
         if pos == 0:
             raise ValueError("you hold no position in that market")
         side = "yes" if pos > 0 else "no"
+        if check_prices:
+            bid = self._quote(ticker, side)["bid"]
+            if bid is not None:                 # no bid = nothing to compare with (and nothing would be sold anyway)
+                S = side.upper()
+                if sl is not None and sl >= bid - 1e-9:
+                    raise ValueError(f"stop-loss {sl:.2f} is at or above the current {S} bid ({bid:.2f}), so it would sell "
+                                     f"right away. A stop-loss goes BELOW the current price. Use Suggest for levels.")
+                if tp is not None and tp <= bid + 1e-9:
+                    raise ValueError(f"take-profit {tp:.2f} is at or below the current {S} bid ({bid:.2f}), so it would sell "
+                                     f"right away. A take-profit goes ABOVE the current price. Use Suggest for levels.")
         now = time.time()
         self.db.execute("INSERT OR REPLACE INTO exit_rules VALUES(?,?,?,?,?,?,?, 'active', NULL, ?)",
                         (self.e.cfg.env, ticker, side, tp, sl, fl, now, now))

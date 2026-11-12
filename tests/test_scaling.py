@@ -188,6 +188,55 @@ def api_tests(tmp):
     check("invalid rules rejected (empty, take <= stop, out of range, floor without / above stop)", bad == [400] * 5, bad)
     r = c.post("/api/exits", headers=H, json={"ticker": "KXA-1", "take_profit": 0.60, "stop_loss": 0.35})
     check("rule saved for the side held", r.status_code == 200 and r.json()["side"] == "yes", r.text)
+    # levels the bid has already passed are refused (bid .50), with the bid in the message
+    r1 = c.post("/api/exits", headers=H, json={"ticker": "KXA-1", "take_profit": 0.99, "stop_loss": 0.97, "floor": 0.97})
+    check("stop-loss above the current bid is refused and explained", r1.status_code == 400 and "BELOW the current price" in r1.text and "0.50" in r1.text, r1.text)
+    r1 = c.post("/api/exits", headers=H, json={"ticker": "KXA-1", "stop_loss": 0.50})
+    check("stop-loss exactly at the bid is refused too", r1.status_code == 400, r1.text)
+    r1 = c.post("/api/exits", headers=H, json={"ticker": "KXA-1", "take_profit": 0.45})
+    check("take-profit below the current bid is refused and explained", r1.status_code == 400 and "ABOVE the current price" in r1.text, r1.text)
+    check("a refused rule leaves the saved one untouched", ex.rules()[0]["stop_loss"] == 0.35 and ex.rules()[0]["take_profit"] == 0.60)
+    # suggested levels: 20 YES bought at .40 (exp 8), bid .50 / ask .52, daily loss limit decides the cap
+    sg = c.get("/api/exits/suggest/KXA-1", headers=H)
+    j = sg.json()
+    check("suggest: stop under the bid, floor under the stop, take above the bid", sg.status_code == 200 and j["side"] == "yes"
+          and j["floor"] < j["stop_loss"] < j["bid"] < j["take_profit"] <= 0.99 and close(j["entry"], 0.40), j)
+    check("suggest: stop at least 3c under the bid", j["bid"] - j["stop_loss"] >= 0.03 - 1e-9, j)
+    check("suggest: dollar effect reported and labelled as not a forecast", close(j["at_stop"], (j["stop_loss"] - 0.40) * 20, 0.011)
+          and "not a forecast" in j["disclaimer"] and j["basis"], j)
+    ok_ = c.post("/api/exits", headers=H, json={"ticker": "KXA-1", "take_profit": j["take_profit"], "stop_loss": j["stop_loss"], "floor": j["floor"]})
+    check("suggest: the suggested levels are accepted as a rule", ok_.status_code == 200, ok_.text)
+    c.post("/api/exits", headers=H, json={"ticker": "KXA-1", "take_profit": 0.60, "stop_loss": 0.35})
+    check("suggest: no position -> refused", c.get("/api/exits/suggest/KXZZ-9", headers=H).status_code == 400)
+    # near $1: entry .90, bid .90 -> the gain is capped, and the app says so; big position -> stop tightened to the loss cap
+    S["positions"]["KXA-1"] = {"pos": Decimal("10"), "exp": Decimal("9"), "fees": Decimal("0")}
+    eng.positions_cache["ts"] = 0
+    mk_ = S["events"][0]["markets"][0]
+    keep = {k_: mk_[k_] for k_ in ("yes_bid_dollars", "yes_ask_dollars", "no_bid_dollars", "no_ask_dollars", "previous_price_dollars")}
+    mk_.update(yes_bid_dollars="0.9000", yes_ask_dollars="0.9100", no_bid_dollars="0.0900", no_ask_dollars="0.1000", previous_price_dollars="0.9000")
+    lim = cfg.risk["max_daily_loss"]
+    cfg.data["risk"]["max_daily_loss"] = 1000
+    j = c.get("/api/exits/suggest/KXA-1", headers=H).json()
+    check("suggest near $1: stop .87, floor .85, take capped; the poor ratio is pointed out", close(j["stop_loss"], 0.87) and close(j["floor"], 0.85)
+          and j["take_profit"] <= 0.99 and close(j["take_profit"], 0.94, 0.011), j)
+    S["positions"]["KXA-1"] = {"pos": Decimal("10"), "exp": Decimal("9.7"), "fees": Decimal("0")}      # paid .97, bid now .90
+    eng.positions_cache["ts"] = 0
+    j = c.get("/api/exits/suggest/KXA-1", headers=H).json()
+    check("suggest: take-profit that cannot repay the risk is flagged", any("against" in n for n in j["notes"]), j)
+    S["positions"]["KXA-1"] = {"pos": Decimal("200"), "exp": Decimal("180"), "fees": Decimal("0")}
+    eng.positions_cache["ts"] = 0
+    cfg.data["risk"]["max_daily_loss"] = 8                       # half = $4 -> 2c on 200 contracts
+    j = c.get("/api/exits/suggest/KXA-1", headers=H).json()
+    check("suggest: large position -> stop tightened to the loss cap", close(j["stop_loss"], 0.88) and any("tightened" in n or "large" in n for n in j["notes"]), j)
+    cfg.data["risk"]["max_daily_loss"] = lim
+    mk_.update(**keep)
+    S["positions"]["KXB-1"] = {"pos": Decimal("-10"), "exp": Decimal("4"), "fees": Decimal("0")}     # NO side: KXB-1 .55/.57 -> NO bid .43
+    eng.positions_cache["ts"] = 0
+    j = c.get("/api/exits/suggest/KXB-1", headers=H).json()
+    check("suggest for a NO position is in NO prices", j["side"] == "no" and close(j["bid"], 0.43) and j["stop_loss"] < 0.43 < j["take_profit"], j)
+    S["positions"]["KXB-1"]["pos"] = Decimal("0")
+    S["positions"]["KXA-1"] = {"pos": Decimal("20"), "exp": Decimal("8"), "fees": Decimal("0")}
+    eng.positions_cache["ts"] = 0
     n0 = len(S["orders"])
     check("bid .50 between stop .35 and take .60 -> nothing happens", ex.check() == [] and len(S["orders"]) == n0)
     mk = S["events"][0]["markets"][0]
@@ -224,7 +273,7 @@ def api_tests(tmp):
     # no bid -> no order; position closed by hand -> rule ends; never opens a position
     S["positions"]["KXC-1"] = {"pos": Decimal("5"), "exp": Decimal("2"), "fees": Decimal("0")}
     eng.positions_cache["ts"] = 0
-    c.post("/api/exits", headers=H, json={"ticker": "KXC-1", "stop_loss": 0.90})
+    ex.set_rule("KXC-1", stop_loss=0.90, check_prices=False)
     mc = S["events"][2]["markets"][0]
     mc.update(yes_bid_dollars="0.0000")
     n2 = len(S["orders"])
@@ -237,7 +286,7 @@ def api_tests(tmp):
     S["positions"]["KXC-1"]["pos"] = Decimal("300")
     eng.positions_cache["ts"] = 0
     cfg.update({"risk": {"max_contracts_per_order": 100}})
-    c.post("/api/exits", headers=H, json={"ticker": "KXC-1", "stop_loss": 0.90})
+    ex.set_rule("KXC-1", stop_loss=0.90, check_prices=False)
     out = ex.check()
     check("large position sold in chunks of the max contracts per order", out and out[0]["sold"] == 300 and S["positions"]["KXC-1"]["pos"] == 0, out)
     # confirmation + resting orders cleared first (KXD-1: .28/.30)
@@ -246,7 +295,7 @@ def api_tests(tmp):
     eng.positions_cache["ts"] = 0
     resting_sell = eng.place(ticker="KXD-1", intent="sell_yes", price="0.35", count=10, source="manual")   # rests above the bid
     other = c.post("/api/order", headers=H, json={"ticker": "KXB-1", "intent": "buy_yes", "price": "0.30", "count": 1}).json()["kalshi"]["order_id"]
-    c.post("/api/exits", headers=H, json={"ticker": "KXD-1", "stop_loss": 0.30})
+    ex.set_rule("KXD-1", stop_loss=0.30, check_prices=False)
     md = S["events"][3]["markets"][0]
     out1 = ex.check()
     check("first check with the stop hit: nothing sold yet", out1 == [] and S["positions"]["KXD-1"]["pos"] == 10)
@@ -263,7 +312,7 @@ def api_tests(tmp):
     cfg.update({"exits": {"confirm_checks": 1}})
     cfg.update({"exits": {"enabled": False}})
     S["positions"]["KXC-1"]["pos"] = Decimal("5")
-    c.post("/api/exits", headers=H, json={"ticker": "KXC-1", "stop_loss": 0.90})
+    ex.set_rule("KXC-1", stop_loss=0.90, check_prices=False)
     check("master switch off -> rules don't fire", ex.check() == [] and S["positions"]["KXC-1"]["pos"] == 5)
     cfg.update({"exits": {"enabled": True}})
     check("rule can be removed", c.delete("/api/exits/KXC-1", headers=H).json()["removed"] and ex.rules() == [])

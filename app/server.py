@@ -699,6 +699,15 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         except ValueError as e:
             raise HTTPException(400, str(e))
 
+    @app.get("/api/exits/suggest/{ticker}")
+    def exits_suggest(ticker: str):
+        if not eng.client.authenticated:
+            raise HTTPException(400, "no working API key for this environment")
+        try:
+            return eng.exits.suggest(ticker)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
     @app.delete("/api/exits/{ticker}")
     def exits_del(ticker: str):
         return {"removed": eng.exits.remove(ticker)}
