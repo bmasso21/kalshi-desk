@@ -365,6 +365,66 @@ def pick_trading_first(rows: list[dict], size: int, max_markets: int, max_capita
     return out
 
 
+def screen_all_markets(client, q: dict, sizes, now: float, known: set, min_spread: float = 0.02, min_volume: float = 50,
+                       top: int = 80, max_pages: int = 60, max_rps: float = 0, progress=None) -> tuple[list[dict], dict]:
+    """Trading-first candidates among ALL open markets (not just those with a reward program): walk the open markets,
+    keep those that pass the quoter's filters with spread >= min_spread and 24h volume >= min_volume, rank by the
+    trading score from the quoted top of book, then fetch real books for the best `top`. Rows have reward 0."""
+    prog = progress or (lambda msg: None)
+    pace = Pacer(max_rps)
+    cands, cur, pages, seen = [], None, 0, 0
+    while pages < max_pages:
+        pace()
+        page = with_retry(client.request, "GET", "/markets", {"status": "open", "mve_filter": "exclude", "limit": 1000, "cursor": cur})
+        pages += 1
+        ms = page.get("markets") or []
+        seen += len(ms)
+        prog(f"all markets: {seen} seen, {len(cands)} candidates")
+        for m in ms:
+            t = m.get("ticker")
+            if not t or t in known or (m.get("market_type") or "binary") != "binary":
+                continue
+            if fnum(m.get("volume_24h_fp") or m.get("volume_24h")) < min_volume:
+                continue
+            yb, ya = fnum(m.get("yes_bid_dollars")), fnum(m.get("yes_ask_dollars"))
+            if ya - yb < min_spread - EPS or not quoter_eligible(m, q, now)[0]:
+                continue
+            r = {"yes_bid": yb, "yes_ask": ya, "prev": fnum(m.get("previous_price_dollars")) or None}
+            sc = trading_score(r)["score"]
+            if sc > 0:
+                cands.append((sc, m))
+        cur = page.get("cursor")
+        if not cur:
+            break
+    cands.sort(key=lambda x: -x[0])
+    cands = cands[:top]
+    books: dict[str, dict] = {}
+    tick = [m["ticker"] for _, m in cands]
+    for i in range(0, len(tick), 20):
+        pace()
+        books.update(with_retry(client.orderbooks, tick[i:i + 20]))
+    rows = []
+    for _, m in cands:
+        t, ob = m["ticker"], books.get(m["ticker"]) or {}
+        yes_lv, no_lv = book_levels(ob.get("yes_dollars")), book_levels(ob.get("no_dollars"))
+        yb = yes_lv[0][0] if yes_lv else 0.0
+        nb = no_lv[0][0] if no_lv else 0.0
+        ya = 1 - nb if nb else 0.0
+        ok, why = quoter_eligible({**m, "yes_bid_dollars": yb, "yes_ask_dollars": ya}, q, now)
+        rows.append({"ticker": t, "series": t.split("-")[0], "event": m.get("event_ticker"), "title": m.get("title"),
+                     "sub": m.get("yes_sub_title"), "daily": 0.0, "target": 100.0, "df": 1.0, "days_left": 0.0,
+                     "max_per_account": None, "yes_bid": yb, "yes_ask": ya,
+                     "mid": round((yb + ya) / 2, 4) if yb and ya else None, "spread": round(ya - yb, 4) if yb and ya else None,
+                     "depth_yes": round(sum(c for _, c in yes_lv), 2), "depth_no": round(sum(c for _, c in no_lv), 2),
+                     "close_ts": iso_ts(m.get("close_time")), "quoter_ok": ok, "why_not": why,
+                     "volume_24h": fnum(m.get("volume_24h_fp") or m.get("volume_24h")),
+                     "last": fnum(m.get("last_price_dollars")) or None, "prev": fnum(m.get("previous_price_dollars")) or None,
+                     "no_program": True,
+                     "sizes": {str(sz): {"share_yes": 0.0, "share_no": 0.0, "eligible": False, "est_daily": 0.0,
+                                         "capital": round(sz * (yb + nb), 2)} for sz in sizes}})
+    return rows, {"seen": seen, "pages": pages, "candidates": len(cands), "complete": not cur}
+
+
 def pick_for_quoter(rows: list[dict], size: int, max_markets: int, max_capital: float, max_volume_24h: float = 0) -> list[dict]:
     """Best estimated reward per $ of capital first, until max_markets or the capital cap is reached."""
     k = str(size)
@@ -422,6 +482,12 @@ class Scanner:
             now = self.clock()
             rows, info = rank_markets(self.client, q, sizes, now, progress=prog)
             progs, pages, pools, live = info["programs"], info["pages"], info["pools"], info["live"]
+            extra_info = None
+            if params.get("include_all", True):
+                extra, extra_info = screen_all_markets(self.client, q, sizes, now, {r["ticker"] for r in rows} | set(pools),
+                                                       float(params.get("min_spread") or 0.02),
+                                                       float(params.get("min_volume_24h") or 50), progress=prog)
+                rows += extra
             with self.db.lock:
                 self.db.conn.executemany("INSERT OR REPLACE INTO mm_scan_rows VALUES(?,?,?)",
                                          [(sid, r["ticker"], json.dumps(r)) for r in rows])
@@ -435,7 +501,7 @@ class Scanner:
                 "eligible_now": {str(s): sum(1 for r in rows if r["sizes"][str(s)]["eligible"]) for s in sizes},
                 "allocation": {str(s): allocate(rows, s) for s in sizes},
                 "program_end_dates": _count(time.strftime("%Y-%m-%d", time.gmtime(v["end"])) for v in pools.values()),
-                "sizes": list(sizes), "quoter_rules": q,
+                "sizes": list(sizes), "quoter_rules": q, "all_markets": extra_info,
             }
             self.db.execute("UPDATE mm_scans SET status='done', progress='', summary=?, duration=? WHERE id=?",
                             (json.dumps(summary), round(time.time() - t0, 1), sid))
@@ -484,7 +550,7 @@ class SimQuoter:
                            "elig_sec": 0.0, "quoted_sec": 0.0, "fills": 0, "contracts": 0.0, "quotes": {},
                            "cooldown_until": 0.0, "mid_hist": [], "last_ts": None, "jumps": 0, "settled": None,
                            "max_capital": 0.0}
-        for k, v in (("side_pause", {}), ("bursts", 0), ("fill_pauses", 0)):
+        for k, v in (("side_pause", {}), ("bursts", 0), ("fill_pauses", 0), ("stop_until", 0.0), ("stops", 0)):
             self.s.setdefault(k, v)
 
     # fills ------------------------------------------------------------------
@@ -585,7 +651,12 @@ class SimQuoter:
             return True
         return False
 
-    def requote(self, now: float, market: dict, yes_lv, no_lv):
+    def tied_up(self) -> float:
+        """$ this market ties up: what was paid, less $1 for every YES+NO pair (pairs pay out $1), plus open quotes."""
+        s = self.s
+        return max(0.0, s["cost"] - min(s["pos_yes"], s["pos_no"])) + sum(q["px"] * q["left"] for q in s["quotes"].values())
+
+    def requote(self, now: float, market: dict, yes_lv, no_lv, allow_open: bool = True):
         s, p = self.s, self.p
         yb = yes_lv[0][0] if yes_lv else 0.0
         nb = no_lv[0][0] if no_lv else 0.0
@@ -617,6 +688,13 @@ class SimQuoter:
             px = round(nb + step, 4) if (step and net > 0) else round(nb - off, 4)
             if px >= 0.01:
                 want["no"] = (px, nlv.get(px, 0.0))
+        # per-market loss stop (like the live quoter): down this much on this market -> exit-only for a day
+        stop = float(p.get("market_loss_stop") or 0)
+        if stop > 0 and s["stop_until"] <= now and self.value(mid) - s["cost"] - s["fees"] <= -stop:
+            s["stop_until"] = now + 86400
+            s["stops"] += 1
+        if not allow_open or s["stop_until"] > now:      # capital cap reached or stopped: only the side that reduces
+            want = {k_: v_ for k_, v_ in want.items() if (k_ == "yes" and net < 0) or (k_ == "no" and net > 0)}
         requeue = float(p.get("requeue_sec", 60))
         for side in ("yes", "no"):
             q = s["quotes"].get(side)
@@ -636,6 +714,15 @@ class SimQuoter:
             self.s["settled"] = result
             self.s["quotes"] = {}
 
+    def liq_value(self, yb: float | None, ya: float | None, mid: float | None) -> float:
+        """What the inventory would fetch if sold now at the bid for the side held (pairs pay $1)."""
+        s = self.s
+        if s["settled"] or not yb or not ya:
+            return self.value(mid)
+        pairs = min(s["pos_yes"], s["pos_no"])
+        net = s["pos_yes"] - s["pos_no"]
+        return pairs + (net * yb if net > 0 else -net * (1 - ya))
+
     def value(self, mid: float | None) -> float:
         s = self.s
         if s["settled"] == "yes":
@@ -654,6 +741,8 @@ PRESETS = [
     {"name": "pull after fills / bursts", "pull_after_fill_min": 10, "burst_contracts": 200, "burst_pull_min": 10},
     {"name": "exit: step 1c inside at the inventory cap", "exit_step_in": True},
     {"name": "trading-first picks (spread >= 2c, edge before rewards)", "select_by": "trading", "min_spread": 0.02},
+    {"name": "as live: trading-first + $80 capital cap + $8 per-market stop + exit step-in", "select_by": "trading",
+     "min_spread": 0.02, "max_capital": 80, "market_loss_stop": 8, "exit_step_in": True},
 ]
 
 
@@ -679,6 +768,7 @@ class Shadow:
         self.mkt: dict[str, dict] = {}          # latest market objects
         self.mkt_ts = 0.0
         self.last_mid: dict[str, float] = {}
+        self.last_ba: dict[str, tuple] = {}
         self.mid_written: dict[tuple, tuple] = {}
         self.persist_ts = 0.0
         self.state = {"running": False, "polls": 0, "errors": 0, "last_error": None, "last_poll": None, "requests": 0}
@@ -733,7 +823,8 @@ class Shadow:
             p = {"name": "custom", "n_markets": 20, "size": 10, "poll_sec": 15, "max_days": 21, "max_inventory": 30,
                  "pull_hours": 6, "jump_cents": 4, "cooldown_min": 10, "refresh_sec": 15, "min_mid": 0.15, "max_mid": 0.85,
                  "max_spread": 0.06, "requeue_sec": 60, "per_series": 3, "offset_ticks": 0, "max_volume_24h": 0,
-                 "pull_after_fill_min": 0, "burst_contracts": 0, "burst_pull_min": 10, "exit_step_in": False, "select_by": "rewards", "min_spread": 0.02, **params}
+                 "pull_after_fill_min": 0, "burst_contracts": 0, "burst_pull_min": 10, "exit_step_in": False,
+                 "max_capital": 0, "market_loss_stop": 0, "select_by": "rewards", "min_spread": 0.02, **params}
             sc, k, picked = self._pick(scanner, p)
             fee_types: dict[str, dict] = {}
             for r in picked:
@@ -917,13 +1008,20 @@ class Shadow:
             sims = [(r, md, r.sims[(t, md)]) for r in holders[t] for md in MODELS]
             trades = self._trades(t) if any(sm.s["quotes"] for _, _, sm in sims) else self._skip_trades(t, now)
             prev_mid = self.last_mid.get(t, mid)
+            if yb and nb:
+                self.last_ba[t] = (yb, 1 - nb)
             for r, md, sim in sims:
                 for f in sim.apply_trades(trades):
                     fills.append((r.rid, t, md, f["ts"], f["side"], f["price"], f["count"], f["fee"], prev_mid, f["kind"]))
                 sim.accrue(now, yes_lv, no_lv, open_, max_dt)
                 if res in ("yes", "no"):
                     sim.settle(res)
-                sim.requote(now, m, yes_lv, no_lv)
+                cap = float(r.p.get("max_capital") or 0)
+                room = True
+                if cap > 0:                       # run-wide capital cap, per fill model
+                    used = sum(sm.tied_up() for (t2, md2), sm in r.sims.items() if md2 == md and t2 != t)
+                    room = used + sim.tied_up() + float(r.p.get("size", 10)) < cap
+                sim.requote(now, m, yes_lv, no_lv, allow_open=room)
             if mid is not None:
                 self.last_mid[t] = mid
                 for r in holders[t]:
@@ -954,6 +1052,7 @@ class Shadow:
             for (t, m), sim in r.sims.items():
                 s = dict(sim.s)
                 s["_mid"] = self.last_mid.get(t)
+                s["_ba"] = self.last_ba.get(t)
                 rows.append((r.rid, t, m, json.dumps(s), now))
         if rows:
             with self.db.lock:
@@ -984,13 +1083,16 @@ def report(wdb, run_id: int | None = None, live: Shadow | None = None, now: floa
         with live.lock:
             states = {(t, m): json.loads(json.dumps(sim.s)) for (t, m), sim in live.runs[run_id].sims.items()}
             mids_now = dict(live.last_mid)
+            ba_now = dict(live.last_ba)
     else:
-        states, mids_now = {}, {}
+        states, mids_now, ba_now = {}, {}, {}
         for r in wdb.query("SELECT * FROM mm_state WHERE run_id=?", (run_id,)):
             s = json.loads(r["state"])
             states[(r["ticker"], r["model"])] = s
             if s.get("_mid") is not None:
                 mids_now[r["ticker"]] = s["_mid"]
+            if s.get("_ba"):
+                ba_now[r["ticker"]] = tuple(s["_ba"])
     markets = {r["ticker"]: json.loads(r["info"]) for r in wdb.query("SELECT * FROM mm_markets WHERE run_id=?", (run_id,))}
     end = run["stopped_ts"] or now
     days = max(1e-9, (end - run["ts"]) / 86400)
@@ -1010,6 +1112,7 @@ def report(wdb, run_id: int | None = None, live: Shadow | None = None, now: floa
 
     fills = wdb.query("SELECT * FROM mm_fills WHERE run_id=? ORDER BY ts", (run_id,))
     out_models = {}
+    tot_liq: dict[str, float] = {}
     for md in MODELS:
         tot = {k: 0.0 for k in ("reward", "cost", "fees", "value", "contracts", "fills", "total_sec", "elig_sec", "quoted_sec", "jumps")}
         per = []
@@ -1019,6 +1122,9 @@ def report(wdb, run_id: int | None = None, live: Shadow | None = None, now: floa
                 continue
             sim = SimQuoter(info, {}, md, s)
             val = sim.value(mids_now.get(t))
+            ba = ba_now.get(t) or (None, None)
+            liq = sim.liq_value(ba[0], ba[1], mids_now.get(t))
+            tot_liq[md] = tot_liq.get(md, 0.0) + liq - s["cost"] - s["fees"]
             trading = val - s["cost"] - s["fees"]
             row = {"ticker": t, "title": info.get("title"), "sub": info.get("sub"), "pool_daily": info["daily"],
                    "scan_est_daily": info.get("scan_est_daily"), "reward": round(s["reward"], 4),
@@ -1058,6 +1164,8 @@ def report(wdb, run_id: int | None = None, live: Shadow | None = None, now: floa
             "cost": round(tot["cost"], 2), "fees": round(tot["fees"], 2), "value": round(tot["value"], 2),
             "trading_pnl": round(trading, 2), "net": round(tot["reward"] + trading, 2),
             "trading_per_day": round(trading / days, 2),
+            "trading_pnl_exit": round(tot_liq.get(md, 0.0), 2),      # inventory sold at the bid instead of marked to the mid
+            "stops": sum(int(states.get((t_, md), {}).get("stops", 0)) for t_ in markets),
             "reward_per_day": round(tot["reward"] / days, 2), "net_per_day": round((tot["reward"] + trading) / days, 2),
             "edge_at_fill_cents": round(100 * edge_sum[0] / edge_sum[1], 2) if edge_sum[1] else None,
             "markout_cents": {f"{h // 60}m": (round(100 * v[0] / v[1], 2) if v[1] else None) for h, v in mk_sum.items()},
@@ -1069,9 +1177,9 @@ def report(wdb, run_id: int | None = None, live: Shadow | None = None, now: floa
         }
     params = json.loads(run["params"])
     # Pass/fail is on TRADING alone (strict fills): rewards are a bonus on top, never what makes a strategy pass.
-    tq = out_models["queue"]["trading_pnl"]
+    tq = out_models["queue"]["trading_pnl_exit"]          # strict fills AND inventory valued at what it could be sold for
     enough = days >= 5 and out_models["queue"]["fills"] >= 30
-    verdict = {"basis": "trading P&L under strict fills, rewards excluded", "enough_data": enough,
+    verdict = {"basis": "trading P&L under strict fills with inventory valued at the bid (what selling now would fetch), rewards excluded", "enough_data": enough,
                "status": ("pass" if tq >= 0 else "fail") if enough else ("ahead" if tq >= 0 else "behind"),
                "trading_pnl": tq, "bonus_rewards": out_models["queue"]["reward"],
                "needs": None if enough else "at least 5 days and 30 fills"}

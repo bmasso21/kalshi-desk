@@ -187,8 +187,9 @@ def create_mock(public_keys: dict[str, object]):
         return {"market_positions": mp, "event_positions": [], "cursor": ""}
 
     @app.get(PREFIX + "/portfolio/orders")
-    def orders(status: str = "", limit: int = 100, min_ts: int = 0, cursor: str = ""):
-        return {"orders": [o for o in S["orders"].values() if not status or o["status"] == status], "cursor": ""}
+    def orders(status: str = "", limit: int = 100, min_ts: int = 0, cursor: str = "", ticker: str = ""):
+        return {"orders": [o for o in S["orders"].values() if (not status or o["status"] == status)
+                           and (not ticker or o["ticker"] == ticker)], "cursor": ""}
 
     @app.get(PREFIX + "/incentive_programs")
     def incentives(status: str = "", type: str = "", limit: int = 100, cursor: str = ""):

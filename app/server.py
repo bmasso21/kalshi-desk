@@ -41,6 +41,8 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     oddspapi = OddsPapi(lambda: cfg.data.get("sports") or {}, wdb)
     app_sp_state = {"running": False}
     eng.weather = WxCollector(eng, wx_store)
+    from .maintenance import Maintenance
+    maint = Maintenance(eng, wdb)
     from . import mm as mmod
     mm_scanner = mmod.Scanner(wdb, client=KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
     mm_shadow = mmod.Shadow(wdb, client=KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
@@ -59,6 +61,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     app.state.auth = auth
     app.state.wdb = wdb
     app.state.mm = (mm_scanner, mm_shadow)
+    app.state.maint = maint
     session_token = secrets.token_urlsafe(24)  # CSRF guard for state-changing calls
     prod_confirms: dict[str, float] = {}
 
@@ -68,6 +71,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             eng.start()
             eng.warehouse.start()
             eng.weather.start()
+            maint.start()
             try:
                 mm_shadow.resume()
             except Exception as e:
@@ -78,6 +82,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
 
     @app.on_event("shutdown")
     def _stop():
+        maint.stop()
         mm_shadow.shutdown()
         eng.weather.stop()
         eng.warehouse.stop()
@@ -259,10 +264,29 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             if "enabled" in bp:
                 bp["enabled"] = bool(bp["enabled"])
             patch["breakers"] = bp            # 'tripped' / peak reset only via the reset endpoint
+        if isinstance(patch.get("maintenance"), dict):
+            mp_ = {}
+            src = patch["maintenance"]
+            if "enabled" in src:
+                mp_["enabled"] = bool(src["enabled"])
+            if re.fullmatch(r"[0-2]?\d:[0-5]\d", str(src.get("time") or "")):
+                mp_["time"] = str(src["time"])
+            for k, lo, hi in (("keep_days", 1, 60), ("prune_days", 7, 3650), ("warehouse_max_gb", 0, 500)):
+                if k in src:
+                    try:
+                        mp_[k] = max(lo, min(hi, float(src[k])))
+                    except (TypeError, ValueError):
+                        pass
+            patch["maintenance"] = mp_
         if isinstance(patch.get("exits"), dict):
             ex = {}
             if "enabled" in patch["exits"]:
                 ex["enabled"] = bool(patch["exits"]["enabled"])
+            if "confirm_checks" in patch["exits"]:
+                try:
+                    ex["confirm_checks"] = max(1, min(10, int(patch["exits"]["confirm_checks"])))
+                except (TypeError, ValueError):
+                    pass
             if "check_sec" in patch["exits"]:
                 try:
                     ex["check_sec"] = max(10, min(600, float(patch["exits"]["check_sec"])))
@@ -323,6 +347,14 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 errors.append(f"Circuit breaker tripped for {', '.join(blocked)} - reset it first")
         if isinstance(patch.get("quoter"), dict):
             qp = patch["quoter"]
+            if "universe" in qp and qp["universe"] not in ("all", "rewards"):
+                qp.pop("universe")
+            for k, lo, hi in (("market_loss_pct", 0, 100), ("min_volume_24h", 0, 10 ** 9)):
+                if k in qp:
+                    try:
+                        qp[k] = max(lo, min(hi, float(qp[k])))
+                    except (TypeError, ValueError):
+                        qp.pop(k)
             if "select_by" in qp and qp["select_by"] not in ("trading", "rewards"):
                 qp.pop("select_by")
                 errors.append("quoter select_by must be 'trading' or 'rewards'")
@@ -628,6 +660,16 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         r["filters"] = json.loads(r["filters"] or "{}")
         return r
 
+    # ---------------------------------------------------- maintenance (3.4) --
+    @app.get("/api/maintenance")
+    def maint_status():
+        return {"state": maint.state, "sizes": maint.sizes(), "config": cfg.data.get("maintenance"),
+                "backups": sorted(p.name for p in maint.dir.glob("*") if p.is_file())[-30:] if maint.dir.exists() else []}
+
+    @app.post("/api/maintenance/run")
+    def maint_run():
+        return maint.run()
+
     # ------------------------------------------------- scaling + exits (3.2) --
     @app.get("/api/scaling")
     def scaling_status():
@@ -716,7 +758,9 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     @app.post("/api/mm/scan")
     def mm_scan():
         try:
-            sid = mm_scanner.start({"quoter": {k: cfg.quoter.get(k) for k in ("pull_hours", "max_spread", "min_mid", "max_mid")}})
+            sid = mm_scanner.start({"quoter": {k: cfg.quoter.get(k) for k in ("pull_hours", "max_spread", "min_mid", "max_mid")},
+                                    "include_all": (cfg.quoter.get("universe") or "all") == "all",
+                                    "min_spread": cfg.quoter.get("min_spread"), "min_volume_24h": cfg.quoter.get("min_volume_24h")})
         except RuntimeError as e:
             raise HTTPException(409, str(e))
         return {"id": sid}
@@ -751,6 +795,9 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 p[k] = max(lo, min(hi, float(b[k])))
         if b.get("exit_step_in"):
             p["exit_step_in"] = True
+        for k, lo, hi in (("max_capital", 0, 10 ** 7), ("market_loss_stop", 0, 10 ** 6)):
+            if b.get(k) is not None:
+                p[k] = max(lo, min(hi, float(b[k])))
         if b.get("select_by") == "trading":
             p["select_by"] = "trading"
             p["min_spread"] = max(0.01, min(0.2, float(b.get("min_spread") or 0.02)))

@@ -64,6 +64,9 @@ DEFAULTS = {
         "max_volume_24h": 0,            # skip markets that traded more than this in 24h (0 = no limit)
         "select_by": "trading",         # "trading" = pick by estimated trading edge, rewards as a bonus; "rewards" = by reward per $
         "min_spread": 0.02,             # trading-first: skip markets with a tighter spread than this
+        "market_loss_pct": 10,          # stop opening in a market once today's quoter loss there reaches this % of its capital (0 = off)
+        "universe": "all",              # trading-first candidates: "all" open markets, or "rewards" = only markets with a reward program
+        "min_volume_24h": 50,           # trading-first, markets without a reward program: need at least this 24h volume
         "exit_step_in": True,           # at the inventory cap, the reducing quote steps 1c inside the spread (if >= 2c wide)
     },
     # --- limits that scale with the account (see app/scaling.py); tiers default to scaling.DEFAULT_TIERS ---
@@ -74,7 +77,9 @@ DEFAULTS = {
         "base": None, "base_day": None, "base_env": None, "tier": None, "limits": None,
     },
     # --- exit rules: per-position take-profit / stop-loss (closing orders only) ---
-    "exits": {"enabled": True, "check_sec": 30},
+    "exits": {"enabled": True, "check_sec": 30, "confirm_checks": 2},
+    # --- nightly backup + pruning ---
+    "maintenance": {"enabled": True, "time": "03:30", "keep_days": 7, "prune_days": 30, "warehouse_max_gb": 4},
     # --- circuit breakers (Phase 3) - every limit 0 = off until you set it ----------
     "breakers": {
         "enabled": True,                # compute P&L / drawdown every check_min (acts only on limits > 0)

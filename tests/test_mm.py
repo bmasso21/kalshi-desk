@@ -199,6 +199,25 @@ def sim_tests():
           set(d3.s["quotes"]) == {"no"} and d3.s["quotes"]["no"]["px"] == 0.59 and d3.s["quotes"]["no"]["ahead"] == 0, d3.s["quotes"])
     d3.requote(8001, MK, YES, [(0.59, 50.0)])
     check("exit step-in: no step when the spread is 1c", d3.s["quotes"]["no"]["px"] == 0.59 and (1 - 0.59) - 0.40 < 0.02)
+    d4 = mm.SimQuoter(INFO, {**P, "market_loss_stop": 1.0}, "touch")
+    d4.s.update(pos_yes=20, cost=10.0)                       # bought 20 YES at .50; mid now .41 -> down $1.80
+    d4.requote(9000, MK, YES, NO)
+    check("per-market loss stop: exit-only (just the reducing side) once the market is down past the stop",
+          set(d4.s["quotes"]) == {"no"} and d4.s["stops"] == 1 and d4.s["stop_until"] > 9000, d4.s["quotes"])
+    d5 = mm.SimQuoter(INFO, P, "touch")
+    d5.requote(9100, MK, YES, NO, allow_open=False)
+    check("capital cap reached and flat: no new quotes", d5.s["quotes"] == {})
+    d5.s.update(pos_no=10, cost=5.8)
+    d5.requote(9200, MK, YES, NO, allow_open=False)
+    check("capital cap reached with inventory: only the reducing side", set(d5.s["quotes"]) == {"yes"})
+    check("tied-up capital = cost - $1 per YES/NO pair + open quotes", close(d5.tied_up(), 5.8 + 0.40 * 10))
+    d5.s.update(pos_yes=10, cost=9.8)
+    d5.s["quotes"] = {}
+    check("a full YES+NO pair ties up nothing (it pays out $1)", close(d5.tied_up(), 0.0))
+    d6 = mm.SimQuoter(INFO, P, "touch")
+    d6.s.update(pos_yes=30, pos_no=10)
+    check("liquidation value: pairs at $1, the rest at the bid for the side held", close(d6.liq_value(0.40, 0.42, 0.41), 10 + 20 * 0.40)
+          and close(d6.value(0.41), 30 * 0.41 + 10 * 0.59))
     s.settle("no")
     check("settled market: quotes dropped, value = payout", not s.s["quotes"] and s.value(0.5) == s.s["pos_no"])
 
@@ -251,7 +270,7 @@ def integration_tests(tmp):
     rep = mm.report(wdb, rid, now=clock["t"] + 7200)
     m = rep["models"]["queue"]
     check("verdict is on trading alone, rewards listed as a bonus; early runs are only 'ahead'/'behind'",
-          rep["verdict"]["status"] == "ahead" and rep["verdict"]["enough_data"] is False and rep["verdict"]["trading_pnl"] == m["trading_pnl"]
+          rep["verdict"]["status"] == "ahead" and rep["verdict"]["enough_data"] is False and rep["verdict"]["trading_pnl"] == m["trading_pnl_exit"] and close(m["trading_pnl_exit"], 10 * 0.50 - 5.0, 0.011) and close(m["trading_pnl"], 0.1, 0.011)
           and rep["verdict"]["bonus_rewards"] == m["reward"] and "rewards excluded" in rep["verdict"]["basis"], rep["verdict"])
     check("report: fills, contracts and cost", m["fills"] == 1 and m["contracts"] == 10 and close(m["cost"], 5.0), m)
     check("report: inventory marked to mid, net = rewards + trading", close(m["value"], 10 * 0.51) and close(m["net"], round(m["reward"] + m["trading_pnl"], 2), 0.011), m)
@@ -271,7 +290,7 @@ def integration_tests(tmp):
     ids = sh3.start_set(sc, {"n_markets": 5, "size": 10, "poll_sec": 10, "per_series": 3})
     names = [json.loads(r["params"])["name"] for r in wdb.query(f"SELECT params FROM mm_runs WHERE id IN ({','.join(map(str, ids))}) ORDER BY id")]
     check("variant set: quiet-market preset skipped when no market qualifies (mock volume 500)",
-          len(ids) == 5 and not any("quiet" in n for n in names) and any("quiet" in x for x in sh3.last_skipped), (names, sh3.last_skipped))
+          len(ids) == 6 and not any("quiet" in n for n in names) and any("quiet" in x for x in sh3.last_skipped), (names, sh3.last_skipped))
     clock["t"] += 10
     sh3.step()
     off = next(r for r in sh3.runs.values() if r.p.get("offset_ticks"))
@@ -284,7 +303,7 @@ def integration_tests(tmp):
                             "count_fp": "250.00", "taker_book_side": "ask"}]
     sh3.step()
     tr_calls = [c_ for c_ in mock.state.calls[calls_before:] if c_[1].endswith("/markets/trades")]
-    check("shared feed: one trades request per market per poll for all runs", len(tr_calls) == len({c_[2].split("&")[0] for c_ in tr_calls}) and 1 <= len(tr_calls) <= 2, tr_calls)
+    check("shared feed: one trades request per market per poll for all runs", len(tr_calls) == len({c_[2].split("&")[0] for c_ in tr_calls}) and len(tr_calls) >= 1, tr_calls)
     pull = next(r for r in sh3.runs.values() if r.p.get("pull_after_fill_min"))
     ps = pull.sims[("KXA-1", "queue")].s
     check("every run fills from the same trade", all(r.sims[("KXA-1", "queue")].s["pos_yes"] == 10 for r in sh3.runs.values()))
@@ -293,9 +312,9 @@ def integration_tests(tmp):
     check("pull variant: YES side paused after its fill", ps["side_pause"].get("yes", 0) > clock["t"] and ps["fill_pauses"] >= 1, ps)
     check("baseline keeps quoting after the same trade", "yes" in base_run.sims[("KXA-1", "queue")].s["quotes"])
     reps = [mm.report(wdb, i, live=sh3, now=clock["t"]) for i in ids]
-    check("reports per run carry the variant name", all(r["name"] for r in reps) and len(reps) == 5)
+    check("reports per run carry the variant name", all(r["name"] for r in reps) and len(reps) == 6)
     sh3.stop(ids[0])
-    check("stop one run keeps the others", ids[0] not in sh3.runs and len(sh3.runs) == 4
+    check("stop one run keeps the others", ids[0] not in sh3.runs and len(sh3.runs) == 5
           and wdb.query("SELECT status FROM mm_runs WHERE id=?", (ids[0],))[0]["status"] == "stopped")
     sh3.stop()
     check("stop all", not sh3.runs)
@@ -323,18 +342,20 @@ def integration_tests(tmp):
             break
         time.sleep(0.1)
     check("scan finishes via API", j["scan"]["status"] == "done", j["scan"])
-    check("scan rows endpoint", len(c.get("/api/mm/scan/rows?size=10&all=1").json()["rows"]) == 2)
+    rws = c.get("/api/mm/scan/rows?size=10&all=1&limit=500").json()["rows"]
+    check("scan rows: reward markets plus trading candidates from all open markets", sum(1 for r in rws if not r.get("no_program")) == 2
+          and any(r.get("no_program") and r["ticker"].startswith("KXD") for r in rws) and not any(r["ticker"] == "KXC-1" for r in rws), [r["ticker"] for r in rws])
     r = c.post("/api/mm/shadow/start", headers=H, json={"n_markets": 99, "size": 10, "poll_sec": 1})
     check("shadow start clamps params", r.status_code == 200 and r.json()["params"]["n_markets"] == 40 and r.json()["params"]["poll_sec"] == 5, r.text)
     r2 = c.post("/api/mm/shadow/start", headers=H, json={"name": "behind", "offset_ticks": 9})
     check("a second run can start alongside (offset clamped to 5)", r2.status_code == 200 and r2.json()["params"]["offset_ticks"] == 5
           and len(app.state.mm[1].runs) == 2, r2.text)
     r3 = c.post("/api/mm/shadow/start_set", headers=H, json={"n_markets": 5})
-    check("variant set via API (quiet preset skipped on the mock)", r3.status_code == 200 and len(r3.json()["ids"]) == 5 and r3.json()["skipped"], r3.text)
+    check("variant set via API (quiet preset skipped on the mock)", r3.status_code == 200 and len(r3.json()["ids"]) == 6 and r3.json()["skipped"], r3.text)
     check("shadow re-places like the live quoter (quote lifetime - 60s)", r3.json()["params"]["requeue_sec"] == 540)
     time.sleep(0.5)
     j = c.get("/api/mm").json()
-    check("status lists every run", len(j["shadow"]["runs"]) == 7 and len(j["reports"]) == 7, j["shadow"])
+    check("status lists every run", len(j["shadow"]["runs"]) == 8 and len(j["reports"]) == 8, j["shadow"])
     time.sleep(0.5)
     check("shadow stop", c.post("/api/mm/shadow/stop", headers=H).status_code == 200 and not app.state.mm[1].status()["alive"])
     check("report endpoint", c.get("/api/mm/report").status_code == 200)
@@ -452,13 +473,22 @@ def quoter_select_tests():
     check("quoter select: $10/day pool picked, $0.30/day pool below the minimum ignored", [x["ticker"] for x in sel] == ["KXA-1"], msg)
     check("quoter select: estimate from Kalshi's formula", close(float(sel[0]["est_daily"]), round(10 * (10 / 210 + 10 / 210) / 2, 4), 1e-4), sel)
     check("quoter select: share and capital reported", close(float(sel[0]["share"]), 10 / 210, 1e-4) and close(float(sel[0]["capital"]), 9.8), sel)
-    cfg["select_by"] = "trading"
+    cfg["select_by"], cfg["universe"] = "trading", "rewards"
     sel_t, msg_t = q.select(KalshiClient(base))
     check("quoter trading-first: both 2c-spread markets qualify, reward or not; the rewarded one ranks first on the tie",
           [x["ticker"] for x in sel_t] == ["KXA-1", "KXB-1"] and float(sel_t[0]["edge_cents"]) == 0.75 and "TRADING-FIRST" in msg_t, msg_t)
     cfg["min_spread"] = 0.03
     check("quoter trading-first: min spread 3c -> nothing qualifies", q.select(KalshiClient(base))[0] == [])
     cfg.pop("min_spread")
+    cfg["universe"] = "all"
+    sel_a, msg_a = q.select(KalshiClient(base))
+    tk = [x["ticker"] for x in sel_a]
+    check("quoter trading-first, all markets: candidates without any reward program are picked too, wide KXC is not",
+          len(tk) == 5 and tk[:2] == ["KXA-1", "KXB-1"] and "KXA-2" in tk and "KXC-1" not in tk and "open markets screened" in msg_a, msg_a)
+    cfg["min_volume_24h"] = 10 ** 6
+    tk = [x["ticker"] for x in q.select(KalshiClient(base))[0]]
+    check("...markets without a program need the minimum 24h volume", tk == ["KXA-1", "KXB-1"], tk)
+    cfg.pop("min_volume_24h")
     cfg["select_by"] = "rewards"
     fm = q._fmt(sel)
     check("quoter select: UI format is plain strings", isinstance(fm[0]["capital"], str) and fm[0]["share"] == "4.8", fm)

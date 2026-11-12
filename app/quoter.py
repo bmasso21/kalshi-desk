@@ -54,6 +54,7 @@ class Quoter:
         self.mid_hist: dict[str, collections.deque] = {}
         self.last_cycle = 0.0
         self.last_sweep = 0.0
+        self.mkt_stop: dict[str, float] = {}            # ticker -> no new quotes until this time
         self.cycles = 0
 
     # ------------------------------------------------------------ helpers --
@@ -91,6 +92,37 @@ class Quoter:
             if e.status != 404:  # 404 = already filled/expired/cancelled
                 self.log("cancel_error", f"{ticker} {side}: {e}")
             return False
+
+    def _own_markets(self) -> set:
+        """Markets with quoter fills in the last 60 days (cached a minute)."""
+        c = self.__dict__.setdefault("_own_cache", {"ts": 0.0, "env": None, "set": set()})
+        if time.time() - c["ts"] > 60 or c["env"] != self.e.cfg.env:
+            rows = self.e.db.query("SELECT DISTINCT ticker FROM fills WHERE env=? AND strategy='liquidity' AND ts>=?",
+                                   (self.e.cfg.env, time.time() - 60 * 86400))
+            c.update(ts=time.time(), env=self.e.cfg.env, set={r["ticker"] for r in rows})
+        return c["set"]
+
+    def _check_market_stops(self, markets: dict, now: float):
+        """Per-market loss stop: if today's quoter fills in one market are down `market_loss_pct` % of the quoter's
+        capital (marked to the mid), stop OPENING there until tomorrow. Exits keep working."""
+        pct = float(self.cfg.get("market_loss_pct") or 0)
+        if pct <= 0:
+            return
+        from .breakers import fill_pnl, market_mark
+        limit = pct / 100 * float(self.cfg["max_capital"])
+        day0 = risk.start_of_today()
+        pnl: dict[str, float] = {}
+        for f in self.e.db.query("SELECT ticker, action, outcome_side, book_side, yes_price, count, fee FROM fills "
+                                 "WHERE env=? AND strategy='liquidity' AND ts>=?", (self.e.cfg.env, day0)):
+            p = fill_pnl(f, market_mark(markets.get(f["ticker"])))
+            if p is not None:
+                pnl[f["ticker"]] = pnl.get(f["ticker"], 0.0) + p
+        for t, v in pnl.items():
+            if -v >= limit and self.mkt_stop.get(t, 0) <= now:
+                self.mkt_stop[t] = day0 + 86400
+                self.log("market_stop", f"{t}: down ${-v:.2f} today (limit ${limit:.2f}); no new quotes there until tomorrow")
+                self.e.db.audit("quoter_market_stop", f"{t}: quoter down ${-v:.2f} in this market today "
+                                                      f"(limit ${limit:.2f} = {pct:g}% of its capital). Exit-only until tomorrow.")
 
     def sweep_strays(self, client) -> int:
         """Cancel resting orders the quoter sent but is not tracking (a request whose reply was lost, or orders left
@@ -188,6 +220,15 @@ class Quoter:
         trading_first = (c.get("select_by") or "trading") == "trading"
         rows, info = mm.rank_markets(client, rules, (size,), time.time(), prefilter=True,
                                      min_pool=0.0 if trading_first else float(c.get("min_daily_reward") or 0), max_rps=4)
+        if trading_first and (c.get("universe") or "all") == "all":
+            try:
+                extra, xinfo = mm.screen_all_markets(client, rules, (size,), time.time(), {r["ticker"] for r in rows} | set(info["pools"]),
+                                                     float(c.get("min_spread") or 0.02), float(c.get("min_volume_24h") or 50),
+                                                     top=40, max_rps=4)
+                rows = rows + extra
+                info["all_markets"] = xinfo
+            except Exception as e:
+                self.log("error", f"all-markets screen failed (using reward markets only): {e}")
         if trading_first:
             picked = mm.pick_trading_first(rows, size, int(c["max_markets"]), float(c["max_capital"]),
                                            float(c.get("min_spread") or 0.02), float(c.get("max_volume_24h") or 0),
@@ -203,7 +244,9 @@ class Quoter:
                    "spread_cents": round(100 * (r.get("spread") or 0), 1)} for r in picked]
         paying = sum(1 for r in rows if r["sizes"][k]["est_daily"] > 0)
         if trading_first:
-            return chosen, (f"TRADING-FIRST: {info['programs']} programs; {len(rows)} markets pass the filters; picked {len(chosen)} with "
+            am = info.get("all_markets")
+            return chosen, (f"TRADING-FIRST: {info['programs']} programs" + (f" + {am['seen']} open markets screened ({am['candidates']} candidates)" if am else "")
+                            + f"; {len(rows)} markets pass the filters; picked {len(chosen)} with "
                             f"spread >= {float(c.get('min_spread') or 0.02):.2f} and a positive estimated edge before rewards "
                             f"(capital ${sum(x['capital'] for x in chosen):.2f} of ${c['max_capital']}): "
                             + ", ".join(f"{x['ticker']} (edge {x['edge_cents']}c/contract, spread {x['spread_cents']}c, "
@@ -248,24 +291,27 @@ class Quoter:
             self._refresh_bg()
         client = self.e.client
         sel = {s["ticker"] for s in self.selected}
-        # drop quotes in markets no longer selected
-        for t in [t for t in self.quotes if t not in sel]:
+        positions = self.e.positions(max_age=5) or {"market_positions": []}
+        held = {mp["ticker"]: d(mp.get("position_fp")) for mp in positions.get("market_positions", [])}
+        # markets the quoter still holds inventory in but no longer selects: keep working OUT of them (exit-only)
+        exit_only = {t for t in self._own_markets() if held.get(t, Decimal(0)) != 0} - sel
+        active_set = sel | exit_only
+        # drop quotes in markets that are neither selected nor held
+        for t in [t for t in self.quotes if t not in active_set]:
             for side in list(self.quotes[t]):
                 self._cancel(t, side)
             self.quotes.pop(t, None)
-        if not sel:
+        if not active_set:
             self._update_state(client)
             return
         feed = getattr(self.e, "feed", None)
         if feed:
-            feed.want("quoter", sel)
+            feed.want("quoter", active_set)
         markets = {m["ticker"]: (feed.market_overlay(m) if feed else m)
-                   for m in client.markets(status=None, tickers=sorted(sel), exclude_combos=False)}
+                   for m in client.markets(status=None, tickers=sorted(active_set), exclude_combos=False)}
         live_orders = feed.resting_orders() if feed else None
         resting = {o["order_id"]: o for o in (live_orders if live_orders is not None
                                                else client.orders(status="resting", max_items=1000))}
-        positions = self.e.positions(max_age=5) or {"market_positions": []}
-        held = {mp["ticker"]: d(mp.get("position_fp")) for mp in positions.get("market_positions", [])}
         exposure = {mp["ticker"]: abs(d(mp.get("market_exposure_dollars"))) for mp in positions.get("market_positions", [])}
         spent = self.e.spent_today(max_age=5)
         now = time.time()
@@ -285,14 +331,19 @@ class Quoter:
         if now - self.last_sweep >= 60:
             self.last_sweep = now
             self.sweep_strays(client)
+            self._check_market_stops(markets, now)
 
-        for t in sorted(sel):
+        for t in sorted(active_set):
             m = markets.get(t)
-            if not m or not self._eligible(m):
+            pos = held.get(t, Decimal(0))
+            yb, ya = (d(m.get("yes_bid_dollars")), d(m.get("yes_ask_dollars"))) if m else (Decimal(0), Decimal(0))
+            # opening new risk needs the full filter; working out of a position only needs an open two-sided market
+            open_ok = bool(m) and t in sel and bool(self._eligible(m)) and self.mkt_stop.get(t, 0) <= now
+            exit_ok = bool(m) and pos != 0 and m.get("status") == "active" and Decimal(0) < yb < ya < ONE
+            if not open_ok and not exit_ok:
                 for side in list(self.quotes.get(t, {})):
                     self._cancel(t, side)
                 continue
-            yb, ya = d(m["yes_bid_dollars"]), d(m["yes_ask_dollars"])
             mid = (yb + ya) / 2
             last = self._jumped(t, mid, now)
             self.last_mid[t] = mid
@@ -304,7 +355,6 @@ class Quoter:
                 continue
             if self.cooldown.get(t, 0) > now:
                 continue
-            pos = held.get(t, Decimal(0))
             inv = d(self.cfg["max_inventory"])
             size = d(self.cfg["size"])
             tick = Decimal("0.01")
@@ -316,11 +366,11 @@ class Quoter:
             want = {}
             if pos < 0:
                 want["yes"] = ("sell_no", ONE - (yb + step), min(size, -pos), True)     # bid YES at yb(+1c) = sell NO
-            elif pos < inv:
+            elif pos < inv and open_ok:
                 want["yes"] = ("buy_yes", yb, size, False)                               # join best YES bid
             if pos > 0:
                 want["no"] = ("sell_yes", ya - step, min(size, pos), True)               # ask YES at ya(-1c) = sell YES
-            elif -pos < inv:
+            elif -pos < inv and open_ok:
                 want["no"] = ("buy_no", ONE - ya, size, False)                           # join best NO bid (= YES ask)
             for side in ("yes", "no"):
                 q = self.quotes.get(t, {}).get(side)

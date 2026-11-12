@@ -175,6 +175,8 @@ def api_tests(tmp):
 
     # ---- exit rules ----
     ex = eng.exits
+    check("default: a condition must hold on 2 checks in a row", cfg.data["exits"]["confirm_checks"] == 2)
+    cfg.update({"exits": {"confirm_checks": 1}})
     S["balance"] = 100000
     r = c.post("/api/exits", headers=H, json={"ticker": "KXA-1", "take_profit": 0.6})
     check("no position -> no rule", r.status_code == 400 and "no position" in r.text, r.text)
@@ -238,12 +240,101 @@ def api_tests(tmp):
     c.post("/api/exits", headers=H, json={"ticker": "KXC-1", "stop_loss": 0.90})
     out = ex.check()
     check("large position sold in chunks of the max contracts per order", out and out[0]["sold"] == 300 and S["positions"]["KXC-1"]["pos"] == 0, out)
+    # confirmation + resting orders cleared first (KXD-1: .28/.30)
+    cfg.update({"exits": {"confirm_checks": 2}, "risk": {"max_contracts_per_order": 500}})
+    S["positions"]["KXD-1"] = {"pos": Decimal("10"), "exp": Decimal("3"), "fees": Decimal("0")}
+    eng.positions_cache["ts"] = 0
+    resting_sell = eng.place(ticker="KXD-1", intent="sell_yes", price="0.35", count=10, source="manual")   # rests above the bid
+    other = c.post("/api/order", headers=H, json={"ticker": "KXB-1", "intent": "buy_yes", "price": "0.30", "count": 1}).json()["kalshi"]["order_id"]
+    c.post("/api/exits", headers=H, json={"ticker": "KXD-1", "stop_loss": 0.30})
+    md = S["events"][3]["markets"][0]
+    out1 = ex.check()
+    check("first check with the stop hit: nothing sold yet", out1 == [] and S["positions"]["KXD-1"]["pos"] == 10)
+    md.update(yes_bid_dollars="0.4000", yes_ask_dollars="0.4200")
+    ex.check()
+    md.update(yes_bid_dollars="0.2800", yes_ask_dollars="0.3000")
+    out2 = ex.check()
+    check("a one-off dip resets the count (dip, recover, dip = still no sale)", out2 == [] and S["positions"]["KXD-1"]["pos"] == 10)
+    out3 = ex.check()
+    check("second consecutive check: sold", len(out3) == 1 and out3[0]["sold"] == 10 and S["positions"]["KXD-1"]["pos"] == 0, out3)
+    check("resting orders in that market were cancelled first (no overselling); other markets untouched",
+          S["orders"][resting_sell["kalshi"]["order_id"]]["status"] == "canceled" and S["orders"][other]["status"] == "resting")
+    c.delete(f"/api/order/{other}?ticker=KXB-1", headers=H)
+    cfg.update({"exits": {"confirm_checks": 1}})
     cfg.update({"exits": {"enabled": False}})
     S["positions"]["KXC-1"]["pos"] = Decimal("5")
     c.post("/api/exits", headers=H, json={"ticker": "KXC-1", "stop_loss": 0.90})
     check("master switch off -> rules don't fire", ex.check() == [] and S["positions"]["KXC-1"]["pos"] == 5)
     cfg.update({"exits": {"enabled": True}})
     check("rule can be removed", c.delete("/api/exits/KXC-1", headers=H).json()["removed"] and ex.rules() == [])
+    # ---- quoter: exit-only markets and the per-market loss stop ----
+    q = eng.quoter
+    for o in list(S["orders"].values()):
+        o["status"] = "canceled" if o["status"] == "resting" else o["status"]
+    for t_ in list(S["positions"]):
+        S["positions"][t_]["pos"] = Decimal("0")
+    S["events"][1]["markets"][0].update(yes_bid_dollars="0.5500", yes_ask_dollars="0.5700", no_bid_dollars="0.4300", no_ask_dollars="0.4500")
+    S["events"][0]["markets"][0].update(yes_bid_dollars="0.5000", yes_ask_dollars="0.5200", no_bid_dollars="0.4800", no_ask_dollars="0.5000")
+    S["balance"] = 100000
+    cfg.update({"risk": {"kill_switch": False, "max_daily_loss": 0}, "quoter": {"enabled": True, "select_by": "rewards", "max_capital": 100,
+                                                                                 "size": 10, "max_inventory": 30, "market_loss_pct": 10}})
+    q.programs_ts, q.selected = time.time(), []            # nothing selected ...
+    S["positions"]["KXB-1"] = {"pos": Decimal("6"), "exp": Decimal("3"), "fees": Decimal("0")}      # ... but the quoter still holds 6 YES here
+    db.execute("INSERT INTO fills(env,fill_key,ticker,ts,yes_price,count,fee,book_side,strategy,order_source) VALUES(?,?,?,?,?,?,?,?,?,?)",
+               ("demo", "q1", "KXB-1", time.time() - 3 * 86400, "0.5500", "6", "0", "bid", "liquidity", "quoter"))
+    eng.positions_cache["ts"] = 0
+    q.__dict__.pop("_own_cache", None)
+    q.cycle()
+    lo = [o for o in S["orders"].values() if o["status"] == "resting"]
+    check("quoter keeps working out of a market it no longer selects: one sell of the 6 held, nothing opened",
+          len(lo) == 1 and lo[0]["ticker"] == "KXB-1" and lo[0]["book_side"] == "ask" and float(lo[0]["remaining_count_fp"]) == 6, lo)
+    q.cancel_all("test")
+    S["positions"]["KXB-1"]["pos"] = Decimal("0")
+    # per-market stop: quoter bought 100 YES of KXA-1 at .62 today, mid now .51 -> down $11 >= 10% of $100
+    db.execute("INSERT INTO fills(env,fill_key,ticker,ts,yes_price,count,fee,book_side,strategy,order_source) VALUES(?,?,?,?,?,?,?,?,?,?)",
+               ("demo", "q2", "KXA-1", time.time() - 60, "0.6200", "100", "0", "bid", "liquidity", "quoter"))
+    q.selected = [{"ticker": "KXA-1", "daily_reward": Decimal(10), "est_daily": Decimal(1), "share": Decimal("0.05"), "capital": Decimal(10)}]
+    eng.positions_cache["ts"] = 0
+    q.last_sweep = 0
+    q.cycle()
+    lo = [o for o in S["orders"].values() if o["status"] == "resting"]
+    check("per-market loss stop: no new quotes in that market for the rest of the day", lo == [] and q.mkt_stop.get("KXA-1", 0) > time.time()
+          and db.query("SELECT 1 FROM audit WHERE kind='quoter_market_stop'"), (lo, q.mkt_stop))
+    S["positions"]["KXA-1"] = {"pos": Decimal("5"), "exp": Decimal("3"), "fees": Decimal("0")}
+    eng.positions_cache["ts"] = 0
+    q.cycle()
+    lo = [o for o in S["orders"].values() if o["status"] == "resting"]
+    check("...but it still exits what it holds there", len(lo) == 1 and lo[0]["book_side"] == "ask" and float(lo[0]["remaining_count_fp"]) == 5, lo)
+    cfg.update({"quoter": {"enabled": False}})
+    q.cycle()
+    S["positions"]["KXA-1"]["pos"] = Decimal("0")
+
+    # ---- nightly backup ----
+    mt = app.state.maint
+    check("backup not due before the set time, due after", not mt.due(time.mktime((2026, 11, 12, 1, 0, 0, 0, 0, -1))) and mt.due(time.mktime((2026, 11, 12, 4, 0, 0, 0, 0, -1))))
+    wdb = app.state.wdb
+    wdb.execute("INSERT INTO mm_mids VALUES(1,'X',?,0.5,0.4,0.6)", (time.time() - 40 * 86400,))
+    wdb.execute("INSERT INTO mm_mids VALUES(1,'X',?,0.5,0.4,0.6)", (time.time() - 86400,))
+    res = mt.run()
+    import sqlite3 as _sq
+    day = res["day"]
+    bk = mt.dir / f"kalshi_desk-{day}.db"
+    n = _sq.connect(str(bk)).execute("SELECT COUNT(*) FROM orders_log").fetchone()[0]
+    check("backup: ledger copy is a readable database with the orders in it; settings and research data copied",
+          n == db.query("SELECT COUNT(*) n FROM orders_log")[0]["n"] and (mt.dir / f"config-{day}.json").exists()
+          and (mt.dir / f"warehouse-{day}.db").exists(), res)
+    check("pruning: paper-test price history older than 30 days removed, recent kept",
+          res["pruned"].get("mm_mids") == 1 and wdb.query("SELECT COUNT(*) n FROM mm_mids WHERE ticker='X'")[0]["n"] == 1, res["pruned"])
+    for i in range(1, 12):
+        (mt.dir / f"kalshi_desk-202601{i:02d}.db").write_text("x")
+    mt.run()
+    check("only the last 7 ledger backups are kept", len(list(mt.dir.glob("kalshi_desk-*.db"))) == 7)
+    import datetime as _dt
+    late = _dt.datetime.now().replace(hour=23, minute=59).timestamp()
+    check("not due again the same day", mt.due(late) is False)
+    check("keys folder is never backed up", not any("key" in p.name.lower() for p in mt.dir.glob("*")))
+    j = c.get("/api/maintenance").json()
+    check("maintenance status endpoint", "disk_free_gb" in j["sizes"] and len(j["backups"]) >= 3)
     pf = c.get("/api/portfolio").json()
     check("portfolio rows carry their exit rule", all("exit" in p for p in pf["positions"]))
     check("exits endpoints need the CSRF token", c.post("/api/exits", json={"ticker": "KXC-1", "stop_loss": 0.5}).status_code in (401, 403))

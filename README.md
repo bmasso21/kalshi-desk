@@ -134,6 +134,19 @@ blend behind the *hourly* markets, not what the daily markets settle on, so v2.1
 - The quoter's market picker now uses the same scoring (it used a simpler size ratio).
 - Backtester: filled/expired orders are dropped from the matching loop (same results, much faster on long runs).
 
+### v3.4
+- **Exit rules** now need the condition on 2 checks in a row (one thin quote can't trigger a sale) and cancel every order
+  of yours resting in that market before selling, so sells can never add up to more than the position.
+- **Quoter per-market loss stop**: when today's quoter fills in one market are down 10% of its capital (marked to the mid),
+  it stops opening there until tomorrow (*market_loss_pct*). It keeps posting exits. It also keeps working out of
+  positions in markets it no longer selects (exit-only), instead of abandoning them.
+- **Paper test realism**: an optional run-wide capital cap, a per-market stop, and a second result column *If sold now*
+  (inventory valued at the bid). Pass/fail uses that stricter figure.
+- **Nightly backup** (03:30) of the ledger, settings and research data into `backups\` (7 days kept; same disk), pruning
+  of paper-test price history and ticks older than 30 days, and a low-disk alert under 5 GB. Settings -> Backups.
+- **Trading-first selection looks at all open markets**, not only those with a reward program: markets without a program
+  need 24h volume of at least 50 contracts (*min_volume_24h*). `universe: "rewards"` restores the narrower list.
+
 ### Trading first, rewards as a bonus (v3.3)
 - **Pass/fail** for every paper run is its **trading P&L alone** under strict fills; rewards are reported separately as a
   bonus. A run shows AHEAD/BEHIND until it has 5 days and 30 fills, then PASS/FAIL.

@@ -7,7 +7,9 @@ A rule belongs to one market in the current environment and to the side you hold
                is under the floor the rule waits and you are alerted once
 
 Prices are in your side's terms (a NO position uses NO prices; NO bid = 1 - YES ask). Checked every `check_sec`
-seconds against Kalshi's quoted best bid. When triggered it sends an immediate-or-cancel sell at the bid for the
+seconds against Kalshi's quoted best bid; the condition must hold on `confirm_checks` checks in a row (default 2), so
+one thin quote can't trigger a sale. Before selling it cancels every order of yours resting in that market (so two sells
+can never exceed the position). It then sends an immediate-or-cancel sell at the bid for the
 whole position (in chunks of the max contracts per order); whatever doesn't fill is retried on the next check while
 the condition still holds. No bid at all = nothing to sell into, so nothing is sent. The rule ends when the position
 is flat, flips side, or the market closes. Sells are always allowed by the risk limits and work with the kill switch on.
@@ -40,6 +42,7 @@ class Exits:
         self.state = {"last": None, "error": None}
         self._stop = threading.Event()
         self._warned: set = set()
+        self._seen: dict[str, int] = {}
 
     @property
     def cfg(self) -> dict:
@@ -127,6 +130,30 @@ class Exits:
                     continue
                 why = f"stop-loss {r['stop_loss']:.2f} hit (bid {bid:.2f})"
             if not why:
+                self._seen.pop(t, None)
+                continue
+            # one thin quote must not trigger a sale: the condition has to hold on consecutive checks
+            need = max(1, int(self.cfg.get("confirm_checks") or 2))
+            self._seen[t] = self._seen.get(t, 0) + 1
+            if self._seen[t] < need:
+                continue
+            # cancel everything of ours resting in this market first, so this sell plus a resting sell (the quoter's
+            # exit quote, or one you placed) can never add up to more than the position
+            try:
+                for o in self.e.client.orders(status="resting", ticker=t, max_items=200):
+                    if o.get("ticker") in (None, t):
+                        try:
+                            self.e.client.cancel_order(o["order_id"], t)
+                        except KalshiError:
+                            pass
+                if getattr(self.e, "quoter", None):
+                    self.e.quoter.quotes.pop(t, None)
+            except Exception as e:
+                self.db.audit("exit_error", f"{t}: could not clear resting orders before the exit ({e}); not selling this check")
+                continue
+            p = self._pos(t)                                # re-read: a resting order may have filled meanwhile
+            if p == 0 or (p > 0) != (r["side"] == "yes"):
+                self._end(r, "closed", "position closed or changed side")
                 continue
             left, sold = abs(p), 0.0
             chunk = float(d(self.e.cfg.risk["max_contracts_per_order"]))
@@ -145,6 +172,7 @@ class Exits:
                 if f < n:
                     break                                   # book exhausted at this price; retry next check
             self._warned.discard(t)
+            self._seen.pop(t, None)
             remaining = abs(p) - sold
             if remaining <= 1e-9:
                 self._end(r, "triggered", f"{why}: sold {sold:g} @ {bid:.2f}")
