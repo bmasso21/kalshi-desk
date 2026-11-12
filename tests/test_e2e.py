@@ -64,6 +64,10 @@ def run(keytype: str):
 
     # UI + status
     check("index served", c.get("/").status_code == 200 and "Kalshi Desk" in c.get("/").text)
+    import re as _re
+    page = c.get("/").text
+    check("UI never relies on browser confirm()/prompt() boxes (blocked in embedded browsers): in-page dialog only",
+          not _re.search(r"(?<![A-Za-z])(confirm|prompt|alert)\(", page) and 'id="dlgYes"' in page and "await ask('Switch to PRODUCTION?" in page)
     s = c.get("/api/status").json()
     check("status authenticated", s["authenticated"] is True, s)
     check("csrf blocks tokenless POST", c.post("/api/scan").status_code == 403)

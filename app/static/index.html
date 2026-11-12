@@ -78,7 +78,7 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
    <button class="b" onclick="api('/api/mm/scan',{method:'POST'}).then(()=>{toast('Scan started (a few minutes)');setTimeout(loadMM,2000)}).catch(e=>toast(e.message,'err'))">Scan reward markets</button>
    <button class="b pri" onclick="mmStartSet()">Start variant set</button>
    <button class="b" onclick="mmStart()">Start one run</button>
-   <button class="b" onclick="if(confirm('Stop all shadow runs?'))api('/api/mm/shadow/stop',{method:'POST'}).then(()=>{toast('Shadow stopped');loadMM()}).catch(e=>toast(e.message,'err'))">Stop all</button></span></div>
+   <button class="b" onclick="ask('Stop all shadow runs?').then(ok=>{if(ok)api('/api/mm/shadow/stop',{method:'POST'}).then(()=>{toast('Shadow stopped');loadMM()}).catch(e=>toast(e.message,'err'))})">Stop all</button></span></div>
    <div class="row" style="margin:8px 0"><label class="f">Markets<input id="mmN" type="number" value="20" style="width:70px"></label><label class="f">Size (contracts)<select id="mmSize"><option>10</option><option>25</option><option>50</option><option>100</option></select></label><label class="f">Poll (s)<input id="mmPoll" type="number" value="10" style="width:70px"></label><label class="f">Max per series<input id="mmPer" type="number" value="3" style="width:70px"></label><button class="b" onclick="loadMM()">Refresh</button></div>
    <p class="mut" style="font-size:12px;margin:4px 0">Scan: every active Kalshi liquidity-reward program, scored with Kalshi's published formula against today's book. Shadow: runs the quoter's own rules on live production data with virtual orders – rewards earned, real trades that would have filled you (queue = back of the queue, conservative; touch = optimistic), maker fees, and what the price did after each fill.</p>
    <div id="mmBox" class="mut">Loading…</div></div>
@@ -134,15 +134,26 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
 <section id="t-settings" class="hide"><div id="settingsBox"></div></section>
 </main>
 <div id="toast"></div>
+<div id="dlg" style="position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:20;display:none;align-items:center;justify-content:center;padding:16px">
+ <div class="card" style="max-width:480px;width:100%;margin:0"><div id="dlgMsg" style="white-space:pre-wrap;margin-bottom:12px"></div>
+  <input id="dlgIn" style="width:100%;margin-bottom:12px;display:none">
+  <div class="row" style="justify-content:flex-end"><button class="b" id="dlgNo">Cancel</button><button class="b pri" id="dlgYes">Confirm</button></div></div></div>
 <script>
 let TOKEN='', CFG=null, EVENTS=[], CUR=null;
 const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const money=x=>x==null||x===''?'':'$'+Number(x).toFixed(2), px=x=>x==null||x===''?'–':Number(x).toFixed(2), ts=t=>t?new Date(typeof t==='number'?(t>1e12?t:t*1000):t).toLocaleString():'';
+// In-page confirmation: the browser's built-in confirm and prompt boxes are blocked in some embedded browsers, which made
+// confirmations silently fail (e.g. switching to Production did nothing). Returns a Promise.
+function _dlg(msg,withInput,def){return new Promise(res=>{const d=$('#dlg'),i=$('#dlgIn');$('#dlgMsg').textContent=msg;i.style.display=withInput?'block':'none';i.value=def??'';
+  d.style.display='flex';const done=v=>{d.style.display='none';$('#dlgYes').onclick=$('#dlgNo').onclick=null;document.removeEventListener('keydown',key);res(v)};
+  const key=e=>{if(e.key==='Escape')done(withInput?null:false);if(e.key==='Enter'&&withInput)done(i.value)};document.addEventListener('keydown',key);
+  $('#dlgYes').onclick=()=>done(withInput?i.value:true);$('#dlgNo').onclick=()=>done(withInput?null:false);(withInput?i:$('#dlgNo')).focus()})}
+const ask=m=>_dlg(m,false), askText=(m,d)=>_dlg(m,true,d);
 function toast(m,k=''){const e=document.createElement('div');e.className='t '+k;e.textContent=m;$('#toast').appendChild(e);setTimeout(()=>e.remove(),k==='err'?9000:4000)}
 async function api(u,o={}){o.headers={'Content-Type':'application/json','X-Desk-Token':TOKEN,...(o.headers||{})};
   if(o.body&&typeof o.body!=='string')o.body=JSON.stringify(o.body);
   const r=await fetch(u,o);let j={};try{j=await r.json()}catch(e){}
-  if(r.status===409&&j.needs_confirm){if(confirm(j.message)){const b=JSON.parse(o.body||'{}');b.confirm_token=j.confirm_token;return api(u,{...o,body:b})}throw new Error('Cancelled')}
+  if(r.status===409&&j.needs_confirm){if(await ask(j.message)){const b=JSON.parse(o.body||'{}');b.confirm_token=j.confirm_token;return api(u,{...o,body:b})}throw new Error('Cancelled')}
   if(r.status===401&&j.login){location.replace('/login');throw new Error('Please log in')}
   if(!r.ok)throw new Error(j.error||j.detail||('HTTP '+r.status));return j}
 // tabs
@@ -169,7 +180,7 @@ async function status(){try{const s=await api('/api/status');const p=$('#envPill
   const k=$('#killBtn');k.textContent=s.kill_switch?'KILL SWITCH ON – click to release':'KILL SWITCH';k.dataset.on=s.kill_switch?'1':'';
   const sc=s.scan;$('#scanInfo').textContent=(sc.running?'scanning… ':'')+(sc.last?'last scan '+new Date(sc.last*1000).toLocaleTimeString():'')+(sc.error?' · ERROR: '+sc.error:'')+(s.exchange&&s.exchange.trading_active===false?' · exchange trading paused':'');
 }catch(e){$('#scanInfo').textContent='server unreachable'}}
-$('#killBtn').onclick=async()=>{const on=!$('#killBtn').dataset.on;if(on&&!confirm('Kill switch: block all new orders, turn off auto, and cancel every resting order?'))return;
+$('#killBtn').onclick=async()=>{const on=!$('#killBtn').dataset.on;if(on&&!await ask('Kill switch: block all new orders, turn off auto, and cancel every resting order?'))return;
   const r=await api('/api/kill',{method:'POST',body:{on}});toast(on?`Kill switch ON. Cancelled ${r.cancelled.length} orders.`:'Kill switch released','ok');status()};
 // scanner
 async function loadSignals(){const j=await api('/api/signals');const f=$('#sigFilter').value;const st=j.scan.stats||{};
@@ -179,7 +190,7 @@ async function loadSignals(){const j=await api('/api/signals');const f=$('#sigFi
    <td>${esc(s.detail)}${s.note?`<div class="w" style="font-size:12px">${esc(s.note)}</div>`:''}</td><td class="r ${Number(s.edge)>0?'y':''}">${Number(s.edge).toFixed(4)}</td>
    <td>${s.actionable?`<div class="row"><input type="number" min="1" style="width:70px" id="cnt${s.id}" value="${Math.max(1,Math.min(s.legs[0]?.count||1,s.max_fit||1))}" title="${s.legs.length>1?'baskets':'contracts'} (depth ${s.legs[0]?.count}, your limits allow ${s.max_fit})"><button class="b yes" onclick="approve(${s.id},${s.legs.length})">Approve</button></div>`:(s.legs[0]?`<button class="b" onclick="openMarket('${esc(s.legs[0].ticker)}')">Open</button>`:'')}
    <button class="b" style="margin-top:4px" onclick="dismiss(${s.id})">Dismiss</button></td></tr>`).join(''):'<tr><td colspan=5 class="mut">No signals right now. That is normal: real edges are rare. Add fair values on markets you have an opinion on.</td></tr>'}
-async function approve(id,n){const c=+$('#cnt'+id).value;if(!confirm(`Place ${n>1?n+' legs × '+c+' contracts (fill-or-kill each)':c+' contracts'}?`))return;
+async function approve(id,n){const c=+$('#cnt'+id).value;if(!await ask(`Place ${n>1?n+' legs × '+c+' contracts (fill-or-kill each)':c+' contracts'}?`))return;
   try{const r=await api(`/api/signals/${id}/approve`,{method:'POST',body:{count:c}});toast('Signal '+r.status+': '+r.results.map(x=>x.ticker+(x.ok?' ✓':' ✗ '+(x.error||'not filled'))).join(' · '),r.status==='executed'?'ok':'err');loadSignals()}catch(e){toast(e.message,'err')}}
 async function dismiss(id){await api(`/api/signals/${id}/dismiss`,{method:'POST'});loadSignals()}
 // markets
@@ -226,7 +237,7 @@ async function summ(){const p=+$('#oPx').value,c=+$('#oCnt').value,i=$('#oInt').
   $('#oSum').innerHTML=buy?`Cost <b>${money(p*c)}</b> + est. fee ${money(fe)} → pays <b>${money(c)}</b> if ${i==='buy_yes'?'YES':'NO'}. Profit if right ${money(c-p*c-fe)} · break-even ${(100*(p+fe/c)).toFixed(1)}%`
    :`Sell ${c} @ ${money(p)} → receive ${money(p*c)} − est. fee ${money(fe)}`}
 async function sendOrder(){const b={ticker:CUR.market.ticker,intent:$('#oInt').value,price:$('#oPx').value,count:$('#oCnt').value,time_in_force:$('#oTif').value,post_only:$('#oPost').checked};
-  if(!confirm(`${b.intent.replace('_',' ').toUpperCase()} ${b.count} × ${CUR.market.ticker} @ $${b.price} (${b.time_in_force})?`))return;
+  if(!await ask(`${b.intent.replace('_',' ').toUpperCase()} ${b.count} × ${CUR.market.ticker} @ $${b.price} (${b.time_in_force})?`))return;
   try{const r=await api('/api/order',{method:'POST',body:b});const k=r.kalshi;toast(`Order ${k.order_id.slice(0,8)}… filled ${k.fill_count}, resting ${k.remaining_count}${k.average_fee_paid?' · fee/contract $'+k.average_fee_paid:''}`,'ok');openMarket(CUR.market.ticker)}catch(e){toast(e.message,'err')}}
 async function saveFV(){try{await api('/api/fair_values',{method:'POST',body:{ticker:CUR.market.ticker,fair_yes:$('#fv').value,note:$('#fvn').value}});toast('Fair value saved – included in next scan','ok')}catch(e){toast(e.message,'err')}}
 async function delFV(){await api('/api/fair_values/'+CUR.market.ticker,{method:'DELETE'});openMarket(CUR.market.ticker)}
@@ -239,10 +250,10 @@ async function loadPortfolio(){try{const j=await api('/api/portfolio');if(!j.aut
 async function saveExit(t){const g=k=>{const e=document.getElementById(k+'_'+t);return e&&e.value.trim()?+e.value:null};
   try{const r=await api('/api/exits',{method:'POST',body:{ticker:t,take_profit:g('tp'),stop_loss:g('sl'),floor:g('fl')}});toast(`Exit rule set on ${t} (${r.side.toUpperCase()}): take ${r.take_profit??'–'}, stop ${r.stop_loss??'–'}${r.floor?', floor '+r.floor:''}`,'ok');loadPortfolio()}catch(e){toast(e.message,'err')}}
 async function delExit(t){try{await api('/api/exits/'+encodeURIComponent(t),{method:'DELETE'});toast('Exit rule removed','ok');loadPortfolio()}catch(e){toast(e.message,'err')}}
-async function closePos(t,side,q,mark){const intent=side==='YES'?'sell_yes':'sell_no';const p=prompt(`Close ${q} ${side} on ${t}. Limit price ($, current bid ${mark}):`,mark);if(!p)return;
+async function closePos(t,side,q,mark){const intent=side==='YES'?'sell_yes':'sell_no';const p=await askText(`Close ${q} ${side} on ${t}. Limit price ($, current bid ${mark}):`,mark);if(!p)return;
   try{const r=await api('/api/order',{method:'POST',body:{ticker:t,intent,price:p,count:q,time_in_force:'immediate_or_cancel'}});toast(`Closed ${r.kalshi.fill_count} of ${q}`,'ok');loadPortfolio()}catch(e){toast(e.message,'err')}}
 async function cancelOrd(id,t){try{await api(`/api/order/${id}?ticker=${encodeURIComponent(t)}`,{method:'DELETE'});toast('Cancelled','ok');loadPortfolio()}catch(e){toast(e.message,'err')}}
-async function cancelAll(){if(!confirm('Cancel ALL resting orders?'))return;const r=await api('/api/cancel_all',{method:'POST'});toast(`Cancelled ${r.cancelled}`,'ok');loadPortfolio()}
+async function cancelAll(){if(!await ask('Cancel ALL resting orders?'))return;const r=await api('/api/cancel_all',{method:'POST'});toast(`Cancelled ${r.cancelled}`,'ok');loadPortfolio()}
 async function loadSettlements(){const j=await api('/api/settlements');let cost=0,rev=0,fee=0;
   $('#setlBody').innerHTML=j.settlements.map(s=>{const c=(+s.yes_total_cost_dollars||0)+(+s.no_total_cost_dollars||0);cost+=c;rev+=(s.revenue||0)/100;fee+=+(s.fee_cost||0);
    return `<tr><td>${ts(s.settled_time)}</td><td>${esc(s.ticker)}</td><td>${esc(s.market_result)}</td><td class="r">${money(s.yes_total_cost_dollars)}</td><td class="r">${money(s.no_total_cost_dollars)}</td><td class="r">${money((s.revenue||0)/100)}</td><td class="r">${s.fee_cost??''}</td></tr>`}).join('')||'<tr><td colspan=7 class="mut">None</td></tr>';
@@ -298,7 +309,7 @@ async function loadSportsCfg(){const sp=CFG.sports||{};let j={configured:false,u
    <div class="row"><label class="f">OddsPapi API key<input id="spK" type="password" autocomplete="off" placeholder="paste key" style="width:320px"></label>
    <label class="f">Monthly cap<input id="spC" type="number" min="0" max="250" value="${sp.monthly_cap??240}" style="width:80px"></label>
    <button class="b pri" onclick="saveSports()">Save</button>
-   <button class="b" ${j.configured&&!j.running?'':'disabled'} onclick="if(confirm('Run discovery? Uses about 7 of this month\'s OddsPapi requests.'))api('/api/sports/discover',{method:'POST'}).then(()=>{toast('Discovery started');setTimeout(loadSportsCfg,8000)}).catch(e=>toast(e.message,'err'))">${j.running?'Discovery running…':'Run discovery (~7 requests)'}</button></div>
+   <button class="b" ${j.configured&&!j.running?'':'disabled'} onclick="ask('Run discovery? Uses about 7 of this month\'s OddsPapi requests.').then(ok=>{if(ok)api('/api/sports/discover',{method:'POST'}).then(()=>{toast('Discovery started');setTimeout(loadSportsCfg,8000)}).catch(e=>toast(e.message,'err'))})">${j.running?'Discovery running…':'Run discovery (~7 requests)'}</button></div>
    <div class="row" style="margin-top:10px"><b>Study (Pinnacle vs Kalshi, finished games)</b>
     <label class="f">Leagues<input id="spL" value="NFL,NBA" style="width:110px"></label><label class="f">Days back<input id="spD" type="number" value="21" style="width:70px"></label>
     <label class="f">Games to pull (1 request each)<input id="spN" type="number" value="10" style="width:80px"></label>
@@ -313,7 +324,7 @@ function spSummary(st,ev){if(!st)return'';const f=st.fixtures||[];let h=`<table 
   if(ev&&ev.by_lead){h+=`<table style="margin-top:6px"><thead><tr><th>Minutes before start</th><th class="r">Snapshots</th><th class="r">Log loss Kalshi</th><th class="r">Log loss Pinnacle</th><th class="r">Avg gap</th><th class="r">Taker trades (fee-adj.)</th><th class="r">P&amp;L / trade</th></tr></thead><tbody>${Object.entries(ev.by_lead).map(([k,v])=>`<tr><td>${k}</td><td class="r">${v.n}</td><td class="r">${v.logloss_kalshi??'–'}</td><td class="r">${v.logloss_pinnacle??'–'}</td><td class="r">${v.mean_abs_gap_c??'–'}¢</td><td class="r">${v.taker_trades??'–'}</td><td class="r">${v.taker_pnl_per_trade_c??'–'}¢</td></tr>`).join('')}</tbody></table><p class="mut" style="font-size:12px">Small samples are noise. Lower log loss = more accurate.</p>`}
   return h}
 async function spStudy(){const L=$('#spL').value.split(',').map(x=>x.trim().toUpperCase()).filter(Boolean),n=+$('#spN').value;
-  if(!confirm(`Pull Pinnacle history for up to ${n} finished games? Uses up to ${n+3*L.length+2} of this month's OddsPapi requests.`))return;
+  if(!await ask(`Pull Pinnacle history for up to ${n} finished games? Uses up to ${n+3*L.length+2} of this month's OddsPapi requests.`))return;
   try{await api('/api/sports/study',{method:'POST',body:{leagues:L,max_games:n,days_back:+$('#spD').value,refresh_fixtures:$('#spR').checked}});toast('Study started','ok');setTimeout(loadSportsCfg,4000)}catch(e){toast(e.message,'err')}}
 async function saveSports(){const b={monthly_cap:+$('#spC').value};const k=$('#spK').value.trim();if(k)b.oddspapi_key=k;
   try{const r=await api('/api/config',{method:'POST',body:{sports:b}});CFG=r.config;toast('Saved','ok')}catch(e){toast(e.message,'err');try{CFG=(await api('/api/config')).config}catch(_){}}loadSportsCfg()}
@@ -326,7 +337,7 @@ async function loadAuth(){const s=await api('/api/auth/status');let ss={sessions
    <div class="row" style="margin-top:10px"><label class="f" style="flex:1">Only these Tailscale accounts (comma separated, blank = any device in your tailnet)<input id="tsAllow" value="${esc((s.allowed_tailscale_logins||[]).join(', '))}"></label>
     ${s.tailscale_login?`<button class="b" onclick="$('#tsAllow').value='${esc(s.tailscale_login)}'">Just me (${esc(s.tailscale_login)})</button>`:''}<button class="b" onclick="saveAllow()">Save</button></div>
    <table style="margin-top:10px"><thead><tr><th>Logged-in devices</th><th>Since</th><th>Last seen</th></tr></thead><tbody>${ss.sessions.map(x=>`<tr><td>${esc(x.login||'')} <span class="mut" style="font-size:12px">${esc((x.agent||'').slice(0,70))}</span></td><td>${ts(x.created)}</td><td>${ts(x.last_seen)}</td></tr>`).join('')||'<tr><td colspan=3 class="mut">None</td></tr>'}</tbody></table>
-   <button class="b" style="margin-top:8px" onclick="if(confirm('Log out every device?'))api('/api/auth/logout',{method:'POST',body:{everywhere:true}}).then(()=>{toast('All devices logged out','ok');loadAuth()})">Log out everywhere</button>`}
+   <button class="b" style="margin-top:8px" onclick="ask('Log out every device?').then(ok=>{if(ok)api('/api/auth/logout',{method:'POST',body:{everywhere:true}}).then(()=>{toast('All devices logged out','ok');loadAuth()})})">Log out everywhere</button>`}
 async function setPw(){const n=$('#pwNew').value;if(n!==$('#pwNew2').value){toast('Passwords do not match','err');return}
   try{const r=await api('/api/auth/password',{method:'POST',body:{new:n,current:$('#pwCur')?$('#pwCur').value:null}});toast(r.message,'ok');loadAuth()}catch(e){toast(e.message,'err')}}
 async function saveAllow(){const v=$('#tsAllow').value.split(',').map(x=>x.trim()).filter(Boolean);try{await api('/api/config',{method:'POST',body:{auth:{allowed_tailscale_logins:v}}});toast('Saved','ok')}catch(e){toast(e.message,'err')}loadAuth()}
@@ -351,10 +362,10 @@ async function saveAlerts(){const b={enabled:$('#alE').checked,fills:$('#alF').c
    summary_time:$('#alST').value.trim(),error_throttle_min:+$('#alET').value,emergency_retry:Math.max(30,+$('#alRR').value),device:$('#alD').value.trim()};
   const u=$('#alU').value.trim(),t=$('#alT').value.trim(),h=$('#alH').value.trim();if(u)b.pushover_user=u;if(t)b.pushover_token=t;if(h)b.healthcheck_url=h;
   try{const r=await api('/api/config',{method:'POST',body:{alerts:b}});CFG=r.config;toast('Alert settings saved','ok')}catch(e){toast(e.message,'err');try{CFG=(await api('/api/config')).config}catch(_){}}loadAlerts()}
-async function testAlert(p){if(p===2&&!confirm('Send an EMERGENCY test? It repeats on your phone until you acknowledge it in the Pushover app.'))return;
+async function testAlert(p){if(p===2&&!await ask('Send an EMERGENCY test? It repeats on your phone until you acknowledge it in the Pushover app.'))return;
   try{const r=await api('/api/alerts/test',{method:'POST',body:{priority:p}});toast(r.ok?'Test sent – check your phone':'Not sent: '+(r.error||r.status),r.ok?'ok':'err')}catch(e){toast(e.message,'err')}loadAlerts()}
 async function previewSummary(){try{const r=await api('/api/alerts/summary_preview');$('#sumPrev').textContent=r.text}catch(e){toast(e.message,'err')}}
-function taxExport(){const y=$('#taxYear').value;if(CFG&&CFG.env!=='prod'&&!confirm('You are on DEMO – the export will contain demo (fake-money) records. Continue?'))return;location.href='/api/export/tax?year='+y}
+async function taxExport(){const y=$('#taxYear').value;if(CFG&&CFG.env!=='prod'&&!await ask('You are on DEMO – the export will contain demo (fake-money) records. Continue?'))return;location.href='/api/export/tax?year='+y}
 (()=>{const y=new Date().getFullYear();const el=document.getElementById('taxYear');if(el)el.innerHTML=[y,y-1,y-2].map(x=>`<option>${x}</option>`).join('')})();
 async function loadMaint(){try{const j=await api('/api/maintenance'),z=j.sizes,st=j.state;const el=document.getElementById('mtBox');if(!el)return;
   el.innerHTML=`Nightly at ${esc(j.config.time)} into the <code>backups</code> folder, last ${j.config.keep_days} days kept · last run ${st.last?ts(st.last):'not yet'}${st.error?' · <span class="n">'+esc(st.error)+'</span>':''} · ledger ${z['kalshi_desk.db']??'–'} MB · research data ${z['warehouse.db']??'–'} MB · backups ${z.backups_mb} MB · free disk ${z.disk_free_gb??'–'} GB <button class="b" onclick="api('/api/maintenance/run',{method:'POST'}).then(()=>{toast('Backup done','ok');loadMaint()}).catch(e=>toast(e.message,'err'))">Back up now</button>`}catch(e){}}
@@ -369,9 +380,9 @@ async function loadBreakers(){try{const j=await api('/api/breakers'),st=j.state,
    ${a?`<p style="font-size:12px;margin:4px 0">Account equity ${money(a.equity)} · peak ${money(a.peak)} · ${money(a.drawdown)} below peak <button class="b" onclick="brkReset(null,true)">Reset peak</button></p>`:''}
    <table><thead><tr><th>Strategy</th><th class="r">P&amp;L today</th><th class="r">P&amp;L 7 days</th><th class="r">Fills (7d)</th></tr></thead><tbody>${rows.map(([k,x])=>`<tr><td>${esc(k)}</td><td class="r ${x.today<0?'n':''}">${money(x.today)}</td><td class="r ${x.week<0?'n':''}">${money(x.week)}</td><td class="r">${x.fills_week}${x.unpriced?' <span class="mut">('+x.unpriced+' unpriced)</span>':''}</td></tr>`).join('')||'<tr><td colspan=4 class="mut">No fills in the last 7 days</td></tr>'}</tbody></table>
    <p class="mut" style="font-size:12px;margin:4px 0">Checked ${st.last?ts(st.last):'not yet'} (every ${j.limits.check_min} min)${st.error?' · <span class="n">'+esc(st.error)+'</span>':''} <button class="b" onclick="api('/api/breakers/check',{method:'POST'}).then(loadBreakers).catch(e=>toast(e.message,'err'))">Check now</button></p>`}catch(e){$('#brkBox').textContent=e.message}}
-async function brkReset(st,peak){if(!confirm(peak?'Reset the account equity peak to now?':'Reset the breaker for '+st+'? You can then switch it back on.'))return;try{await api('/api/breakers/reset',{method:'POST',body:{strategy:st,peak:!!peak}});toast('Reset','ok')}catch(e){toast(e.message,'err')}loadBreakers()}
+async function brkReset(st,peak){if(!await ask(peak?'Reset the account equity peak to now?':'Reset the breaker for '+st+'? You can then switch it back on.'))return;try{await api('/api/breakers/reset',{method:'POST',body:{strategy:st,peak:!!peak}});toast('Reset','ok')}catch(e){toast(e.message,'err')}loadBreakers()}
 async function saveSettings(){const v=id=>+$('#'+id).value,env=$('#sEnv').value;
-  if(env==='prod'&&CFG.env!=='prod'&&!confirm('Switch to PRODUCTION? Orders will use real money.'))return;
+  if(env==='prod'&&CFG.env!=='prod'&&!await ask('Switch to PRODUCTION? Orders will use real money.'))return;
   const patch={env,risk:{max_order_cost:v('r1'),max_daily_spend:v('r2'),max_market_exposure:v('r3'),max_total_exposure:v('r4'),max_contracts_per_order:v('r5'),min_price:v('r6'),max_price:v('r7'),require_confirm_prod:$('#r8').checked,max_daily_loss:v('r9')},
    scaling:{enabled:$('#sc1').checked},
    breakers:{strategy_daily_loss:v('b1'),strategy_7d_loss:v('b2'),account_drawdown:v('b3'),drawdown_days:v('b4')},
@@ -379,8 +390,8 @@ async function saveSettings(){const v=id=>+$('#'+id).value,env=$('#sEnv').value;
    auto:{enabled:$('#a1').checked,strategies:[...document.querySelectorAll('.as:checked')].map(x=>x.value),max_order_cost:v('a2'),max_daily_spend:v('a3')},
    scanner:{interval_sec:v('s1'),min_edge:v('s2'),min_volume_24h:v('s3'),max_markets_scanned:v('s4'),strategies:[...document.querySelectorAll('.ss:checked')].map(x=>x.value)}};
   for(const e of ['demo','prod']){const k=$('#k_'+e).value.trim(),p=$('#p_'+e).value.trim();if(k)patch[e+'_key_id']=k;if(p)patch[e+'_private_key_path']=p}
-  if(patch.auto.enabled&&!CFG.auto.enabled&&!confirm('Turn ON auto-trading? Orders will be placed without asking you.'))return;
-  if(patch.quoter.enabled&&!CFG.quoter.enabled&&!confirm(`Turn ON the liquidity quoter in ${env.toUpperCase()}? It will place and cancel resting orders automatically.`))return;
+  if(patch.auto.enabled&&!CFG.auto.enabled&&!await ask('Turn ON auto-trading? Orders will be placed without asking you.'))return;
+  if(patch.quoter.enabled&&!CFG.quoter.enabled&&!await ask(`Turn ON the liquidity quoter in ${env.toUpperCase()}? It will place and cancel resting orders automatically.`))return;
   try{const r=await api('/api/config',{method:'POST',body:patch});toast(r.authenticated?'Saved – API key is working':'Saved – no working key for '+r.config.env.toUpperCase()+' yet','ok');loadSettings();status()}catch(e){toast(e.message,'err');loadSettings();status()}}
 // CLV
 const cents=v=>v==null?'–':(v>0?'+':'')+Number(v).toFixed(2)+'¢';
