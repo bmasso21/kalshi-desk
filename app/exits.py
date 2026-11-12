@@ -24,7 +24,7 @@ arithmetic, NOT a forecast - it says nothing about whether the trade is good:
   stop   = bid - distance, distance = the largest of 3c, twice the bid/ask spread, and the move since yesterday's close
            (so normal noise doesn't trigger it); tightened if the loss at the stop would exceed half the daily loss limit
   floor  = stop - the larger of 2c and the spread (room for a thin book)
-  take   = entry + 1.5 x (entry - stop), capped at 0.99 and always above the bid
+  take   = the higher of entry and bid, plus 1.5 x the stop distance; capped at 0.99
 """
 from __future__ import annotations
 
@@ -120,8 +120,8 @@ class Exits:
         if stop >= bid:
             raise ValueError(f"the {side.upper()} bid ({bid:.2f}) is too low to place a stop under it")
         floor = round(max(0.01, stop - max(0.02, spread)), 2)
-        risk_c = max(entry - stop, 0.01)
-        take = min(0.99, entry + 1.5 * risk_c)
+        risk_c = max(entry - stop, 0.01)                # what a contract loses if the stop is hit
+        take = min(0.99, max(entry, bid) + 1.5 * (bid - stop))   # 1.5x the stop distance, above both entry and bid
         take = round(max(take, bid + 0.01), 2)
         take = min(take, 0.99)
         if take <= bid:
@@ -137,7 +137,7 @@ class Exits:
                 "take_profit": take, "stop_loss": stop, "floor": floor,
                 "at_stop": round((stop - entry) * qty, 2), "at_take": round(gain_c * qty, 2) if take else None,
                 "basis": f"stop {dist * 100:.0f}c under the bid (largest of 3c, 2x the {spread * 100:.0f}c spread, "
-                         f"{move * 100:.0f}c move since yesterday); floor allows a thin book; take-profit 1.5x the risk",
+                         f"{move * 100:.0f}c move since yesterday); floor allows a thin book; take-profit 1.5x the stop distance",
                 "notes": notes,
                 "disclaimer": "Risk arithmetic from your position and limits - not a forecast and not a view on whether the trade is good."}
 

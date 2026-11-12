@@ -64,6 +64,25 @@ def run(keytype: str):
 
     # UI + status
     check("index served", c.get("/").status_code == 200 and "Kalshi Desk" in c.get("/").text)
+    pg = c.get("/").text
+    check("page: five sections with a Home landing page and an environment strip",
+          all(f'data-t="{t}"' in pg for t in ("home", "markets", "portfolio", "strategies", "settings")) and 'id="envBar"' in pg
+          and 'id="t-home"' in pg and "go('home')" in pg and 'data-t="ledger"' not in pg)
+    check("page: every old tab is still reachable as a sub-page", all(f"'{t}'" in pg for t in ("scanner", "ledger", "clv", "rewards", "weather", "research"))
+          and all(f'id="t-{t}"' in pg for t in ("scanner", "markets", "rewards", "portfolio", "ledger", "clv", "weather", "research", "settings")))
+    check("page: settings are grouped and scaled limits are locked", all(f'data-g="{g}"' in pg for g in ("conn", "limits", "strat", "alerts", "maint"))
+          and "set by scaling" in pg and 'id="saveBar"' in pg)
+    for i in range(60):
+        db.audit("pagetest", f"line {i:02d}")
+    lg = c.get("/api/ledger", headers=H).json()
+    check("ledger without parameters behaves as before (up to 200 audit lines, totals added)", len(lg["audit"]) >= 60 and lg["audit_total"] >= 60 and "orders_total" in lg)
+    l1 = c.get("/api/ledger?a_limit=25&a_offset=0&q=pagetest", headers=H).json()
+    l2 = c.get("/api/ledger?a_limit=25&a_offset=50&q=pagetest", headers=H).json()
+    check("ledger paging: 25 per page, newest first, last page holds the remainder", len(l1["audit"]) == 25 and l1["audit_total"] == 60
+          and l1["audit"][0]["message"] == "line 59" and len(l2["audit"]) == 10 and l2["audit"][-1]["message"] == "line 00", (len(l1["audit"]), len(l2["audit"])))
+    check("ledger search and day filter", c.get("/api/ledger?q=line 07", headers=H).json()["audit_total"] == 1
+          and c.get("/api/ledger?q=pagetest&days=1", headers=H).json()["audit_total"] == 60
+          and c.get("/api/ledger?q=no-such-thing-xyz", headers=H).json()["audit"] == [])
     import re as _re
     page = c.get("/").text
     check("UI never relies on browser confirm()/prompt() boxes (blocked in embedded browsers): in-page dialog only",

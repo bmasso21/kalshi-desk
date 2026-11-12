@@ -984,9 +984,25 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             qty = d(p.get("position_fp"))
             side = "YES" if qty > 0 else "NO"
             mark = d(m.get("yes_bid_dollars")) if qty > 0 else d(m.get("no_bid_dollars"))
+            # what the position is worth: the bid for the side held; with no bid, the last trade (an estimate, flagged)
+            last_yes = d(m.get("last_price_dollars"))
+            last = last_yes if qty > 0 else (1 - last_yes if 0 < last_yes < 1 else d(0))
+            if 0 < mark < 1:
+                now_px, src = mark, "bid"
+            elif 0 < last < 1:
+                now_px, src = last, "last"
+            else:
+                now_px, src = None, "none"
+            cost = d(p.get("market_exposure_dollars"))
+            entry = (cost / abs(qty)).quantize(d("0.0001")) if qty != 0 and cost > 0 else None
+            value = (abs(qty) * now_px).quantize(d("0.01")) if now_px is not None else None
             rows.append({**p, "title": m.get("title"), "sub": m.get("yes_sub_title"), "status": m.get("status"),
                          "side": side, "qty": str(abs(qty)), "mark": str(mark),
                          "mark_value": str((abs(qty) * mark).quantize(d("0.01"))),
+                         "entry": str(entry) if entry is not None else None,
+                         "now": str(now_px) if now_px is not None else None, "now_source": src,
+                         "value_est": str(value) if value is not None else None,
+                         "unrealized": str((value - cost).quantize(d("0.01"))) if value is not None and cost > 0 else None,
                          "close_time": m.get("close_time"), "exit": xr.get(p["ticker"])})
         return {"authenticated": True, "balance": bal, "positions": rows,
                 "orders": c.orders(status="resting"), "fills": c.fills(max_items=200)}
@@ -1093,11 +1109,30 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
 
     # ------------------------------------------------------------ ledger --
     @app.get("/api/ledger")
-    def ledger(quoter: int = 0):
-        where = "" if quoter else "WHERE source!='quoter'"
+    def ledger(quoter: int = 0, limit: int = 0, offset: int = 0, a_limit: int = 0, a_offset: int = 0, q: str = "", days: float = 0):
+        """Order log and audit trail, newest first. Without parameters: the latest 500 orders / 200 audit lines (as before).
+        limit/offset page the order log, a_limit/a_offset the audit; q searches both; days limits both to the last N days."""
+        oc, oa = ([] if quoter else ["source!='quoter'"]), []
+        ac, aa = [], []
+        if days and days > 0:
+            since = time.time() - float(days) * 86400
+            oc.append("ts>=?"); oa.append(since)
+            ac.append("ts>=?"); aa.append(since)
+        if q.strip():
+            like = f"%{q.strip()[:80]}%"
+            oc.append("(ticker LIKE ? OR intent LIKE ? OR status LIKE ? OR source LIKE ? OR IFNULL(strategy,'') LIKE ? OR IFNULL(error,'') LIKE ?)")
+            oa += [like] * 6
+            ac.append("(kind LIKE ? OR message LIKE ?)")
+            aa += [like] * 2
+        ow = ("WHERE " + " AND ".join(oc)) if oc else ""
+        aw = ("WHERE " + " AND ".join(ac)) if ac else ""
+        lim, alim = max(1, min(limit or 500, 500)), max(1, min(a_limit or 200, 500))
         return {"orders": db.query("SELECT id,ts,env,source,strategy,ticker,intent,price,count,cost,status,"
-                                   f"fill_count,avg_fill_price,avg_fee,error FROM orders_log {where} ORDER BY id DESC LIMIT 500"),
-                "audit": db.query("SELECT * FROM audit ORDER BY id DESC LIMIT 200"),
+                                   f"fill_count,avg_fill_price,avg_fee,error FROM orders_log {ow} ORDER BY id DESC LIMIT ? OFFSET ?",
+                                   (*oa, lim, max(0, offset))),
+                "orders_total": db.query(f"SELECT COUNT(*) n FROM orders_log {ow}", tuple(oa))[0]["n"],
+                "audit": db.query(f"SELECT * FROM audit {aw} ORDER BY id DESC LIMIT ? OFFSET ?", (*aa, alim, max(0, a_offset))),
+                "audit_total": db.query(f"SELECT COUNT(*) n FROM audit {aw}", tuple(aa))[0]["n"],
                 "spent_today": str(eng.spent_today(max_age=0)["all"]) if eng.client.authenticated else "0"}
 
     return app

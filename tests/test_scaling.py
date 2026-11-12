@@ -202,6 +202,22 @@ def api_tests(tmp):
     check("suggest: stop under the bid, floor under the stop, take above the bid", sg.status_code == 200 and j["side"] == "yes"
           and j["floor"] < j["stop_loss"] < j["bid"] < j["take_profit"] <= 0.99 and close(j["entry"], 0.40), j)
     check("suggest: stop at least 3c under the bid", j["bid"] - j["stop_loss"] >= 0.03 - 1e-9, j)
+    check("suggest in profit (entry .40, bid .50): take-profit is 1.5x the stop distance above the bid, not 1c",
+          close(j["take_profit"], round(j["bid"] + 1.5 * (j["bid"] - j["stop_loss"]), 2), 0.011), j)
+    pf = c.get("/api/portfolio", headers=H).json()["positions"]
+    pa = next(x for x in pf if x["ticker"] == "KXA-1")
+    check("portfolio: entry price, current bid and unrealized P&L per position", close(float(pa["entry"]), 0.40) and pa["now_source"] == "bid"
+          and close(float(pa["now"]), 0.50) and close(float(pa["value_est"]), 10.0) and close(float(pa["unrealized"]), 2.0), pa)
+    mk0 = S["events"][0]["markets"][0]
+    keep0 = {k_: mk0[k_] for k_ in ("yes_bid_dollars", "no_bid_dollars", "last_price_dollars")}
+    mk0.update(yes_bid_dollars="0.0000", last_price_dollars="0.4500")
+    pa = next(x for x in c.get("/api/portfolio", headers=H).json()["positions"] if x["ticker"] == "KXA-1")
+    check("portfolio: no bid -> valued at the last trade and flagged as an estimate (not $0)", pa["now_source"] == "last" and close(float(pa["now"]), 0.45)
+          and close(float(pa["value_est"]), 9.0) and close(float(pa["unrealized"]), 1.0) and float(pa["mark_value"]) == 0, pa)
+    mk0.update(last_price_dollars="0.0000")
+    pa = next(x for x in c.get("/api/portfolio", headers=H).json()["positions"] if x["ticker"] == "KXA-1")
+    check("portfolio: no bid and no last trade -> no value claimed", pa["now_source"] == "none" and pa["value_est"] is None and pa["unrealized"] is None, pa)
+    mk0.update(**keep0)
     check("suggest: dollar effect reported and labelled as not a forecast", close(j["at_stop"], (j["stop_loss"] - 0.40) * 20, 0.011)
           and "not a forecast" in j["disclaimer"] and j["basis"], j)
     ok_ = c.post("/api/exits", headers=H, json={"ticker": "KXA-1", "take_profit": j["take_profit"], "stop_loss": j["stop_loss"], "floor": j["floor"]})
