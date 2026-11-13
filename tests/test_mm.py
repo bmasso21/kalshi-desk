@@ -388,6 +388,34 @@ def integration_tests(tmp):
     time.sleep(0.5)
     check("shadow stop", c.post("/api/mm/shadow/stop", headers=H).status_code == 200 and not app.state.mm[1].status()["alive"])
     check("report endpoint", c.get("/api/mm/report").status_code == 200)
+    time.sleep(0.3)
+    j2 = c.get("/api/mm", headers=H).json()
+    check("stopped runs stay in the summary, marked stopped (results are not lost)", len(j2["reports"]) >= 9
+          and all(r_["status"] != "running" for r_ in j2["reports"]) and j2["reports_pending"] is False, [(r_["run_id"], r_["status"]) for r_ in j2["reports"]])
+    # a slow summary build must never hang the request (or the Home page): the last finished one is served meanwhile
+    real_report = mm.report
+    slow = {"n": 0}
+
+    def slow_report(*a, **k):
+        slow["n"] += 1
+        time.sleep(3.2)
+        return real_report(*a, **k)
+    rid_new = c.post("/api/mm/shadow/start", headers=H, json={"n_markets": 5, "name": "slowtest"}).json()["id"]
+    mm.report = slow_report
+    t0 = time.time()
+    j3 = c.get("/api/mm", headers=H).json()
+    took = time.time() - t0
+    check("slow summary build: answered in about 2s with the previous summaries and a refreshing flag", took < 3.5 and j3["reports_refreshing"] is True
+          and len(j3["reports"]) == len(j2["reports"]), (round(took, 1), j3["reports_refreshing"], len(j3["reports"])))
+    for _ in range(40):
+        time.sleep(0.25)
+        if app.state.mm_cache["busy"] is None:
+            break
+    mm.report = real_report
+    j4 = c.get("/api/mm", headers=H).json()
+    check("...and the finished build appears on the next request (new run included, old ones not rebuilt)",
+          any(r_["run_id"] == rid_new for r_ in j4["reports"]) and slow["n"] == 1, (slow["n"], [r_["run_id"] for r_ in j4["reports"]]))
+    c.post("/api/mm/shadow/stop", headers=H)
     check("no orders placed anywhere", not app.state.engine.db.query("SELECT 1 FROM orders_log LIMIT 1"))
     check("quoter still off", cfg.quoter["enabled"] is False)
 

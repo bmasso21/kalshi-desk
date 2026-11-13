@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import threading
 import time
 from pathlib import Path
 
@@ -769,18 +770,54 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         return eng.breakers.snapshot()
 
     # ------------------------------------------------- market making (2.3) --
-    mm_cache: dict = {"ts": 0.0, "r": None}
+    # Paper-test reports are built in the background and served from the last finished build: building one waits on
+    # the polling loop and reads a lot of history, which used to make this request (and the Home page) hang.
+    mm_cache: dict = {"ts": 0.0, "r": None, "busy": None, "final": {}, "took": None}
+
+    app.state.mm_cache = mm_cache
+
+    def _mm_build():
+        t0 = time.time()
+        try:
+            live_ids = set(mm_shadow.runs)
+            out = []
+            for row in sorted(wdb.query("SELECT id, status FROM mm_runs ORDER BY id DESC LIMIT 40"), key=lambda r_: r_["id"]):
+                i = row["id"]
+                if i in live_ids:
+                    x = mmod.report(wdb, i, live=mm_shadow)
+                else:                               # finished runs never change: build their report once
+                    x = mm_cache["final"].get(i)
+                    if x is None:
+                        x = mmod.report(wdb, i)
+                        if x and row["status"] != "running":
+                            mm_cache["final"][i] = x
+                if x:
+                    out.append(x)
+            mm_cache.update(r=out, ts=time.time(), took=round(time.time() - t0, 1))
+        except Exception as e:
+            db.audit("mm_error", f"report build: {e}"[:300])
+        finally:
+            mm_cache["busy"] = None
+
+    def _mm_refresh(wait: float = 2.0):
+        th = mm_cache["busy"]
+        if th is None:
+            th = threading.Thread(target=_mm_build, daemon=True, name="mm-report")
+            mm_cache["busy"] = th
+            th.start()
+        th.join(timeout=wait)                       # fast builds are returned fresh; slow ones finish in the background
 
     @app.get("/api/mm")
     def mm_status():
         sc = mm_scanner.latest()
         if time.time() - mm_cache["ts"] > 60 or mm_cache["r"] is None:
-            ids = sorted(mm_shadow.runs) or [r["id"] for r in wdb.query("SELECT id FROM mm_runs ORDER BY id DESC LIMIT 1")]
-            mm_cache["r"] = [x for x in (mmod.report(wdb, i, live=mm_shadow) for i in ids) if x]
-            mm_cache["ts"] = time.time()
-        reps = mm_cache["r"]
+            _mm_refresh()
+        reps = mm_cache["r"] or []
+        live_reps = [x for x in reps if x.get("status") == "running"]
         return {"scan": sc, "scan_running": mm_scanner.running, "shadow": mm_shadow.status(), "reports": reps,
-                "report": reps[-1] if reps else None,
+                "reports_pending": mm_cache["r"] is None, "reports_refreshing": mm_cache["busy"] is not None or mm_cache["ts"] == 0,
+                "reports_age": round(time.time() - mm_cache["ts"]) if mm_cache["ts"] else None, "reports_took": mm_cache["took"],
+                "report": (live_reps or reps)[-1] if reps else None,
                 "runs": wdb.query("SELECT id, ts, status, stopped_ts, note, scan_id, params FROM mm_runs ORDER BY id DESC LIMIT 30")}
 
     @app.post("/api/mm/scan")
