@@ -370,7 +370,7 @@ async function loadSettings(){const j=await api('/api/config');CFG=j.config;cons
     <label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" id="a1" ${a.enabled?'checked':''}>Enable auto-trading</label>
     ${strat.filter(x=>!j.never_auto.includes(x)).map(x=>`<label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" class="as" value="${x}" ${a.strategies.includes(x)?'checked':''}>${x}</label>`).join('')}
     <label class="f">Auto max $ / order${num('a2',a.max_order_cost)}</label><label class="f">Auto max $ / day${num('a3',a.max_daily_spend)}</label></div></div>
-   <div class="card" data-g="strat"><h3 style="margin-top:0">Liquidity quoter</h3><p class="w">Off by default. Quoter orders also count against the auto limits above ($ per order, $ per day of fills).</p><div class="row">
+   <div class="card" data-g="strat"><h3 style="margin-top:0">Liquidity quoter</h3><p class="w">Off by default. Each quote is held to the general per-order limit and shrunk to fit it; quoter fills count against the general daily buy limit. The quoter also has its own caps below (capital, inventory, per-market stop).</p><div class="row">
     <label class="f" style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" id="q1" ${c.quoter.enabled?'checked':''}>Enable quoter</label>
     <label class="f">Markets at once${num('q2',c.quoter.max_markets,'1')}</label><label class="f">Contracts / quote${num('q3',c.quoter.size,'1')}</label>
     <label class="f">Min pool $/day${num('q4',c.quoter.min_daily_reward)}</label><label class="f">Max net contracts / market${num('q5',c.quoter.max_inventory,'1')}</label>

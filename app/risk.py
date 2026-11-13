@@ -56,7 +56,7 @@ def check(cfg, *, intent: str, price, count, market: dict | None, positions: dic
     if not (d(r["min_price"]) <= p <= d(r["max_price"])):
         raise RiskError(f"Buy price ${p} outside allowed range ${r['min_price']}-${r['max_price']}")
     lim = d(r["max_order_cost"])
-    if source in ("auto", "quoter"):
+    if source == "auto":            # the quoter has its own capital / inventory caps and uses the general limits here
         lim = min(lim, d(cfg.auto["max_order_cost"]))
     if cost > lim:
         raise RiskError(f"Order cost ${cost:.2f} exceeds per-order limit ${lim:.2f}")
@@ -64,7 +64,7 @@ def check(cfg, *, intent: str, price, count, market: dict | None, positions: dic
     s_all, s_auto = d(spent.get("all", 0)), d(spent.get("auto", 0))
     if s_all + cost > d(r["max_daily_spend"]):
         raise RiskError(f"Daily spend limit: ${s_all:.2f} filled today + ${cost:.2f} > ${r['max_daily_spend']}")
-    if source in ("auto", "quoter") and s_auto + cost > d(cfg.auto["max_daily_spend"]):
+    if source == "auto" and s_auto + cost > d(cfg.auto["max_daily_spend"]):
         raise RiskError(f"Auto daily limit: ${s_auto:.2f} + ${cost:.2f} > ${cfg.auto['max_daily_spend']}")
 
     if positions is not None and market is not None:

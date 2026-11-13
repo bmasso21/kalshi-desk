@@ -72,14 +72,21 @@ def compute(equity: float, tiers: list[dict] | None = None, caps: dict | None = 
     return {"tier": idx, "limits": out}
 
 
-def quoter_shape(capital: float, markets_cap: int) -> dict:
+QUOTE_MAX_PRICE = 0.85      # the quoter's highest quote price (its max_mid default): a quote costs at most this per contract
+
+
+def quoter_shape(capital: float, markets_cap: int, order_limit: float | None = None) -> dict:
+    """Markets, contracts per quote and inventory cap for a quoter capital. With `order_limit`, the quote size is
+    also capped so that one quote can never cost more than the per-order limit (small accounts: $2 -> 2 contracts)."""
     markets = max(1, min(int(markets_cap or 5), int(capital // 10)))
     size = max(1, int(capital / markets / 2))
+    if order_limit:
+        size = max(1, min(size, int(float(order_limit) / QUOTE_MAX_PRICE + 1e-9)))
     return {"max_markets": markets, "size": size, "max_inventory": 2 * size}
 
 
 def to_patch(limits: dict, markets_cap: int) -> dict:
-    q = quoter_shape(limits["quoter"], markets_cap)
+    q = quoter_shape(limits["quoter"], markets_cap, limits["order"])
     return {
         "risk": {"max_order_cost": limits["order"], "max_daily_spend": limits["daily_buys"],
                  "max_market_exposure": limits["market"], "max_total_exposure": limits["total"],

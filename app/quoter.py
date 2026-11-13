@@ -396,6 +396,13 @@ class Quoter:
                         self.log("inventory", f"{t}: net position {pos}; pulled the {side.upper()} quote (inventory cap, fill pause, or the market no longer passes the filters)")
                     continue
                 intent, px, cnt, reduce = want[side]
+                if not reduce and px > 0:           # one quote never costs more than the per-order limit: shrink it to fit
+                    fit = int(d(self.e.cfg.risk["max_order_cost"]) / px)
+                    if fit < 1:
+                        if q:
+                            self._cancel(t, side)
+                        continue
+                    cnt = min(cnt, Decimal(fit))
                 if q and q.get("intent", intent) == intent and d(q["price"]) == px and d(q.get("count") or size) == cnt \
                         and q["exp"] - now > 60:
                     continue  # unchanged and not about to expire

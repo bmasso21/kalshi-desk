@@ -232,6 +232,15 @@ def run(keytype: str):
     q.cycle()
     qs = {x["side"]: x for x in c.get("/api/quoter").json()["quotes"]}
     check("offset 0: back at the best bid", qs["yes"]["price"] == "0.5000" and qs["no"]["price"] == "0.4800", qs)
+    lim0 = cfg.risk["max_order_cost"]
+    cfg.update({"risk": {"max_order_cost": 2}})
+    q.cycle()
+    qs = {x["side"]: x for x in c.get("/api/quoter").json()["quotes"]}
+    check("a quote is shrunk to fit the per-order limit ($2 / 48c = 4 contracts instead of 10)", qs.get("no", {}).get("count") in ("4", "4.00") and qs["no"]["price"] == "0.4800", qs)
+    cfg.update({"risk": {"max_order_cost": lim0}})
+    q.cycle()
+    qs = {x["side"]: x for x in c.get("/api/quoter").json()["quotes"]}
+    check("...and back to full size when the limit allows", qs.get("no", {}).get("count") in ("10", "10.00"), qs)
     # pause after a fill: the position grows on the NO side -> stop bidding NO there for a while; the exit quote stays
     cfg.update({"quoter": {"pull_after_fill_min": 10}})
     pz = mock.state.S["positions"]["KXA-1"]

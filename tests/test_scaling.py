@@ -66,6 +66,33 @@ def unit_tests():
     check("zero / negative equity -> zero limits", set(SC.compute(-5)["limits"].values()) == {0.0})
     check("quoter shape: $8 -> 1 market, 4 contracts, 8 inventory", SC.quoter_shape(8, 5) == {"max_markets": 1, "size": 4, "max_inventory": 8})
     check("quoter shape: $88 -> 5 markets, 8 contracts, 16 inventory", SC.quoter_shape(88, 5) == {"max_markets": 5, "size": 8, "max_inventory": 16})
+    check("quoter shape: a quote must fit the per-order limit ($2 order limit -> 2 contracts at up to 85c, inventory 4)",
+          SC.quoter_shape(8, 5, 2) == {"max_markets": 1, "size": 2, "max_inventory": 4})
+    check("quoter shape: a roomy order limit changes nothing; a tiny one still quotes 1 contract",
+          SC.quoter_shape(88, 5, 22) == SC.quoter_shape(88, 5) and SC.quoter_shape(8, 5, 0.5)["size"] == 1)
+    from app import risk as RK
+
+    class _C:
+        risk = {"max_order_cost": 2, "max_daily_spend": 5, "max_market_exposure": 3, "max_total_exposure": 8, "max_contracts_per_order": 500,
+                "min_price": 0.1, "max_price": 0.98}
+        auto = {"max_order_cost": 0.8, "max_daily_spend": 1.5}
+    sp0 = {"all": Decimal("0"), "auto": Decimal("0")}
+    mk_ = {"ticker": "T", "status": "active"}
+    ok_q = RK.check(_C, intent="buy_yes", price="0.50", count=2, market=mk_, positions={"market_positions": []}, spent=sp0, source="quoter")
+    check("quoter order of $1.00 passes under the $2 general per-order limit (the $0.80 auto limit no longer applies to it)", ok_q == Decimal("1.00"), ok_q)
+
+    def blocked(**kw):
+        try:
+            RK.check(_C, market=mk_, positions={"market_positions": []}, **kw)
+            return ""
+        except RK.RiskError as e:
+            return str(e)
+    check("auto-trading orders are still held to the tighter auto limit", "per-order limit $0.80" in blocked(intent="buy_yes", price="0.50", count=2, spent=sp0, source="auto"))
+    check("quoter order above the general per-order limit is still blocked", "per-order limit $2.00" in blocked(intent="buy_yes", price="0.50", count=5, spent=sp0, source="quoter"))
+    check("quoter fills count against the general daily buy limit ($5), not the $1.50 auto one",
+          blocked(intent="buy_yes", price="0.50", count=2, spent={"all": Decimal("3"), "auto": Decimal("3")}, source="quoter") == ""
+          and "Daily spend limit" in blocked(intent="buy_yes", price="0.50", count=2, spent={"all": Decimal("4.5"), "auto": Decimal("4.5")}, source="quoter"))
+    check("auto-trading is still stopped by the auto daily limit", "Auto daily limit" in blocked(intent="buy_yes", price="0.50", count=1, spent={"all": Decimal("1.2"), "auto": Decimal("1.2")}, source="auto"))
     p = SC.to_patch(SC.compute(100)["limits"], 5)
     check("auto limits keep their ratio (40% of order, 30% of daily buys)", p["auto"] == {"max_order_cost": 8.0, "max_daily_spend": 15.0}, p["auto"])
 
@@ -103,8 +130,8 @@ def api_tests(tmp):
           and cfg.risk["max_order_cost"] == 2 and cfg.risk["max_daily_spend"] == 5 and cfg.risk["max_market_exposure"] == 3
           and cfg.risk["max_total_exposure"] == 8 and cfg.risk["max_daily_loss"] == 2, (r.text[:200], cfg.risk))
     check("breakers, auto and quoter follow too", cfg.data["breakers"]["strategy_daily_loss"] == 1.5 and cfg.data["breakers"]["account_drawdown"] == 3
-          and cfg.auto["max_order_cost"] == 0.8 and cfg.quoter["max_capital"] == 8 and cfg.quoter["size"] == 4
-          and cfg.quoter["max_markets"] == 1 and cfg.quoter["max_inventory"] == 8, (cfg.data["breakers"], cfg.auto, cfg.quoter))
+          and cfg.auto["max_order_cost"] == 0.8 and cfg.quoter["max_capital"] == 8 and cfg.quoter["size"] == 2
+          and cfg.quoter["max_markets"] == 1 and cfg.quoter["max_inventory"] == 4, (cfg.data["breakers"], cfg.auto, cfg.quoter))
     check("turning scaling on does not switch the quoter or auto-trading on", not cfg.quoter["enabled"] and not cfg.auto["enabled"] and cfg.env == "demo")
     r = c.post("/api/config", headers=H, json={"risk": {"max_order_cost": 500, "min_price": 0.2}, "quoter": {"max_capital": 9999, "pull_hours": 7}})
     check("while on, hand-typed dollar limits are ignored; other settings still save", cfg.risk["max_order_cost"] == 2 and cfg.risk["min_price"] == 0.2
