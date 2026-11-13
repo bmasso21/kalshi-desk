@@ -117,9 +117,7 @@ def main():
     check("late: the NO side (bought at 1 - bid = 96c) is included", b["buys"] == 10 and b["avg_price_c"] == 96.0, b)
     wide = ST.late(conn, {"categories": ["Weather2"]})
     check("late: a 99c ask on an empty book (bid 2c) is NOT counted as a favorite", wide["rows"] == [] and wide["max_spread_c"] == 3, wide["rows"])
-    eqv = bp["80-89c"]["taker_eq"]
-    check("per-event average (every event counts once) is reported beside the volume-weighted one", eqv["events"] == 10
-          and close(eqv["ret_c"], 100 * (0.9 - 0.8 - fee80), 0.002) and eqv["t"] is not None, eqv)
+    check("the biased per-event average is no longer reported", "taker_eq" not in bp["80-89c"] and "maker_eq" not in bp["80-89c"], list(bp["80-89c"]))
     check("late: no candle near 24h before the close -> no row invented", not any(h == 24 for h, _ in rows), list(rows))
 
     cb = ST.calib(conn, {"categories": ["Weather"]})

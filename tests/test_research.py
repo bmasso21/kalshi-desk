@@ -141,6 +141,9 @@ def build_data_mock():
 
     @app.get(P + "/series/{s}/markets/{t}/candlesticks")
     def lcandles(s: str, t: str, start_ts: int, end_ts: int, period_interval: int):
+        if (end_ts - start_ts) / (period_interval * 60) > 5000:      # as Kalshi does
+            from fastapi import HTTPException as _H
+            raise _H(400, "requested time range with candlesticks over max candlesticks: 5000")
         e = start_ts - start_ts % 3600 + 3600
         out = []
         while e <= end_ts and len(out) < 3:
@@ -428,6 +431,23 @@ def main():
           jsp["longshot"]["status"] == "done" and jsp["longshot"]["result"]["skipped_too_busy"] == 1 and jsp["calib"]["status"] == "done",
           {k: (v or {}).get("status") for k, v in jsp.items()})
     check("studies: results are kept per scope (the all-categories result is still there)", c.get("/api/studies", headers=HD).json()["studies"]["longshot"]["status"] == "done")
+    # a category can be collected deeper than the rest; markets cut at the old cap are fetched again in full
+    r = c.post("/api/config", headers=HD, json={"warehouse": {"sample": {"overrides": {"Sports": {"max_trades_per_market": 100, "series_per_category": 1, "bogus": 5}}}}})
+    check("sample overrides per category saved and validated", r.status_code == 200 and cfg.data["warehouse"]["sample"]["overrides"] == {"Sports": {"max_trades_per_market": 100, "series_per_category": 1}}
+          and cfg.data["warehouse"]["sample"]["enabled"] is True, cfg.data["warehouse"]["sample"])
+    st5 = wh.sync()
+    check("sample override: the market cut at the old cap is refetched in full (complete = 1, all 3 trades)",
+          q("SELECT complete FROM wh_markets WHERE ticker='KXNFL-26NOV09-GB'")[0]["complete"] == 1
+          and len(q("SELECT 1 FROM wh_trades WHERE ticker='KXNFL-26NOV09-GB'")) == 3 and st5["errors"] == 0, st5)
+    # long-lived markets: candle requests are split so none asks for more than Kalshi's 5000-candle limit
+    mrow = dict(q("SELECT ticker, series_ticker, category, tier, open_ts, close_ts, settled_ts, status, volume, trades_synced_to, candles_synced_to FROM wh_markets WHERE ticker='KXHIGHNY-26NOV05-B40'")[0])
+    mrow.update(open_ts=time.time() - 400 * 86400, candles_synced_to=0, close_ts=time.time() + 86400, tier="live", settled_ts=None)
+    try:
+        wh._sync_market_data(mrow, {})
+        ok_c = True
+    except Exception as e:
+        ok_c = str(e)
+    check("candles for a market open 400 days are fetched in several requests, none over the limit", ok_c is True, ok_c)
     cfg.data["warehouse"]["sample"]["enabled"] = False
 
 

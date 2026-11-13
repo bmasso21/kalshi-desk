@@ -410,6 +410,20 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                                 okd[k] = max(lo, min(hi, int(float(sm[k]))))
                             except (TypeError, ValueError):
                                 pass
+                    if isinstance(sm.get("overrides"), dict):      # per-category depth, e.g. {"Sports": {"series_per_category": 40}}
+                        ovs = {}
+                        for cat, ov in list(sm["overrides"].items())[:20]:
+                            if not isinstance(ov, dict):
+                                continue
+                            o2 = {}
+                            for k, lo, hi in (("series_per_category", 1, 200), ("markets_per_series", 1, 2000), ("days", 1, 365), ("max_trades_per_market", 100, 200000)):
+                                if k in ov:
+                                    try:
+                                        o2[k] = max(lo, min(hi, int(float(ov[k]))))
+                                    except (TypeError, ValueError):
+                                        pass
+                            ovs[str(cat)[:60]] = o2
+                        cfg.data.setdefault("warehouse", {}).setdefault("sample", {})["overrides"] = ovs   # replaced whole, not merged
                     if isinstance(sm.get("skip_categories"), list):
                         cfg.data.setdefault("warehouse", {}).setdefault("sample", {})["skip_categories"] = [str(x)[:60] for x in sm["skip_categories"]][:40]
                 w["sample"] = okd

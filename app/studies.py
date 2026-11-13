@@ -118,8 +118,7 @@ def longshot(conn, flt: dict | None = None) -> dict:
         for k in sorted(meta):
             n, px, wins, trades = meta[k]
             out.append({"key": k, "contracts": round(n), "trades": trades, "avg_price_c": round(100 * px / n, 1),
-                        "win_pct": round(100 * wins / n, 1), "taker": _stat(tk[k]), "maker": _stat(mk[k]),
-                        "taker_eq": _stat_eq(tk[k]), "maker_eq": _stat_eq(mk[k])})
+                        "win_pct": round(100 * wins / n, 1), "taker": _stat(tk[k]), "maker": _stat(mk[k])})
         return out
     lab = lambda b: f"{b * 10 if b else 1}-{b * 10 + 9}c"
     by_price = [{**x, "bucket": lab(x["key"])} for x in table(lambda r: True, lambda r: r["b"])]
@@ -276,16 +275,9 @@ def baskets(conn, flt: dict | None = None) -> dict:
     return {"events": n_ev, "event_hours": hours, "complete_event_hours": full, **out}
 
 
-def _stat_eq(groups: dict) -> dict:
-    """Every event counts once, whatever its volume: mean of the per-event returns (cents) and its t. A result that
-    only shows when events are weighted by contracts is being carried by a few very busy days."""
-    rs = [g[1] / g[0] for g in groups.values() if g[0] > 0]
-    k = len(rs)
-    if not k:
-        return {"events": 0, "ret_c": None, "se_c": None, "t": None}
-    mean = sum(rs) / k
-    se = math.sqrt(sum((x - mean) ** 2 for x in rs) / (k - 1) / k) if k > 1 else None
-    return {"events": k, "ret_c": round(100 * mean, 3), "se_c": round(100 * se, 3) if se else None, "t": round(mean / se, 2) if se else None}
+# NOTE: a "per-event average" (every event counted once) was removed in 3.9.1. It is biased by construction for
+# price buckets: the eventual winner's price always crosses the upper buckets and the loser's the lower ones, so
+# averaging event by event shows favorites winning and longshots losing even in a perfectly fair market.
 
 
 RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets}

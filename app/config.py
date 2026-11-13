@@ -141,7 +141,7 @@ DEFAULTS = {
         "base_url_override": "",        # testing only
         # Broad sample for the edge studies: besides the full scope above, a slice of EVERY other category -
         # the busiest series of each, and the most recently settled markets of each series.
-        "sample": {"enabled": False, "series_per_category": 12, "markets_per_series": 60, "days": 45,
+        "sample": {"enabled": False, "series_per_category": 12, "markets_per_series": 60, "days": 45, "candle_days": 30, "overrides": {},
                    "max_trades_per_market": 5000, "skip_categories": []},
     },
     # --- weather data for 2.1 (NWS forecast guidance + observations + climate reports, public) ---

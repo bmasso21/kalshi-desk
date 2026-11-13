@@ -253,6 +253,13 @@ class Warehouse:
                     pass
         return best
 
+    def _sample_opt(self, category, key: str, default):
+        """A sample setting, with an optional per-category override (sample.overrides = {category: {key: value}})."""
+        sc = self.cfg.get("sample") or {}
+        ov = (sc.get("overrides") or {}).get(category or "") or {}
+        v = ov.get(key, sc.get(key))
+        return default if v in (None, "") else v
+
     def sample_series(self, exclude: set) -> list[dict]:
         """The busiest series of every category that is not already collected in full."""
         sc = self.cfg.get("sample") or {}
@@ -279,10 +286,11 @@ class Warehouse:
                 import hashlib
                 vols.sort(key=lambda x: hashlib.md5(x[1]["ticker"].encode()).hexdigest())
                 how = "no volume data, arbitrary pick"
-            for _, s in vols[:per]:
+            n = max(1, int(self._sample_opt(cat, "series_per_category", per)))
+            for _, s in vols[:n]:
                 self.db.upsert_series(s, cat)
-                out.append({"ticker": s["ticker"], "category": s.get("category") or cat})
-            info[cat] = f"{min(per, len(vols))} of {len(ser)} series ({how})"
+                out.append({"ticker": s["ticker"], "category": s.get("category") or cat, "sample_cat": cat})
+            info[cat] = f"{min(n, len(vols))} of {len(ser)} series ({how})"
         self.db.put("sample_info", info)
         return out
 
@@ -291,7 +299,7 @@ class Warehouse:
         st, cat = s["ticker"], s.get("category")
         since = time.time() - days * 86400
         got = []
-        for m in self.client.paginate("/markets", "markets", {"series_ticker": st, "status": "settled", "limit": 1000}, max_items=3000):
+        for m in self.client.paginate("/markets", "markets", {"series_ticker": st, "status": "settled", "limit": 1000}, max_items=max(3000, per * 3)):
             ts = iso_ts(m.get("settlement_ts")) or iso_ts(m.get("close_time")) or 0
             if ts >= since and (m.get("result") in ("yes", "no")):
                 got.append((ts, m))
@@ -342,13 +350,19 @@ class Warehouse:
                         break
                     self.state["progress"] = f"sample markets {i + 1}/{len(samp)} {s['ticker']}"
                     try:
-                        stats["markets"] += self._retry(self._sync_sample_markets, s, float(sc.get("days") or 45), int(sc.get("markets_per_series") or 60))
+                        stats["markets"] += self._retry(self._sync_sample_markets, s, float(self._sample_opt(s.get("sample_cat"), "days", 45)),
+                                                        int(self._sample_opt(s.get("sample_cat"), "markets_per_series", 60)))
                     except Exception as e:
                         stats["errors"] += 1
                         self.state["error"] = f"{s['ticker']}: {e}"[:300]
+                # markets cut at an earlier, lower trade cap are fetched again when their category's cap has been raised
+                for r in self.db.query("SELECT m.ticker, m.category, (SELECT COUNT(*) FROM wh_trades t WHERE t.ticker = m.ticker) n "
+                                       "FROM wh_markets m WHERE m.complete = 2"):
+                    if r["n"] < int(self._sample_opt(r["category"], "max_trades_per_market", 5000)):
+                        self.db.execute("UPDATE wh_markets SET complete=0, trades_synced_to=0 WHERE ticker=?", (r["ticker"],))
             # 2) trades + candles for markets that still need them
             todo = self.db.query(
-                "SELECT ticker, series_ticker, tier, open_ts, close_ts, settled_ts, status, volume, trades_synced_to, "
+                "SELECT ticker, series_ticker, category, tier, open_ts, close_ts, settled_ts, status, volume, trades_synced_to, "
                 "candles_synced_to FROM wh_markets WHERE complete=0 AND COALESCE(close_ts, 0) >= ? "
                 "ORDER BY close_ts DESC", (since,))
             self.state["phase"] = "trades+candles"
@@ -426,7 +440,7 @@ class Warehouse:
         end = int(min(now, (m["close_ts"] or now) + 3600))
         nt = nc = 0
         sampled = m["series_ticker"] not in getattr(self, "_full_scope", {m["series_ticker"]})
-        cap = int((self.cfg.get("sample") or {}).get("max_trades_per_market") or 5000) if sampled else 200000
+        cap = int(self._sample_opt(m["category"], "max_trades_per_market", 5000)) if sampled else 200000
         truncated = False
         # trades (skip markets that never traded)
         if (m["volume"] or 0) > 0 or m["volume"] is None:
@@ -455,16 +469,19 @@ class Warehouse:
         # hourly candles
         period = int(self.cfg.get("candle_period", 60))
         cstart = max(start, int(m["candles_synced_to"] or 0) - period * 60)
+        if sampled:                              # the studies look at the last days before the close, not a market's whole life
+            cstart = max(cstart, end - int(self._sample_opt(m["category"], "candle_days", 30)) * 86400)
         if cstart < end:
             hist = m["tier"] == "historical" or (cut.get("market_settled_ts") and m["settled_ts"]
                                                   and m["settled_ts"] < cut["market_settled_ts"])
-            if hist:
-                r = self.client.request("GET", f"/historical/markets/{t}/candlesticks",
-                                        {"start_ts": cstart, "end_ts": end, "period_interval": period})
-            else:
-                r = self.client.request("GET", f"/series/{m['series_ticker']}/markets/{t}/candlesticks",
-                                        {"start_ts": cstart, "end_ts": end, "period_interval": period})
-            nc += self.db.add_candles(t, period, r.get("candlesticks") or [])
+            path = f"/historical/markets/{t}/candlesticks" if hist else f"/series/{m['series_ticker']}/markets/{t}/candlesticks"
+            step = 4000 * period * 60            # Kalshi refuses more than 5000 candles per request
+            a = cstart
+            while a < end:
+                b = min(end, a + step)
+                r = self.client.request("GET", path, {"start_ts": a, "end_ts": b, "period_interval": period})
+                nc += self.db.add_candles(t, period, r.get("candlesticks") or [])
+                a = b
             self.db.execute("UPDATE wh_markets SET candles_synced_to=? WHERE ticker=?", (end, t))
         if m["status"] in ("settled", "finalized") or (m["settled_ts"] and m["settled_ts"] < now):
             # complete = 2: settled and stored, but its trade list was cut at the sample cap (trade-level studies skip it)
