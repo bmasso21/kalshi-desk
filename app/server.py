@@ -1131,6 +1131,18 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                         r.get("fee_cost"), json.dumps(r)))
         return {"settlements": s}
 
+    @app.get("/api/prod/history")
+    def prod_history_view(days: float = 30, prefix: str = ""):
+        """Results of the LIVE account, read-only (its fills and settlements only), while the desk stays on its current environment."""
+        from .history import prod_history
+        try:
+            out = prod_history(cfg, days, prefix[:40])
+        except Exception as e:
+            db.audit("prod_history_error", str(e)[:300])
+            raise HTTPException(502, f"could not read the production account: {e}")
+        db.audit("prod_history_read", f"days={days} prefix={prefix[:40]} fills={out.get('fills_read')}")
+        return out
+
     # ------------------------------------------------------------- orders --
     @app.post("/api/order")
     async def order(request: Request):
