@@ -29,9 +29,9 @@ def build(tmp):
     wdb.execute("INSERT INTO wh_series VALUES('S', 'Weather', 'S', 'quadratic', 1.0, 'daily', '{}', 0)")
     wdb.execute("INSERT INTO wh_series VALUES('F', 'Other', 'F', 'quadratic_with_maker_fees', 1.0, 'daily', '{}', 0)")
 
-    def mkt(t, ev, series, cat, close_ts, result):
-        wdb.execute("INSERT INTO wh_markets(ticker, event_ticker, series_ticker, category, status, open_ts, close_ts, result, volume) "
-                    "VALUES(?,?,?,?, 'finalized', ?, ?, ?, 100)", (t, ev, series, cat, close_ts - 86400 * 2, close_ts, result))
+    def mkt(t, ev, series, cat, close_ts, result, complete=1):
+        wdb.execute("INSERT INTO wh_markets(ticker, event_ticker, series_ticker, category, status, open_ts, close_ts, result, volume, complete) "
+                    "VALUES(?,?,?,?, 'finalized', ?, ?, ?, 100, ?)", (t, ev, series, cat, close_ts - 86400 * 2, close_ts, result, complete))
 
     def trade(i, t, ts, yp, n, side):
         wdb.execute("INSERT INTO wh_trades VALUES(?,?,?,?,?,?,?,0)", (f"t{i}", t, ts, yp, n, side, "bid" if side == "yes" else "ask"))
@@ -66,6 +66,8 @@ def build(tmp):
     # another category with maker fees, to check the filter and the maker fee
     mkt("X-1", "X", "F", "Other", T0 + 86400, "yes")
     trade(999, "X-1", T0, 0.50, 100, "yes")
+    mkt("X-2", "X2", "F", "Other", T0 + 86400, "no", complete=2)      # a sampled market whose trade list was cut at the cap
+    trade(998, "X-2", T0, 0.50, 7, "yes")
     return wdb, T0
 
 
@@ -99,6 +101,7 @@ def main():
     check("the two side labels in the data are tabulated for a sanity check", {(x["outcome_side"], x["book_side"]) for x in r["side_labels"]} == {("yes", "bid"), ("no", "ask")})
     r2 = ST.longshot(conn, {"categories": ["Other"]})
     x = r2["by_price"][0]
+    check("a market whose trade list was cut at the sample cap is left out of the trade study, and counted", r2["skipped_too_busy"] == 1 and len(r2["by_price"]) == 1)
     check("category filter + maker fee series: maker pays 0.0175 x .5 x .5 (taker -1.75c + 50c, maker -50.44c)", r2["markets"] == 1 and x["contracts"] == 100
           and close(x["taker"]["ret_c"], 100 * (1 - 0.5 - 0.07 * 0.25), 0.002) and close(x["maker"]["ret_c"], 100 * (0.5 - 1 - 0.0175 * 0.25), 0.002), x)
     check("empty scope is reported, not an error", ST.longshot(conn, {"categories": ["Nope"]})["markets"] == 0)
@@ -150,9 +153,9 @@ def main():
         if rid not in st.threads:
             break
         time.sleep(0.05)
-    L = st.latest()
-    check("study runs in the background and its result is stored", L["longshot"]["status"] == "done" and L["longshot"]["result"]["markets"] == 20
-          and L["late"] is None, L["longshot"]["status"])
+    L = st.latest({"categories": ["Weather"]})
+    check("study runs in the background and its result is stored under its scope", L["longshot"]["status"] == "done" and L["longshot"]["result"]["markets"] == 20
+          and L["late"] is None and st.latest()["longshot"] is None, L["longshot"]["status"])
     wdb.execute("INSERT INTO wh_studies(ts, kind, status, params) VALUES(?, 'late', 'running', '{}')", (time.time(),))
     try:
         st.start("late")

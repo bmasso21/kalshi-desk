@@ -399,6 +399,20 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                     except Exception:
                         w.pop(k)
                         errors.append(f"warehouse {k} must be between {lo} and {hi}")
+            if "sample" in w:
+                sm, okd = w["sample"], {}
+                if isinstance(sm, dict):
+                    if "enabled" in sm:
+                        okd["enabled"] = bool(sm["enabled"])
+                    for k, lo, hi in (("series_per_category", 1, 100), ("markets_per_series", 1, 1000), ("days", 1, 365), ("max_trades_per_market", 100, 200000)):
+                        if k in sm:
+                            try:
+                                okd[k] = max(lo, min(hi, int(float(sm[k]))))
+                            except (TypeError, ValueError):
+                                pass
+                    if isinstance(sm.get("skip_categories"), list):
+                        cfg.data.setdefault("warehouse", {}).setdefault("sample", {})["skip_categories"] = [str(x)[:60] for x in sm["skip_categories"]][:40]
+                w["sample"] = okd
             if "candle_period" in w and int(w.get("candle_period") or 0) not in (1, 60, 1440):
                 w.pop("candle_period")
                 errors.append("candle_period must be 1, 60 or 1440")
@@ -635,8 +649,8 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         return {"ts": r["ts"], "chars": len(txt), "body_text": txt[:max(100, min(chars, 200000))]}
 
     @app.get("/api/studies")
-    def studies_list():
-        return {"studies": studies.latest(), "kinds": list(STUDY_KINDS),
+    def studies_list(category: str = ""):
+        return {"studies": studies.latest({"categories": [category]} if category else None), "kinds": list(STUDY_KINDS), "category": category,
                 "scope": wdb.query("SELECT category, COUNT(*) markets, SUM(result IN ('yes','no')) settled FROM wh_markets GROUP BY category")}
 
     @app.post("/api/studies/run")
@@ -882,6 +896,12 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 p[k] = max(lo, min(hi, float(b[k])))
         if b.get("exit_step_in"):
             p["exit_step_in"] = True
+        if b.get("hold_to_settle"):
+            p["hold_to_settle"] = True
+        if b.get("min_quote_price") is not None:
+            p["min_quote_price"] = max(0.0, min(0.99, float(b["min_quote_price"])))
+        if isinstance(b.get("series_prefixes"), list):
+            p["series_prefixes"] = [str(x)[:30] for x in b["series_prefixes"] if str(x).strip()][:20]
         for k, lo, hi in (("max_capital", 0, 10 ** 7), ("market_loss_stop", 0, 10 ** 6), ("max_move", 0, 1), ("max_inventory", 1, 10 ** 5)):
             if b.get(k) is not None:
                 p[k] = max(lo, min(hi, float(b[k])))

@@ -241,6 +241,65 @@ class Warehouse:
             out.append({"ticker": st, "category": s.get("category")})
         return out
 
+    # ---- broad sample: a slice of every other category ------------------------------------------------
+    @staticmethod
+    def _series_volume(s: dict) -> float:
+        best = 0.0
+        for k, v in s.items():
+            if "volume" in k.lower():
+                try:
+                    best = max(best, float(v or 0))
+                except (TypeError, ValueError):
+                    pass
+        return best
+
+    def sample_series(self, exclude: set) -> list[dict]:
+        """The busiest series of every category that is not already collected in full."""
+        sc = self.cfg.get("sample") or {}
+        if not sc.get("enabled"):
+            return []
+        per = max(1, int(sc.get("series_per_category") or 12))
+        skip = {c.lower() for c in (sc.get("skip_categories") or [])} | {c.lower() for c in (self.cfg.get("categories") or [])}
+        cats = sorted((self._retry(self.client.tags_by_category) or {}).get("tags_by_categories") or {})
+        out, info = [], {}
+        for cat in cats:
+            if cat.lower() in skip or "test" in cat.lower() or self._stop.is_set():
+                continue
+            try:
+                ser = self._retry(self.client.series_list, cat) or []
+            except Exception as e:
+                info[cat] = f"error: {e}"[:120]
+                continue
+            ser = [s for s in ser if s.get("ticker") and s["ticker"] not in exclude]
+            vols = [(self._series_volume(s), s) for s in ser]
+            if any(v > 0 for v, _ in vols):
+                vols.sort(key=lambda x: -x[0])
+                how = "by volume"
+            else:                               # no volume figures: an arbitrary but repeatable spread
+                import hashlib
+                vols.sort(key=lambda x: hashlib.md5(x[1]["ticker"].encode()).hexdigest())
+                how = "no volume data, arbitrary pick"
+            for _, s in vols[:per]:
+                self.db.upsert_series(s, cat)
+                out.append({"ticker": s["ticker"], "category": s.get("category") or cat})
+            info[cat] = f"{min(per, len(vols))} of {len(ser)} series ({how})"
+        self.db.put("sample_info", info)
+        return out
+
+    def _sync_sample_markets(self, s, days: float, per: int) -> int:
+        """The most recently settled markets of one sampled series (they have a result; that is what the studies need)."""
+        st, cat = s["ticker"], s.get("category")
+        since = time.time() - days * 86400
+        got = []
+        for m in self.client.paginate("/markets", "markets", {"series_ticker": st, "status": "settled", "limit": 1000}, max_items=3000):
+            ts = iso_ts(m.get("settlement_ts")) or iso_ts(m.get("close_time")) or 0
+            if ts >= since and (m.get("result") in ("yes", "no")):
+                got.append((ts, m))
+        got.sort(key=lambda x: -x[0])
+        for _, m in got[:per]:
+            self.db.upsert_market(m, st, cat, "live")
+        return min(per, len(got))
+
     def cutoff(self) -> dict:
         try:
             c = self.client.request("GET", "/historical/cutoff")
@@ -270,6 +329,23 @@ class Warehouse:
                 except Exception as e:              # one series failing must not abort the whole sync
                     stats["errors"] += 1
                     self.state["error"] = f"{s['ticker']}: {e}"[:300]
+            # 1b) broad sample of the other categories (for the edge studies)
+            full = {s["ticker"] for s in series}
+            self._full_scope = full
+            sc = self.cfg.get("sample") or {}
+            if sc.get("enabled"):
+                self.state["phase"] = "sample"
+                samp = self.sample_series(full)
+                stats["sample_series"] = len(samp)
+                for i, s in enumerate(samp):
+                    if self._stop.is_set():
+                        break
+                    self.state["progress"] = f"sample markets {i + 1}/{len(samp)} {s['ticker']}"
+                    try:
+                        stats["markets"] += self._retry(self._sync_sample_markets, s, float(sc.get("days") or 45), int(sc.get("markets_per_series") or 60))
+                    except Exception as e:
+                        stats["errors"] += 1
+                        self.state["error"] = f"{s['ticker']}: {e}"[:300]
             # 2) trades + candles for markets that still need them
             todo = self.db.query(
                 "SELECT ticker, series_ticker, tier, open_ts, close_ts, settled_ts, status, volume, trades_synced_to, "
@@ -349,6 +425,9 @@ class Warehouse:
         start = int(m["open_ts"] or ((m["close_ts"] or now) - 7 * 86400))
         end = int(min(now, (m["close_ts"] or now) + 3600))
         nt = nc = 0
+        sampled = m["series_ticker"] not in getattr(self, "_full_scope", {m["series_ticker"]})
+        cap = int((self.cfg.get("sample") or {}).get("max_trades_per_market") or 5000) if sampled else 200000
+        truncated = False
         # trades (skip markets that never traded)
         if (m["volume"] or 0) > 0 or m["volume"] is None:
             since = max(start, int(m["trades_synced_to"] or 0) - 300)   # 5-min overlap; duplicates are ignored
@@ -360,8 +439,12 @@ class Warehouse:
                 routes.append(("/markets/trades", int(max(since, hist_cut or 0)), end))
             for path, a, b in routes:
                 params = {"ticker": t, "min_ts": a, "max_ts": b, "limit": 1000}
-                batch = []
-                for tr in self.client.paginate(path, "trades", params, max_items=200000):
+                batch, got = [], 0
+                for tr in self.client.paginate(path, "trades", params, max_items=cap + 1):
+                    got += 1
+                    if got > cap:
+                        truncated = True         # busier than the sample allows: keep quotes, leave its trades out of trade studies
+                        break
                     batch.append(tr)
                     if len(batch) >= 2000:
                         nt += self.db.add_trades(batch)
@@ -384,12 +467,13 @@ class Warehouse:
             nc += self.db.add_candles(t, period, r.get("candlesticks") or [])
             self.db.execute("UPDATE wh_markets SET candles_synced_to=? WHERE ticker=?", (end, t))
         if m["status"] in ("settled", "finalized") or (m["settled_ts"] and m["settled_ts"] < now):
-            self.db.execute("UPDATE wh_markets SET complete=1 WHERE ticker=?", (t,))
+            # complete = 2: settled and stored, but its trade list was cut at the sample cap (trade-level studies skip it)
+            self.db.execute("UPDATE wh_markets SET complete=? WHERE ticker=?", (2 if truncated else 1, t))
         return nt, nc
 
     # -------------------------------------------------------------- loop --
     def status(self) -> dict:
-        return {**self.state, "counts": self.db.counts(), "config": self.cfg, "cutoff": self.db.get("cutoff"),
+        return {**self.state, "counts": self.db.counts(), "config": self.cfg, "cutoff": self.db.get("cutoff"), "sample_info": self.db.get("sample_info"),
                 "last_stats": self.db.get("last_stats")}
 
     def trigger(self):

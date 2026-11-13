@@ -490,6 +490,29 @@ def trading_first_tests():
     check("unknown fee type -> maker fees assumed, flagged", f["fee_known"] is False and "not in the fee table" in f["fee_note"], f)
 
 
+def onesided_tests():
+    # book: YES bid 40c, NO bid 58c -> NO is the favorite side
+    a = mm.SimQuoter(INFO, {**P, "min_quote_price": 0.55}, "touch")
+    a.requote(1000, MK, YES, NO)
+    check("favorite-side-only: the 58c NO bid is placed, the 40c YES bid is not", set(a.s["quotes"]) == {"no"} and a.s["quotes"]["no"]["px"] == 0.58, a.s["quotes"])
+    a.apply_trades([tr(1001, 0.42, 10, "bid")])                  # a taker buys YES at 42c = sells into... our NO bid at 58c fills
+    check("favorite-side-only: the NO bid fills", a.s["pos_no"] == 10, a.s)
+    a.requote(1100, MK, YES, NO)
+    check("favorite-side-only: holding NO, the YES-side quote that REDUCES the position is still placed (an exit is never blocked)",
+          "yes" in a.s["quotes"], a.s["quotes"])
+    b = mm.SimQuoter(INFO, {**P, "min_quote_price": 0.55, "hold_to_settle": True}, "touch")
+    b.requote(1000, MK, YES, NO)
+    b.apply_trades([tr(1001, 0.42, 10, "bid")])
+    b.requote(1100, MK, YES, NO)
+    check("hold to settlement: no reducing quote; it keeps bidding only on the favorite side", b.s["pos_no"] == 10 and "yes" not in b.s["quotes"] and "no" in b.s["quotes"], b.s["quotes"])
+    c_ = mm.SimQuoter(INFO, {**P, "min_quote_price": 0.70}, "touch")
+    c_.requote(1000, MK, YES, NO)
+    check("favorite-side-only: neither side at or above 70c -> nothing quoted", c_.s["quotes"] == {}, c_.s["quotes"])
+    d_ = mm.SimQuoter(INFO, P, "touch")
+    d_.requote(1000, MK, YES, NO)
+    check("default (no minimum price) still quotes both sides", set(d_.s["quotes"]) == {"yes", "no"})
+
+
 def retry_tests():
     from app.kalshi_client import KalshiError
     n, waits = {"c": 0}, []
@@ -600,6 +623,7 @@ if __name__ == "__main__":
     backtest_prune_test()
     quoter_select_tests()
     retry_tests()
+    onesided_tests()
     trading_first_tests()
     integration_tests(tempfile.mkdtemp())
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")

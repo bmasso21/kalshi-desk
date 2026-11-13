@@ -139,6 +139,10 @@ DEFAULTS = {
         "record_ticks": True,           # top-of-book changes from the live feed
         "max_hist_pages": 20,
         "base_url_override": "",        # testing only
+        # Broad sample for the edge studies: besides the full scope above, a slice of EVERY other category -
+        # the busiest series of each, and the most recently settled markets of each series.
+        "sample": {"enabled": False, "series_per_category": 12, "markets_per_series": 60, "days": 45,
+                   "max_trades_per_market": 5000, "skip_categories": []},
     },
     # --- weather data for 2.1 (NWS forecast guidance + observations + climate reports, public) ---
     "weather": {

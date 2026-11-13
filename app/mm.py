@@ -700,14 +700,17 @@ class SimQuoter:
         # like the live quoter: at the inventory cap the reducing side steps 1c inside the spread when there is room
         room = (1 - nb) - yb >= 2 * TICK - EPS
         step = TICK if (p.get("exit_step_in") and abs(net) >= inv and room) else 0.0
+        # favorite-side-only quoting: an OPENING bid is only placed at or above min_quote_price (0 = both sides).
+        # hold_to_settle: never quote to reduce - what is bought is held until the market settles.
+        minq, hold = float(p.get("min_quote_price") or 0), bool(p.get("hold_to_settle"))
         want = {}
         if net < inv and s["side_pause"].get("yes", 0.0) <= now:
             px = round(yb + step, 4) if (step and net < 0) else round(yb - off, 4)
-            if px >= 0.01:
+            if px >= 0.01 and ((net < 0 and not hold) or (net >= 0 and px >= minq - EPS)):
                 want["yes"] = (px, ylv.get(px, 0.0))
         if -net < inv and s["side_pause"].get("no", 0.0) <= now:
             px = round(nb + step, 4) if (step and net > 0) else round(nb - off, 4)
-            if px >= 0.01:
+            if px >= 0.01 and ((net > 0 and not hold) or (net <= 0 and px >= minq - EPS)):
                 want["no"] = (px, nlv.get(px, 0.0))
         # per-market loss stop (like the live quoter): down this much on this market -> exit-only for a day
         stop = float(p.get("market_loss_stop") or 0)
@@ -821,6 +824,9 @@ class Shadow:
         size = int(p["size"])
         k = str(size if str(size) in {str(s) for s in sc["summary"]["sizes"]} else sc["summary"]["sizes"][0])
         rows = scanner.rows(sc["id"], int(k), limit=100000)
+        pre = tuple(x.upper() for x in (p.get("series_prefixes") or []) if x)
+        if pre:                                   # e.g. ["KXHIGH", "KXLOW"] = daily temperature markets only
+            rows = [r for r in rows if str(r.get("series") or "").upper().startswith(pre)]
         mv = float(p.get("max_volume_24h") or 0)
         if p.get("select_by") == "trading":
             picked = pick_trading_first(rows, int(k), int(p["n_markets"]), 1e12, float(p.get("min_spread") or 0.02), mv,
@@ -848,7 +854,8 @@ class Shadow:
                  "pull_hours": 6, "jump_cents": 4, "cooldown_min": 10, "refresh_sec": 15, "min_mid": 0.15, "max_mid": 0.85,
                  "max_spread": 0.06, "requeue_sec": 60, "per_series": 3, "offset_ticks": 0, "max_volume_24h": 0,
                  "pull_after_fill_min": 0, "burst_contracts": 0, "burst_pull_min": 10, "exit_step_in": False,
-                 "max_capital": 0, "market_loss_stop": 0, "select_by": "rewards", "min_spread": 0.02, "max_move": 0, **params}
+                 "max_capital": 0, "market_loss_stop": 0, "select_by": "rewards", "min_spread": 0.02, "max_move": 0,
+                 "min_quote_price": 0, "hold_to_settle": False, "series_prefixes": [], **params}
             sc, k, picked = self._pick(scanner, p)
             fee_types: dict[str, dict] = {}
             for r in picked:

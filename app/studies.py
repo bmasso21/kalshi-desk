@@ -75,9 +75,9 @@ def _where(flt: dict, alias="m") -> tuple[str, list]:
 def longshot(conn, flt: dict | None = None) -> dict:
     flt = flt or {}
     w, args = _where(flt)
-    span = conn.execute(f"SELECT MIN(m.close_ts) a, MAX(m.close_ts) b, COUNT(*) n FROM wh_markets m WHERE {w}", args).fetchone()
+    span = conn.execute(f"SELECT MIN(m.close_ts) a, MAX(m.close_ts) b, COUNT(*) n, SUM(m.complete = 2) cut FROM wh_markets m WHERE {w} AND m.complete IN (1, 2)", args).fetchone()
     if not span["n"]:
-        return {"markets": 0, "note": "no settled markets in scope"}
+        return {"markets": 0, "note": "no settled markets with stored trades in scope"}
     mid = (span["a"] + span["b"]) / 2
     ty = ("CASE WHEN t.taker_outcome_side='yes' THEN 1 WHEN t.taker_outcome_side='no' THEN 0 "
           "WHEN t.taker_book_side='bid' THEN 1 WHEN t.taker_book_side='ask' THEN 0 END")
@@ -92,7 +92,7 @@ def longshot(conn, flt: dict | None = None) -> dict:
              {TAKER} * COALESCE(s.fee_multiplier, 1) * t.yes_price * (1 - t.yes_price) tfee,
              ({MAKER_SQL}) * COALESCE(s.fee_multiplier, 1) * t.yes_price * (1 - t.yes_price) mfee
       FROM wh_trades t JOIN wh_markets m ON m.ticker = t.ticker LEFT JOIN wh_series s ON s.series_ticker = m.series_ticker
-      WHERE {w} AND t.yes_price > 0 AND t.yes_price < 1 AND t.count > 0 AND {ty} IS NOT NULL AND t.ts <= m.close_ts
+      WHERE {w} AND m.complete = 1 AND t.yes_price > 0 AND t.yes_price < 1 AND t.count > 0 AND {ty} IS NOT NULL AND t.ts <= m.close_ts
     ) GROUP BY ev, b, hb, half"""
     rows = conn.execute(sql, [mid] + args).fetchall()
     hb_names = ["under 1h", "1-6h", "6-24h", "over 24h"]
@@ -128,7 +128,8 @@ def longshot(conn, flt: dict | None = None) -> dict:
     overall = table(lambda r: True, lambda r: 0)
     san = conn.execute(f"SELECT t.taker_outcome_side o, t.taker_book_side b, COUNT(*) n FROM wh_trades t JOIN wh_markets m ON m.ticker=t.ticker "
                        f"WHERE {w} GROUP BY 1,2", args).fetchall()
-    return {"markets": span["n"], "from": span["a"], "to": span["b"], "split_at": mid, "by_price": by_price, "first_half": halves[0],
+    return {"markets": span["n"] - (span["cut"] or 0), "skipped_too_busy": span["cut"] or 0,
+            "from": span["a"], "to": span["b"], "split_at": mid, "by_price": by_price, "first_half": halves[0],
             "second_half": halves[1], "by_time_to_close": by_time, "overall": overall[0] if overall else None,
             "side_labels": [{"outcome_side": r["o"], "book_side": r["b"], "trades": r["n"]} for r in san]}
 
@@ -305,8 +306,8 @@ class Studies:
     def start(self, kind: str, filters: dict | None = None) -> int:
         if kind not in RUN:
             raise ValueError("unknown study")
-        if any(r["kind"] == kind for r in self.db.query("SELECT kind FROM wh_studies WHERE status='running'")):
-            raise RuntimeError(f"the {kind} study is already running")
+        if self.db.query("SELECT 1 FROM wh_studies WHERE status='running' AND kind=? AND params=?", (kind, json.dumps(filters or {}))):
+            raise RuntimeError(f"the {kind} study is already running for this scope")
         cur = self.db.execute("INSERT INTO wh_studies(ts, kind, status, params) VALUES(?,?, 'running', ?)",
                               (time.time(), kind, json.dumps(filters or {})))
         rid = cur.lastrowid
@@ -335,11 +336,13 @@ class Studies:
         """Studies that were running when the app stopped can't have finished."""
         self.db.execute("UPDATE wh_studies SET status='error', error='interrupted by a restart - run it again' WHERE status='running'")
 
-    def latest(self) -> dict:
+    def latest(self, filters: dict | None = None) -> dict:
+        """The newest run of each study for one scope (the same filters), default = everything stored."""
+        key = json.dumps(filters or {})
         out = {}
         for k in KINDS:
-            r = self.db.query("SELECT * FROM wh_studies WHERE kind=? ORDER BY id DESC LIMIT 1", (k,))
-            done = self.db.query("SELECT * FROM wh_studies WHERE kind=? AND status='done' ORDER BY id DESC LIMIT 1", (k,))
+            r = self.db.query("SELECT * FROM wh_studies WHERE kind=? AND params=? ORDER BY id DESC LIMIT 1", (k, key))
+            done = self.db.query("SELECT * FROM wh_studies WHERE kind=? AND params=? AND status='done' ORDER BY id DESC LIMIT 1", (k, key))
             x = r[0] if r else None
             if x:
                 x = {**x, "params": json.loads(x["params"] or "{}"), "result": json.loads(x["result"]) if x["result"] else None}

@@ -63,7 +63,10 @@ def build_data_mock():
     M5 = mkt("KXNFL-26NOV09-GB", "KXNFL", NOW - 2 * 86400, "finalized", "yes", settle=NOW - 2 * 86400)
     M6 = mkt("KXHIGHNY-26NOV06-B41", "KXHIGHNY", NOW - 4 * 86400, "finalized", "no", vol=0, settle=NOW - 4 * 86400)
     M7 = mkt("KXHURR-26NOV-X", "KXHURR", NOW - 3 * 86400, "finalized", "no", settle=NOW - 3 * 86400)
-    live = {"KXHIGHNY": [M1, M3, M6], "KXNFL": [M5], "KXHURR": [M7]}
+    M8 = mkt("KXNFL-26NOV02-DAL", "KXNFL", NOW - 9 * 86400, "finalized", "no", settle=NOW - 9 * 86400)
+    M9 = mkt("KXNFL-26AUG01-OLD", "KXNFL", NOW - 100 * 86400, "finalized", "no", settle=NOW - 100 * 86400)
+    M10 = mkt("KXNBA-26NOV08-BOS", "KXNBA", NOW - 3 * 86400, "finalized", "yes", settle=NOW - 3 * 86400)
+    live = {"KXHIGHNY": [M1, M3, M6], "KXNFL": [M5, M8, M9], "KXHURR": [M7], "KXNBA": [M10]}
     hist = {"KXHIGHNY": [M2, M4]}
     # trades: M1 live; M2 straddles the trades cutoff; M3 live
     def tr(tid, t, ts, px, n=5, side="bid"):
@@ -72,7 +75,9 @@ def build_data_mock():
                 "taker_book_side": side, "is_block_trade": False}
     trades = [tr("t1", M1["ticker"], NOW - 5 * 86400 - 3 * H, 0.70), tr("t2", M1["ticker"], NOW - 5 * 86400 - H, 0.80),
               tr("t3", M2["ticker"], NOW - 20 * 86400 - 5 * H, 0.30), tr("t4", M2["ticker"], NOW - 20 * 86400 - 2 * H, 0.20),
-              tr("t5", M3["ticker"], NOW - 2 * H, 0.45)]
+              tr("t5", M3["ticker"], NOW - 2 * H, 0.45),
+              tr("nfl-1", M5["ticker"], NOW - 2 * 86400 - 3 * H, 0.60), tr("nfl-2", M5["ticker"], NOW - 2 * 86400 - 2 * H, 0.62),
+              tr("nfl-3", M5["ticker"], NOW - 2 * 86400 - H, 0.64), tr("nfl-4", M8["ticker"], NOW - 9 * 86400 - H, 0.30)]
     app.state.trades = trades
 
     def page(items, cursor, n=2):
@@ -90,8 +95,14 @@ def build_data_mock():
                  "tags": ["Daily temperature"]},
                 {"ticker": "KXHURR", "category": "Climate and Weather", "title": "Hurricanes", "fee_type": "quadratic", "fee_multiplier": 1,
                  "tags": ["Hurricanes"]},
-                {"ticker": "KXNFL", "category": "Sports", "title": "NFL", "fee_type": "quadratic_with_maker_fees", "fee_multiplier": 1}]
+                {"ticker": "KXNFL", "category": "Sports", "title": "NFL", "fee_type": "quadratic_with_maker_fees", "fee_multiplier": 1, "volume": 900000},
+                {"ticker": "KXNBA", "category": "Sports", "title": "NBA", "fee_type": "quadratic", "fee_multiplier": 1, "volume": 5000},
+                {"ticker": "KXTESTX", "category": "Test", "title": "test", "fee_type": "quadratic", "fee_multiplier": 1, "volume": 10 ** 9}]
         return {"series": [s for s in allx if not category or s["category"] == category]}
+
+    @app.get(P + "/search/tags_by_categories")
+    def tags_by_cat():
+        return {"tags_by_categories": {"Climate and Weather": ["Daily temperature", "Hurricanes"], "Sports": [], "Test": []}}
 
     @app.get(P + "/series/{t}")
     def one_series(t: str):
@@ -389,6 +400,35 @@ def main():
     check("API list shows summary per fill model", lst[0]["id"] == rid and lst[0]["summary"]["through"]["pnl"] == -6.54)
     check("unknown strategy rejected", c.post("/api/backtests", headers=HD, json={"strategy": "nope"}).status_code == 400)
     check("backtests never touch trading (no orders logged)", not eng.db.query("SELECT 1 FROM orders_log LIMIT 1"))
+    # broad sample: a slice of every OTHER category (busiest series, most recently settled markets), trade lists capped
+    r = c.post("/api/config", headers=HD, json={"warehouse": {"sample": {"enabled": True, "series_per_category": 1, "markets_per_series": 5,
+                                                                         "days": 30, "max_trades_per_market": 2}}})
+    check("sample settings saved (and clamped: trade cap at least 100)", r.status_code == 200 and cfg.data["warehouse"]["sample"]["enabled"] is True
+          and cfg.data["warehouse"]["sample"]["max_trades_per_market"] == 100, cfg.data["warehouse"]["sample"])
+    cfg.data["warehouse"]["sample"]["max_trades_per_market"] = 2
+    st4 = wh.sync()
+    tick = {r_["ticker"]: r_ for r_ in q("SELECT * FROM wh_markets")}
+    check("sample: the busiest series of the other category is added (NFL by volume, not NBA; nothing from Test)",
+          "KXNFL-26NOV09-GB" in tick and "KXNFL-26NOV02-DAL" in tick and not any(t_.startswith(("KXNBA", "KXTESTX")) for t_ in tick), sorted(tick))
+    check("sample: only markets settled inside the sample window", "KXNFL-26AUG01-OLD" not in tick)
+    check("sample: the full-scope category is untouched (weather still complete, no duplicates)", tick["KXHIGHNY-26NOV05-B40"]["complete"] == 1 and st4["errors"] == 0, st4)
+    check("sample: a market with more trades than the cap is stored with its trades cut and flagged (complete = 2)",
+          tick["KXNFL-26NOV09-GB"]["complete"] == 2 and len(q("SELECT 1 FROM wh_trades WHERE ticker='KXNFL-26NOV09-GB'")) == 2
+          and tick["KXNFL-26NOV02-DAL"]["complete"] == 1, (tick["KXNFL-26NOV09-GB"]["complete"], tick["KXNFL-26NOV02-DAL"]["complete"],
+                                                            q("SELECT trade_id, ts FROM wh_trades WHERE ticker LIKE 'KXNFL%'")))
+    check("sample: categories recorded for the studies' scope list", {r_["category"] for r_ in q("SELECT DISTINCT category FROM wh_markets")} >= {"Climate and Weather", "Sports"}
+          and "Sports" in (wh.status()["sample_info"] or {}))
+    c.post("/api/studies/run", headers=HD, json={"categories": ["Sports"]})
+    for _ in range(100):
+        if not app.state.studies.threads:
+            break
+        time.sleep(0.1)
+    jsp = c.get("/api/studies?category=Sports", headers=HD).json()["studies"]
+    check("studies per category: the trade study skips the cut market and says so; quote studies keep it",
+          jsp["longshot"]["status"] == "done" and jsp["longshot"]["result"]["skipped_too_busy"] == 1 and jsp["calib"]["status"] == "done",
+          {k: (v or {}).get("status") for k, v in jsp.items()})
+    check("studies: results are kept per scope (the all-categories result is still there)", c.get("/api/studies", headers=HD).json()["studies"]["longshot"]["status"] == "done")
+    cfg.data["warehouse"]["sample"]["enabled"] = False
 
 
 if __name__ == "__main__":
