@@ -55,6 +55,8 @@ class Quoter:
         self.last_cycle = 0.0
         self.last_sweep = 0.0
         self.mkt_stop: dict[str, float] = {}            # ticker -> no new quotes until this time
+        self.last_pos: dict[str, Decimal] = {}          # ticker -> net position seen on the previous cycle
+        self.side_pause: dict[tuple, float] = {}        # (ticker, side) -> no opening quote on that side until this time
         self.cycles = 0
 
     # ------------------------------------------------------------ helpers --
@@ -360,6 +362,15 @@ class Quoter:
             inv = d(self.cfg["max_inventory"])
             size = d(self.cfg["size"])
             tick = Decimal("0.01")
+            # a fill that opened or added to the position: stop bidding on that side for a while instead of
+            # chasing the price (the next trades often come from the same informed seller/buyer)
+            prev = self.last_pos.get(t)
+            self.last_pos[t] = pos
+            pf = float(self.cfg.get("pull_after_fill_min") or 0)
+            if pf > 0 and prev is not None and pos != prev and (abs(pos) > abs(prev) or (pos > 0) != (prev > 0)):
+                fs = "yes" if pos > prev else "no"
+                self.side_pause[(t, fs)] = now + pf * 60
+                self.log("fill-pause", f"{t}: position {prev} -> {pos}; not bidding {fs.upper()} for {pf:g} min")
             # Each side: (intent, price in that side's terms, count, reducing?). A side that REDUCES the position is
             # sent as a sell (same order on Kalshi's book as buying the other side), so it is never blocked by the
             # capital cap or the buy limits - exiting must always be possible. At the inventory cap it steps 1c inside
@@ -371,18 +382,18 @@ class Quoter:
             want = {}
             if pos < 0:
                 want["yes"] = ("sell_no", ONE - (yb + step), min(size, -pos), True)     # bid YES at yb(+1c) = sell NO
-            elif pos < inv and open_ok and yb - off >= tick:
+            elif pos < inv and open_ok and yb - off >= tick and self.side_pause.get((t, "yes"), 0) <= now:
                 want["yes"] = ("buy_yes", yb - off, size, False)                         # best YES bid (minus the offset)
             if pos > 0:
                 want["no"] = ("sell_yes", ya - step, min(size, pos), True)               # ask YES at ya(-1c) = sell YES
-            elif -pos < inv and open_ok and ONE - ya - off >= tick:
+            elif -pos < inv and open_ok and ONE - ya - off >= tick and self.side_pause.get((t, "no"), 0) <= now:
                 want["no"] = ("buy_no", ONE - ya - off, size, False)                     # best NO bid (minus the offset)
             for side in ("yes", "no"):
                 q = self.quotes.get(t, {}).get(side)
                 if side not in want:
                     if q:
                         self._cancel(t, side)
-                        self.log("inventory", f"{t}: net position {pos}; stopped quoting {side.upper()}")
+                        self.log("inventory", f"{t}: net position {pos}; pulled the {side.upper()} quote (inventory cap, fill pause, or the market no longer passes the filters)")
                     continue
                 intent, px, cnt, reduce = want[side]
                 if q and q.get("intent", intent) == intent and d(q["price"]) == px and d(q.get("count") or size) == cnt \

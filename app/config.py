@@ -70,6 +70,7 @@ DEFAULTS = {
         "exit_step_in": True,           # at the inventory cap, the reducing quote steps 1c inside the spread (if >= 2c wide)
         "offset_ticks": 0,              # opening quotes rest this many cents BEHIND the best bid (0 = join the best bid)
         "max_move": 0,                  # trading-first: skip markets whose price moved more than this since yesterday's close (0 = off; 0.03 = 3c)
+        "pull_after_fill_min": 0,       # after a fill that opens/adds to a position, stop quoting that side of that market this long (0 = off)
     },
     # --- limits that scale with the account (see app/scaling.py); tiers default to scaling.DEFAULT_TIERS ---
     "scaling": {
@@ -77,6 +78,9 @@ DEFAULTS = {
         "caps": {},                     # optional $ ceilings: order, daily_buys, market, total, daily_loss, strat_day, strat_7d, drawdown, quoter
         "max_markets_cap": 5,           # most markets the quoter may use when scaled
         "base": None, "base_day": None, "base_env": None, "tier": None, "limits": None,
+        # DEMO only: size the demo account as if it held this many dollars (0 = off), so demo behaves at production size.
+        # Set through the app (Settings > Limits & safety), which records the starting point below.
+        "demo_base": 0, "demo_since": 0, "demo_equity0": None, "demo_ignore": {}, "demo_spent": {},
     },
     # --- exit rules: per-position take-profit / stop-loss (closing orders only) ---
     "exits": {"enabled": True, "check_sec": 30, "confirm_checks": 2},

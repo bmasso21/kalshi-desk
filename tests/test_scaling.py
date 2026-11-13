@@ -406,6 +406,55 @@ def api_tests(tmp):
     check("portfolio rows carry their exit rule", all("exit" in p for p in pf["positions"]))
     check("exits endpoints need the CSRF token", c.post("/api/exits", json={"ticker": "KXC-1", "stop_loss": 0.5}).status_code in (401, 403))
 
+    # ---- demo test balance: the demo account sized like a real one ----
+    cfg.update({"quoter": {"enabled": False}, "risk": {"kill_switch": False}})
+    for o in list(S["orders"].values()):
+        o["status"] = "canceled" if o["status"] == "resting" else o["status"]
+    cfg.update({"scaling": {"enabled": False}})
+    r = c.post("/api/scaling/demo", headers=H, json={"base": 10})
+    check("test balance refused while scaling is off", r.status_code == 400 and "Scale limits" in r.text, r.text)
+    c.post("/api/config", headers=H, json={"scaling": {"enabled": True}})
+    S["positions"]["KXC-1"] = {"pos": Decimal("50"), "exp": Decimal("30"), "fees": Decimal("0")}       # a big position from before
+    eng.positions_cache["ts"] = 0
+    eng.spend_cache["ts"] = 0
+    real0 = float(eng.equity())
+    big = cfg.risk["max_order_cost"]
+    r = c.post("/api/scaling/demo", headers=H, json={"base": 10})
+    j = r.json()
+    check("test balance $10: limits sized as a $10 account (order $2, total $8, daily loss $2, quoter 1 market)",
+          r.status_code == 200 and j["demo"]["active"] and cfg.risk["max_order_cost"] == 2 and cfg.risk["max_total_exposure"] == 8
+          and cfg.risk["max_daily_loss"] == 2 and cfg.quoter["max_markets"] == 1 and cfg.quoter["max_capital"] == 8 and big > 2, (r.text[:300], cfg.risk))
+    check("test balance: what the account already held is set aside", j["demo"]["set_aside"].get("KXC-1") == 30 and cfg.data["scaling"]["demo_equity0"] == round(real0, 2), j["demo"])
+    check("test balance: today's P&L restarts from now", abs(float(eng.daily_pnl()["pnl"])) < 0.01, eng.daily_pnl())
+    r1 = c.post("/api/order", headers=H, json={"ticker": "KXB-1", "intent": "buy_yes", "price": "0.30", "count": 5, "post_only": True})
+    check("test balance: a $1.50 order passes although the real account holds $30+ (set aside, not counted)", r1.status_code == 200, r1.text)
+    r2 = c.post("/api/order", headers=H, json={"ticker": "KXB-1", "intent": "buy_yes", "price": "0.30", "count": 10, "post_only": True})
+    check("test balance: a $3 order is blocked by the $2 per-order limit", r2.status_code != 200 and "per-order limit $2.00" in r2.text, r2.text)
+    S["positions"]["KXC-1"]["exp"] = Decimal("36")                                                   # $6 more bought in the old market
+    eng.positions_cache["ts"] = 0
+    r3 = c.post("/api/order", headers=H, json={"ticker": "KXC-1", "intent": "buy_yes", "price": "0.30", "count": 5, "post_only": True})
+    check("test balance: new exposure in a set-aside market DOES count ($6 + $1.50 > $3 per market)", r3.status_code != 200 and "Market exposure $6.00" in r3.text, r3.text)
+    S["balance"] -= 100                                                                              # the demo account loses $1
+    check("test balance follows results: $10 - $1 lost = $9", close(eng.scaler.sim_equity(float(eng.equity())), 9.0, 0.011), eng.scaler.sim_equity(float(eng.equity())))
+    eng.scaler.apply(force=True)
+    check("...and the limits shrink with it (20% of $9 = $1.80)", close(cfg.risk["max_order_cost"], 1.8), cfg.risk["max_order_cost"])
+    S["balance"] += 100
+    cfg.data["env"] = "prod"
+    pv, sv = eng.scaler.risk_view({"market_positions": [{"ticker": "KXC-1", "market_exposure_dollars": "36"}]}, {"all": Decimal(5), "auto": Decimal(0)})
+    check("test balance never applies on production", eng.scaler.sim() is None and eng.scaler.sim_equity(123.0) == 123.0
+          and pv["market_positions"][0]["market_exposure_dollars"] == "36" and sv["all"] == 5)
+    try:
+        eng.scaler.start_sim(10)
+        refused = False
+    except ValueError:
+        refused = True
+    check("test balance cannot be started on production", refused)
+    cfg.data["env"] = "demo"
+    r = c.post("/api/scaling/demo", headers=H, json={"base": 0})
+    check("test balance off: limits follow the real demo balance again", r.status_code == 200 and not r.json()["demo"]["active"]
+          and cfg.risk["max_order_cost"] > 2 and cfg.data["scaling"]["demo_ignore"] == {}, (r.text[:200], cfg.risk["max_order_cost"]))
+    check("page has the test-balance control", "Demo test balance" in c.get("/").text)
+
 
 if __name__ == "__main__":
     unit_tests()

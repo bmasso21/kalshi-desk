@@ -228,8 +228,9 @@ class Engine:
                 resting = self.feed.resting_orders() if getattr(self, "feed", None) else None
                 if resting is None:
                     resting = self.client.orders(status="resting", max_items=1000)
+            r_pos, r_spent = self.scaler.risk_view(positions, spent)       # demo test balance: pretend-account view
             cost = risk.check(self.cfg, intent=intent, price=price, count=count, market=market,
-                              positions=positions, spent=spent, source=source, category=cat, resting=resting)
+                              positions=r_pos, spent=r_spent, source=source, category=cat, resting=resting)
             if intent.startswith("sell"):
                 held = self._held(positions, ticker)
                 want = d(count)
@@ -284,8 +285,7 @@ class Engine:
     def _preflight_basket(self, legs, cnt, source):
         """Run every leg's risk check AND the combined cost against daily limits before
         placing anything, so a basket can't be stopped halfway by our own limits."""
-        positions = self.positions(max_age=0)
-        sp = self.spent_today(max_age=0)
+        positions, sp = self.scaler.risk_view(self.positions(max_age=0), self.spent_today(max_age=0))
         total = Decimal(0)
         for leg in legs:
             m = self.client.market(leg["ticker"])

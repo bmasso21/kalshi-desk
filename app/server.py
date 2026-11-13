@@ -349,7 +349,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             qp = patch["quoter"]
             if "universe" in qp and qp["universe"] not in ("all", "rewards"):
                 qp.pop("universe")
-            for k, lo, hi in (("market_loss_pct", 0, 100), ("min_volume_24h", 0, 10 ** 9), ("max_move", 0, 0.5)):
+            for k, lo, hi in (("market_loss_pct", 0, 100), ("min_volume_24h", 0, 10 ** 9), ("max_move", 0, 0.5), ("pull_after_fill_min", 0, 240)):
                 if k in qp:
                     try:
                         qp[k] = max(lo, min(hi, float(qp[k])))
@@ -680,6 +680,20 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     def scaling_status():
         return {**eng.scaler.snapshot(), "transfers_error": eng.transfers.error}
 
+    @app.post("/api/scaling/demo")
+    async def scaling_demo(request: Request):
+        """Start the demo test balance ({"base": 10}) or switch it off ({"base": 0}). Demo environment only."""
+        b = await request.json()
+        try:
+            base = float(b.get("base") or 0)
+            if base > 0:
+                eng.scaler.start_sim(base)
+            else:
+                eng.scaler.stop_sim()
+        except (ValueError, TypeError) as e:
+            raise HTTPException(400, str(e))
+        return eng.scaler.snapshot()
+
     @app.post("/api/scaling/recalc")
     def scaling_recalc():
         if not (cfg.data.get("scaling") or {}).get("enabled"):
@@ -809,7 +823,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 p[k] = max(lo, min(hi, float(b[k])))
         if b.get("exit_step_in"):
             p["exit_step_in"] = True
-        for k, lo, hi in (("max_capital", 0, 10 ** 7), ("market_loss_stop", 0, 10 ** 6), ("max_move", 0, 1)):
+        for k, lo, hi in (("max_capital", 0, 10 ** 7), ("market_loss_stop", 0, 10 ** 6), ("max_move", 0, 1), ("max_inventory", 1, 10 ** 5)):
             if b.get(k) is not None:
                 p[k] = max(lo, min(hi, float(b[k])))
         if b.get("select_by") == "trading":

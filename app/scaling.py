@@ -118,21 +118,93 @@ class Scaler:
         if equity is None:
             if not self.e.client or not self.e.client.authenticated:
                 return None
-            equity = float(self.e.equity())
+            equity = self.sim_equity(float(self.e.equity()))
         r = compute(equity, c.get("tiers") or DEFAULT_TIERS, c.get("caps"))
         patch = to_patch(r["limits"], int(c.get("max_markets_cap") or 5))
         patch["scaling"] = {"base": round(equity, 2), "base_day": today, "base_env": env, "base_ts": time.time(),
                             "tier": r["tier"], "limits": r["limits"]}
         self.e.cfg.update(patch)
-        self.e.db.audit("scaling", f"{env}: limits set from account value ${equity:.2f} (tier {r['tier'] + 1}): "
+        self.e.db.audit("scaling", f"{env}: limits set from {'DEMO TEST BALANCE' if self.sim() else 'account value'} ${equity:.2f} (tier {r['tier'] + 1}): "
                                    + ", ".join(f"{k} ${v:.2f}" for k, v in r["limits"].items()))
         self.error = None
         return r
 
+    # ---- demo test balance: make the DEMO account behave like an account of a chosen size -------------------
+    def sim(self) -> dict | None:
+        """The scaling settings when the demo test balance is active (demo environment, scaling on, demo_base > 0)."""
+        c = self.cfg
+        return c if (self.e.cfg.env == "demo" and c.get("enabled") and float(c.get("demo_base") or 0) > 0) else None
+
+    def sim_equity(self, real: float) -> float:
+        """Pretend equity = the test balance plus whatever the demo account has made or lost since it was switched on."""
+        c = self.sim()
+        if not c:
+            return real
+        e0 = c.get("demo_equity0")
+        return max(0.0, float(c["demo_base"]) + real - float(e0 if e0 is not None else real))
+
+    def start_sim(self, base: float) -> dict:
+        """Start (or restart) the demo test balance: limits are sized from `base`; what the account already holds and
+        has already spent or lost today is set aside, so the pretend account starts clean. Demo only."""
+        if self.e.cfg.env != "demo":
+            raise ValueError("the test balance only works in the DEMO environment")
+        if not self.cfg.get("enabled"):
+            raise ValueError("turn on 'Scale limits with the account' first")
+        if not self.e.client or not self.e.client.authenticated:
+            raise ValueError("no working API key for demo")
+        base = float(base)
+        if not 1 <= base <= 1_000_000:
+            raise ValueError("test balance must be between $1 and $1,000,000")
+        now, real = time.time(), float(self.e.equity())
+        pos = self.e.positions(max_age=0) or {}
+        ignore = {mp["ticker"]: round(abs(float(mp.get("market_exposure_dollars") or 0)), 4)
+                  for mp in pos.get("market_positions", []) if float(mp.get("position_fp") or 0) != 0}
+        sp = self.e.spent_today(max_age=0)
+        self.e.cfg.data.setdefault("scaling", {})["demo_ignore"] = ignore           # replace, not merge
+        self.e.cfg.update({"scaling": {"demo_base": base, "demo_since": now, "demo_equity0": round(real, 2),
+                                       "demo_spent": {"day": risk.today_key(), "all": float(sp["all"]), "auto": float(sp["auto"])}}})
+        # today's P&L and the drawdown peak start from now: earlier results belong to the real demo balance
+        self.e.db.execute("INSERT OR REPLACE INTO day_equity VALUES(?,?,?,?)", ("demo", risk.today_key(), real, now))
+        if getattr(self.e, "breakers", None):
+            self.e.breakers.reset(None, peak=True)
+        self.e.db.audit("scaling", f"demo test balance ${base:.2f} started (real demo equity ${real:.2f}; "
+                                   f"{len(ignore)} existing position(s) and ${float(sp['all']):.2f} of today's buys set aside)")
+        return self.apply(force=True)
+
+    def stop_sim(self):
+        self.e.cfg.data.setdefault("scaling", {})["demo_ignore"] = {}
+        self.e.cfg.update({"scaling": {"demo_base": 0, "demo_since": 0, "demo_equity0": None, "demo_spent": {}}})
+        self.e.db.audit("scaling", "demo test balance switched off; limits follow the real demo balance again")
+        return self.apply(force=True)
+
+    def risk_view(self, positions, spent):
+        """Positions and today's spend as the pretend account sees them: exposure and buys from before the test
+        balance started are left out. Only used for the pre-trade limits; everything shown to you stays real."""
+        c = self.sim()
+        if not c:
+            return positions, spent
+        ign = c.get("demo_ignore") or {}
+        if positions and ign:
+            mps = []
+            for mp in positions.get("market_positions", []):
+                cut = float(ign.get(mp.get("ticker")) or 0)
+                if cut > 0:
+                    mp = {**mp, "market_exposure_dollars": f"{max(0.0, abs(float(mp.get('market_exposure_dollars') or 0)) - cut):.4f}"}
+                mps.append(mp)
+            positions = {**positions, "market_positions": mps}
+        off = c.get("demo_spent") or {}
+        if spent and off.get("day") == risk.today_key():
+            from decimal import Decimal
+            spent = {**spent, "all": max(Decimal(0), spent["all"] - Decimal(str(off.get("all") or 0))),
+                     "auto": max(Decimal(0), spent["auto"] - Decimal(str(off.get("auto") or 0)))}
+        return positions, spent
+
     def snapshot(self) -> dict:
         c = self.cfg
         tiers = c.get("tiers") or DEFAULT_TIERS
-        return {"enabled": bool(c.get("enabled")), "base": c.get("base"), "base_day": c.get("base_day"),
+        return {"demo": {"active": bool(self.sim()), "base": c.get("demo_base") or 0, "since": c.get("demo_since") or 0,
+                         "equity0": c.get("demo_equity0"), "set_aside": c.get("demo_ignore") or {}, "env": self.e.cfg.env},
+                "enabled": bool(c.get("enabled")), "base": c.get("base"), "base_day": c.get("base_day"),
                 "base_env": c.get("base_env"), "tier": c.get("tier"), "limits": c.get("limits"), "tiers": tiers,
                 "caps": c.get("caps") or {}, "labels": LABELS, "error": self.error,
                 "examples": {str(x): compute(x, tiers, c.get("caps"))["limits"] for x in (10, 110, 500, 1000, 5000)}}

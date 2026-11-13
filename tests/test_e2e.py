@@ -1,5 +1,6 @@
 """End-to-end test: desk server <-> strict mock Kalshi, for both Ed25519 and RSA keys."""
 import json
+from decimal import Decimal
 import sys
 import tempfile
 import threading
@@ -231,6 +232,28 @@ def run(keytype: str):
     q.cycle()
     qs = {x["side"]: x for x in c.get("/api/quoter").json()["quotes"]}
     check("offset 0: back at the best bid", qs["yes"]["price"] == "0.5000" and qs["no"]["price"] == "0.4800", qs)
+    # pause after a fill: the position grows on the NO side -> stop bidding NO there for a while; the exit quote stays
+    cfg.update({"quoter": {"pull_after_fill_min": 10}})
+    pz = mock.state.S["positions"]["KXA-1"]
+    keep_pos = dict(pz)
+    pz["pos"] -= 3
+    pz["exp"] += Decimal("1.44")
+    eng.positions_cache["ts"] = 0
+    q.cycle()
+    snapq = c.get("/api/quoter").json()
+    qs = {x["side"]: x for x in snapq["quotes"]}
+    check("fill pause: after a fill that adds to the position, that side stops bidding; the reducing quote stays",
+          "no" not in qs and qs.get("yes", {}).get("reduce") and any(e["kind"] == "fill-pause" for e in snapq["events"]), (qs, snapq["events"][:3]))
+    q.cycle()
+    check("fill pause holds on the next cycle", "no" not in {x["side"] for x in c.get("/api/quoter").json()["quotes"]})
+    q.side_pause.clear()
+    pz.update(keep_pos)
+    eng.positions_cache["ts"] = 0
+    cfg.update({"quoter": {"pull_after_fill_min": 0}})
+    q.cycle()
+    q.cycle()
+    qs = {x["side"]: x for x in c.get("/api/quoter").json()["quotes"]}
+    check("fill pause off / expired: both sides quoted again", qs.get("yes", {}).get("price") == "0.5000" and qs.get("no", {}).get("price") == "0.4800", qs)
     n_orders = len(mock.state.S["orders"])
     mk = mock.state.S["events"][0]["markets"][0]
     mk.update(yes_bid_dollars="0.5500", yes_ask_dollars="0.5700", no_bid_dollars="0.4300", no_ask_dollars="0.4500")
