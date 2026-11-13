@@ -554,9 +554,10 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                                 "uses_maker": v.uses_maker} for k, v in STRATEGIES.items()]}
 
     @app.post("/api/research/sync")
-    def research_sync():
-        eng.warehouse.trigger()
-        return {"ok": True}
+    def research_sync(restart: int = 0):
+        """restart=1: end the pass in progress and begin a new one now (used after changing what to collect)."""
+        eng.warehouse.trigger(restart=bool(restart))
+        return {"ok": True, "restart": bool(restart)}
 
     # ------------------------------------------------------------- weather --
     @app.get("/api/weather")

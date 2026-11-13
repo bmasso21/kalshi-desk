@@ -446,6 +446,22 @@ def main():
     check("sample: a series named in the overrides is collected although it is not among the busiest",
           len(q("SELECT 1 FROM wh_markets WHERE ticker='KXNBA-26NOV08-BOS'")) == 1 and (wh.status()["sample_info"] or {}).get("KXNBA") == "named series" and st6["errors"] == 0,
           (st6, wh.status()["sample_info"]))
+    # named series are fetched first, and a pass can be cut short to restart with new settings
+    wh.db.execute("UPDATE wh_markets SET complete=0 WHERE ticker IN ('KXNBA-26NOV08-BOS', 'KXNFL-26NOV02-DAL')")
+    seen = []
+    orig = wh._sync_market_data
+    wh._sync_market_data = lambda m, cut: (seen.append(m["series_ticker"]), orig(m, cut))[1]
+    wh.sync()
+    check("the series asked for by name is first in the queue", seen and seen[0] == "KXNBA" and "KXNFL" in seen, seen)
+    wh.db.execute("UPDATE wh_markets SET complete=0 WHERE ticker IN ('KXNBA-26NOV08-BOS', 'KXNFL-26NOV02-DAL')")
+    seen.clear()
+    wh.state["running"] = True
+    wh.trigger(restart=True)
+    wh.sync()
+    check("restart request: the pass in progress stops before fetching more", seen == [] and wh._abort.is_set(), seen)
+    wh._abort.clear()
+    wh._sync_market_data = orig
+    wh.sync()
     # long-lived markets: candle requests are split so none asks for more than Kalshi's 5000-candle limit
     mrow = dict(q("SELECT ticker, series_ticker, category, tier, open_ts, close_ts, settled_ts, status, volume, trades_synced_to, candles_synced_to FROM wh_markets WHERE ticker='KXHIGHNY-26NOV05-B40'")[0])
     mrow.update(open_ts=time.time() - 400 * 86400, candles_synced_to=0, close_ts=time.time() + 86400, tier="live", settled_ts=None)

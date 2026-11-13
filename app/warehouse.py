@@ -192,6 +192,7 @@ class Warehouse:
         self.client.read_bucket = TokenBucket(rate=rate * 10, capacity=max(10, rate * 10))
         self._stop = threading.Event()
         self._now = threading.Event()
+        self._abort = threading.Event()          # end the pass in progress early (a restart with new settings follows)
         self.state = {"running": False, "phase": "idle", "last_sync": db.get("last_sync"), "error": None,
                       "progress": "", "requests": 0, "last_duration": db.get("last_duration")}
         self._last_tick: dict[str, tuple] = {}
@@ -354,7 +355,7 @@ class Warehouse:
             self.db.put("cutoff", cut)
             # 1) markets: live tier (open + settled) and historical tier
             for i, s in enumerate(series):
-                if self._stop.is_set():
+                if self._stop.is_set() or self._abort.is_set():
                     break
                 self.state["progress"] = f"markets {i + 1}/{len(series)} {s['ticker']}"
                 try:
@@ -371,7 +372,7 @@ class Warehouse:
                 samp = self.sample_series(full)
                 stats["sample_series"] = len(samp)
                 for i, s in enumerate(samp):
-                    if self._stop.is_set():
+                    if self._stop.is_set() or self._abort.is_set():
                         break
                     self.state["progress"] = f"sample markets {i + 1}/{len(samp)} {s['ticker']}"
                     try:
@@ -390,9 +391,11 @@ class Warehouse:
                 "SELECT ticker, series_ticker, category, tier, open_ts, close_ts, settled_ts, status, volume, trades_synced_to, "
                 "candles_synced_to FROM wh_markets WHERE complete=0 AND COALESCE(close_ts, 0) >= ? "
                 "ORDER BY close_ts DESC", (since,))
+            named = set((sc.get("overrides") or {}))            # series asked for by name go first
+            todo.sort(key=lambda m: m["series_ticker"] not in named)
             self.state["phase"] = "trades+candles"
             for i, m in enumerate(todo):
-                if self._stop.is_set():
+                if self._stop.is_set() or self._abort.is_set():
                     break
                 if i % 25 == 0:
                     self.state["progress"] = f"market data {i + 1}/{len(todo)}"
@@ -518,7 +521,9 @@ class Warehouse:
         return {**self.state, "counts": self.db.counts(), "config": self.cfg, "cutoff": self.db.get("cutoff"), "sample_info": self.db.get("sample_info"),
                 "last_stats": self.db.get("last_stats")}
 
-    def trigger(self):
+    def trigger(self, restart: bool = False):
+        if restart and self.state.get("running"):
+            self._abort.set()
         self._now.set()
 
     def loop(self):
@@ -526,6 +531,10 @@ class Warehouse:
         while not self._stop.is_set():
             if self.cfg.get("enabled", True):
                 self.sync()
+            if self._abort.is_set():             # cut short on request: start again at once with the current settings
+                self._abort.clear()
+                self._now.clear()
+                continue
             self._now.clear()
             self._now.wait(max(10, float(self.cfg.get("sync_interval_min", 60))) * 60)
 
