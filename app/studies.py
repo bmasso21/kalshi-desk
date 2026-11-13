@@ -6,7 +6,8 @@ work runs on its own read-only database connection so the paper test and the col
                  taker return = win - price - taker fee          maker return = price - win - maker fee
              (the maker holds the other side at 1 - price, so before fees one's gain is the other's loss).
   late       Late-stage drift. At 24 / 12 / 6 / 3 / 1 hours before a market closes, if one side could be BOUGHT for
-             90-99c (hourly closing quote), buy 1 contract and hold to settlement: win - ask - taker fee.
+             90-99c (hourly closing quote, bid and ask no more than 3c apart - a 99c ask on an empty book is a
+             placeholder, not a favorite), buy 1 contract and hold to settlement: win - ask - taker fee.
   baskets    Outcome sets that don't add up. For events whose markets turned out mutually exclusive and exhaustive
              (exactly one settled YES), every hour: could you buy every YES for under $1, or sell every YES (buy every
              NO) for over $1, after taker fees?
@@ -38,6 +39,7 @@ KINDS = ("longshot", "late", "baskets")
 TAKER = 0.07
 MAKER_SQL = "CASE s.fee_type WHEN 'quadratic_with_maker_fees' THEN 0.0175 WHEN 'quadratic_with_combo_maker_fees' THEN 0.035 ELSE 0 END"
 HOURS = (24, 12, 6, 3, 1)
+LATE_MAX_SPREAD = 0.03      # a 9xc ask on an empty book is a placeholder, not a favorite: require a real two-sided quote
 LATE_BUCKETS = ((0.90, 0.925, "90-92c"), (0.925, 0.955, "93-95c"), (0.955, 0.975, "96-97c"), (0.975, 0.995, "98-99c"))
 
 
@@ -111,7 +113,8 @@ def longshot(conn, flt: dict | None = None) -> dict:
         for k in sorted(meta):
             n, px, wins, trades = meta[k]
             out.append({"key": k, "contracts": round(n), "trades": trades, "avg_price_c": round(100 * px / n, 1),
-                        "win_pct": round(100 * wins / n, 1), "taker": _stat(tk[k]), "maker": _stat(mk[k])})
+                        "win_pct": round(100 * wins / n, 1), "taker": _stat(tk[k]), "maker": _stat(mk[k]),
+                        "taker_eq": _stat_eq(tk[k]), "maker_eq": _stat_eq(mk[k])})
         return out
     lab = lambda b: f"{b * 10 if b else 1}-{b * 10 + 9}c"
     by_price = [{**x, "bucket": lab(x["key"])} for x in table(lambda r: True, lambda r: r["b"])]
@@ -146,8 +149,10 @@ def late(conn, flt: dict | None = None) -> dict:
             wins = n = 0
             px = 0.0
             for r in rows:
-                for price, won in ((r["ask"], r["res"] == "yes"), ((1 - r["bid"]) if r["bid"] else None, r["res"] == "no")):
-                    if price is None or not (lo <= price < hi):
+                if not r["bid"] or not r["ask"] or not (0 < r["bid"] < r["ask"] < 1) or r["ask"] - r["bid"] > LATE_MAX_SPREAD + 1e-9:
+                    continue                    # empty or wide book: the quote is not a price anyone agreed on
+                for price, won in ((r["ask"], r["res"] == "yes"), (1 - r["bid"], r["res"] == "no")):
+                    if not (lo <= price < hi):
                         continue
                     ret = (1.0 if won else 0.0) - price - TAKER * r["mult"] * price * (1 - price)
                     for k in ("all", 0 if r["ct"] < mid else 1):
@@ -163,7 +168,7 @@ def late(conn, flt: dict | None = None) -> dict:
     for r in out:      # win rate needed to break even after the fee at the average price
         p = r["avg_price_c"] / 100
         r["breakeven_pct"] = round(100 * (p + TAKER * p * (1 - p)), 2)
-    return {"markets": span["n"], "from": span["a"], "to": span["b"], "split_at": mid, "rows": out}
+    return {"markets": span["n"], "from": span["a"], "to": span["b"], "split_at": mid, "rows": out, "max_spread_c": round(100 * LATE_MAX_SPREAD)}
 
 
 def baskets(conn, flt: dict | None = None) -> dict:
@@ -223,6 +228,18 @@ def baskets(conn, flt: dict | None = None) -> dict:
                   "pct_of_hours": round(100 * x["hours"] / full, 3) if full else None,
                   "by_size_c": {("5+" if b == 5 else f"{b}-{b + 1}"): n for b, n in sorted(hist[k].items())}}
     return {"events": n_ev, "event_hours": hours, "complete_event_hours": full, **out}
+
+
+def _stat_eq(groups: dict) -> dict:
+    """Every event counts once, whatever its volume: mean of the per-event returns (cents) and its t. A result that
+    only shows when events are weighted by contracts is being carried by a few very busy days."""
+    rs = [g[1] / g[0] for g in groups.values() if g[0] > 0]
+    k = len(rs)
+    if not k:
+        return {"events": 0, "ret_c": None, "se_c": None, "t": None}
+    mean = sum(rs) / k
+    se = math.sqrt(sum((x - mean) ** 2 for x in rs) / (k - 1) / k) if k > 1 else None
+    return {"events": k, "ret_c": round(100 * mean, 3), "se_c": round(100 * se, 3) if se else None, "t": round(mean / se, 2) if se else None}
 
 
 RUN = {"longshot": longshot, "late": late, "baskets": baskets}

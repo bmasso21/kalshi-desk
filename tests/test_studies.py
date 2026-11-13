@@ -51,6 +51,8 @@ def build(tmp):
         # candles 3h before close: A 78/80... one hour later the set is mispriced on purpose in event 5
         candle(f"E{e}-A", ct - 3 * 3600, 0.93, 0.95)
         candle(f"E{e}-B", ct - 3 * 3600, 0.04, 0.06)
+        mkt(f"W{e}", f"WE{e}", "S", "Weather2", ct, "no")         # empty book: bid 2c, ask 99c. YES at 99c is no favorite
+        candle(f"W{e}", ct - 3 * 3600, 0.02, 0.99)
         if e == 5:
             candle(f"E{e}-A", ct - 2 * 3600, 0.60, 0.62)
             candle(f"E{e}-B", ct - 2 * 3600, 0.30, 0.32)       # asks sum to 0.94 -> buy both for under $1
@@ -108,6 +110,11 @@ def main():
           and close(a["breakeven_pct"], 100 * (0.95 + 0.07 * 0.95 * 0.05), 0.01), a)
     b = rows[(3, "96-97c")]
     check("late: the NO side (bought at 1 - bid = 96c) is included", b["buys"] == 10 and b["avg_price_c"] == 96.0, b)
+    wide = ST.late(conn, {"categories": ["Weather2"]})
+    check("late: a 99c ask on an empty book (bid 2c) is NOT counted as a favorite", wide["rows"] == [] and wide["max_spread_c"] == 3, wide["rows"])
+    eqv = bp["80-89c"]["taker_eq"]
+    check("per-event average (every event counts once) is reported beside the volume-weighted one", eqv["events"] == 10
+          and close(eqv["ret_c"], 100 * (0.9 - 0.8 - fee80), 0.002) and eqv["t"] is not None, eqv)
     check("late: no candle near 24h before the close -> no row invented", not any(h == 24 for h, _ in rows), list(rows))
 
     bk = ST.baskets(conn, {"categories": ["Weather"]})
