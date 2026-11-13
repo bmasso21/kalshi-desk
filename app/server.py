@@ -54,6 +54,9 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             wx_model["m"], wx_model["ts"] = WxModel(wx_store), time.time()
         return wx_model["m"]
     bt = Backtester(wdb)
+    from .studies import KINDS as STUDY_KINDS, Studies
+    studies = Studies(wdb)
+    studies.recover()
     from .auth import COOKIE, Auth
     auth = Auth(cfg, db, eng.alerts, extra_local_hosts=() if start_engine else ("testclient",))
     app = FastAPI(title="Kalshi Desk", version=__version__)
@@ -631,6 +634,24 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         txt = json.dumps(r["body"])
         return {"ts": r["ts"], "chars": len(txt), "body_text": txt[:max(100, min(chars, 200000))]}
 
+    @app.get("/api/studies")
+    def studies_list():
+        return {"studies": studies.latest(), "kinds": list(STUDY_KINDS),
+                "scope": wdb.query("SELECT category, COUNT(*) markets, SUM(result IN ('yes','no')) settled FROM wh_markets GROUP BY category")}
+
+    @app.post("/api/studies/run")
+    async def studies_run(request: Request):
+        b = await request.json()
+        kinds = [k for k in (b.get("kinds") or STUDY_KINDS) if k in STUDY_KINDS]
+        flt = {k: [str(x)[:80] for x in b[k]][:50] for k in ("categories", "series") if isinstance(b.get(k), list) and b[k]}
+        started, skipped = [], []
+        for k in kinds:
+            try:
+                started.append(studies.start(k, flt))
+            except RuntimeError as e:
+                skipped.append(str(e))
+        return {"started": started, "skipped": skipped}
+
     @app.get("/api/backtests")
     def backtests():
         rows = wdb.query("SELECT id,ts,strategy,params,filters,status,error,duration,results FROM wh_backtests "
@@ -775,6 +796,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     mm_cache: dict = {"ts": 0.0, "r": None, "busy": None, "final": {}, "took": None}
 
     app.state.mm_cache = mm_cache
+    app.state.studies = studies
 
     def _mm_build():
         t0 = time.time()

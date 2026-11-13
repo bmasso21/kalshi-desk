@@ -404,7 +404,7 @@ def main():
     b = c.get("/api/weather/board?days=2").json()
     check("API board responds (no open events in synthetic past world)", b["events"] == [] and "note" in b)
     check("API eval needs the CSRF token", c.post("/api/weather/eval").status_code in (401, 403))
-    check("version 3.7.2", c.get("/api/session").status_code == 200 and __import__("app").__version__ == "3.7.2")
+    check("version 3.8.0", c.get("/api/session").status_code == 200 and __import__("app").__version__ == "3.8.0")
     check("weather collection never places orders", not app.state.engine.db.query("SELECT 1 FROM orders_log LIMIT 1"))
     del tok
 

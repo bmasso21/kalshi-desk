@@ -203,6 +203,18 @@ def main():
           st3["errors"] >= 1 and wh.state["last_sync"] and len(eng.db.query("SELECT 1 FROM audit WHERE kind='warehouse_error'")) == n_err, st3)
     wh._sync_markets = real_sm
     wh.state["error"] = None
+    # edge studies over the API (read-only, background)
+    rs = c.post("/api/studies/run", headers=HD, json={})
+    check("studies: all three start from one request", rs.status_code == 200 and len(rs.json()["started"]) == 3, rs.text)
+    for _ in range(100):
+        if not app.state.studies.threads:
+            break
+        time.sleep(0.1)
+    js = c.get("/api/studies", headers=HD).json()
+    check("studies: results are stored and listed with the data in scope", all(js["studies"][k] and js["studies"][k]["status"] == "done" for k in js["kinds"])
+          and js["scope"] and "markets" in js["studies"]["longshot"]["result"], {k: (v or {}).get("status") for k, v in js["studies"].items()})
+    check("studies: need the session token", c.post("/api/studies/run", json={}).status_code in (401, 403))
+    check("page has the edge studies card", "Edge studies" in c.get("/").text)
     type(wh).RETRY_429 = (5, 15, 45)
     check("tag filter: untagged weather series (hurricanes) skipped", "KXHURR-26NOV-X" not in tick and
           not any(qp.get("series_ticker") == "KXHURR" for _, qp in dm.state.calls))
