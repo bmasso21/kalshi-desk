@@ -5,6 +5,11 @@ work runs on its own read-only database connection so the paper test and the col
              price), whether that side won, and so what takers and makers earned per contract, by price bucket.
                  taker return = win - price - taker fee          maker return = price - win - maker fee
              (the maker holds the other side at 1 - price, so before fees one's gain is the other's loss).
+  calib      Buying blind at fixed times. The trade-level study shows what the people who traded earned - and they chose
+             their moment. This asks the question a rule can act on: at 24 / 12 / 6 / 3 / 1 hours before the close, in
+             every market with a real two-sided quote (3c or tighter), buy 1 contract of each side at its ask and hold.
+             Return by price paid. If favorites are genuinely underpriced it shows here; if the trade-level profits
+             came from good timing, it does not.
   late       Late-stage drift. At 24 / 12 / 6 / 3 / 1 hours before a market closes, if one side could be BOUGHT for
              90-99c (hourly closing quote, bid and ask no more than 3c apart - a 99c ask on an empty book is a
              placeholder, not a favorite), buy 1 contract and hold to settlement: win - ask - taker fee.
@@ -35,7 +40,7 @@ CREATE TABLE IF NOT EXISTS wh_studies (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT, status TEXT, params TEXT, result TEXT, error TEXT, duration REAL
 );
 """
-KINDS = ("longshot", "late", "baskets")
+KINDS = ("longshot", "calib", "late", "baskets")
 TAKER = 0.07
 MAKER_SQL = "CASE s.fee_type WHEN 'quadratic_with_maker_fees' THEN 0.0175 WHEN 'quadratic_with_combo_maker_fees' THEN 0.035 ELSE 0 END"
 HOURS = (24, 12, 6, 3, 1)
@@ -171,6 +176,46 @@ def late(conn, flt: dict | None = None) -> dict:
     return {"markets": span["n"], "from": span["a"], "to": span["b"], "split_at": mid, "rows": out, "max_spread_c": round(100 * LATE_MAX_SPREAD)}
 
 
+def calib(conn, flt: dict | None = None) -> dict:
+    flt = flt or {}
+    w, args = _where(flt)
+    span = conn.execute(f"SELECT MIN(m.close_ts) a, MAX(m.close_ts) b, COUNT(*) n FROM wh_markets m WHERE {w}", args).fetchone()
+    if not span["n"]:
+        return {"markets": 0, "note": "no settled markets in scope"}
+    mid = (span["a"] + span["b"]) / 2
+    out = []
+    for h in HOURS:
+        sql = f"""
+        SELECT COALESCE(m.event_ticker, m.ticker) ev, m.result res, m.close_ts ct, c.bid_c bid, c.ask_c ask, COALESCE(s.fee_multiplier, 1) mult
+        FROM wh_markets m LEFT JOIN wh_series s ON s.series_ticker = m.series_ticker
+        JOIN wh_candles c ON c.ticker = m.ticker AND c.period = 60 AND c.end_ts = (
+            SELECT MAX(c2.end_ts) FROM wh_candles c2 WHERE c2.ticker = m.ticker AND c2.period = 60 AND c2.end_ts <= m.close_ts - ?)
+        WHERE {w} AND c.end_ts >= m.close_ts - ?"""
+        g: dict = {}
+        meta: dict = {}
+        for r in conn.execute(sql, [h * 3600] + args + [(h + 1.5) * 3600]):
+            if not r["bid"] or not r["ask"] or not (0 < r["bid"] < r["ask"] < 1) or r["ask"] - r["bid"] > LATE_MAX_SPREAD + 1e-9:
+                continue
+            for price, won in ((r["ask"], r["res"] == "yes"), (1 - r["bid"], r["res"] == "no")):
+                b = min(9, int(price * 10 + 1e-9))
+                ret = (1.0 if won else 0.0) - price - TAKER * r["mult"] * price * (1 - price)
+                for k in ("all", 0 if r["ct"] < mid else 1):
+                    e = g.setdefault((b, k), {}).setdefault(r["ev"], [0.0, 0.0])
+                    e[0] += 1
+                    e[1] += ret
+                x = meta.setdefault(b, [0, 0, 0.0])
+                x[0] += 1
+                x[1] += won
+                x[2] += price
+        for b in sorted(meta):
+            n, wins, px = meta[b]
+            p = px / n
+            out.append({"hours_before": h, "bucket": f"{b * 10 if b else 1}-{b * 10 + 9}c", "buys": n, "avg_price_c": round(100 * p, 1),
+                        "win_pct": round(100 * wins / n, 2), "breakeven_pct": round(100 * (p + TAKER * p * (1 - p)), 2),
+                        "all": _stat(g.get((b, "all"), {})), "first_half": _stat(g.get((b, 0), {})), "second_half": _stat(g.get((b, 1), {}))})
+    return {"markets": span["n"], "from": span["a"], "to": span["b"], "split_at": mid, "rows": out, "max_spread_c": round(100 * LATE_MAX_SPREAD)}
+
+
 def baskets(conn, flt: dict | None = None) -> dict:
     flt = flt or {}
     w, args = _where(flt)
@@ -242,7 +287,7 @@ def _stat_eq(groups: dict) -> dict:
     return {"events": k, "ret_c": round(100 * mean, 3), "se_c": round(100 * se, 3) if se else None, "t": round(mean / se, 2) if se else None}
 
 
-RUN = {"longshot": longshot, "late": late, "baskets": baskets}
+RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets}
 
 
 class Studies:

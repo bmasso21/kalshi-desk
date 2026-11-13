@@ -205,7 +205,7 @@ def main():
     wh.state["error"] = None
     # edge studies over the API (read-only, background)
     rs = c.post("/api/studies/run", headers=HD, json={})
-    check("studies: all three start from one request", rs.status_code == 200 and len(rs.json()["started"]) == 3, rs.text)
+    check("studies: all three start from one request", rs.status_code == 200 and len(rs.json()["started"]) == 4, rs.text)
     for _ in range(100):
         if not app.state.studies.threads:
             break

@@ -49,6 +49,8 @@ def build(tmp):
             i += 1
             trade(i, t, ct - 2 * 3600, yp, n, side)
         # candles 3h before close: A 78/80... one hour later the set is mispriced on purpose in event 5
+        candle(f"E{e}-A", ct - 6 * 3600, 0.68, 0.70)           # 6h before: a 70c favorite and a 31c longshot
+        candle(f"E{e}-B", ct - 6 * 3600, 0.29, 0.31)
         candle(f"E{e}-A", ct - 3 * 3600, 0.93, 0.95)
         candle(f"E{e}-B", ct - 3 * 3600, 0.04, 0.06)
         mkt(f"W{e}", f"WE{e}", "S", "Weather2", ct, "no")         # empty book: bid 2c, ask 99c. YES at 99c is no favorite
@@ -117,15 +119,29 @@ def main():
           and close(eqv["ret_c"], 100 * (0.9 - 0.8 - fee80), 0.002) and eqv["t"] is not None, eqv)
     check("late: no candle near 24h before the close -> no row invented", not any(h == 24 for h, _ in rows), list(rows))
 
+    cb = ST.calib(conn, {"categories": ["Weather"]})
+    cr = {(x["hours_before"], x["bucket"]): x for x in cb["rows"]}
+    fav6 = cr[(6, "70-79c")]
+    # 6h before: YES on A at 70c and NO on B at 1 - .29 = 71c, each wins in 9 of 10 events
+    pavg = 0.705
+    exp = 0.9 - pavg - 0.07 * (0.70 * 0.30 + 0.71 * 0.29) / 2
+    check("blind buying, 6h before: the 70c sides (YES at 70c, NO at 71c) were bought 20 times and won 90%", fav6["buys"] == 20 and fav6["win_pct"] == 90.0
+          and close(fav6["avg_price_c"], 70.5, 0.06), fav6)
+    check("blind buying: return = win rate - price - fee (+18.0c here), with event-clustered error bars", close(fav6["all"]["ret_c"], 100 * exp, 0.01)
+          and fav6["all"]["events"] == 10 and fav6["all"]["t"] is not None, (fav6["all"], 100 * exp))
+    lng6 = cr[(6, "30-39c")]
+    check("blind buying: the other sides (31c and 32c) win 10% and lose", lng6["buys"] == 20 and lng6["win_pct"] == 10.0 and lng6["all"]["ret_c"] < -20, lng6)
+    check("blind buying: empty books are skipped and both halves are reported", not any(b == "90-99c" and x["avg_price_c"] > 98 for (h_, b), x in cr.items())
+          and fav6["first_half"]["events"] + fav6["second_half"]["events"] == 10)
     bk = ST.baskets(conn, {"categories": ["Weather"]})
     by, sl = bk["buy_all_yes"], bk["sell_all_yes"]
-    check("baskets: 10 events with exactly one winner; incomplete hours are not counted", bk["events"] == 10 and bk["complete_event_hours"] == 12 and bk["event_hours"] == 13, bk)
+    check("baskets: 10 events with exactly one winner; incomplete hours are not counted", bk["events"] == 10 and bk["complete_event_hours"] == 22 and bk["event_hours"] == 23, bk)
     p_buy = 1 - 0.94 - 0.07 * (0.62 * 0.38 + 0.32 * 0.68)
     check("baskets: buying both YES at 62c + 32c leaves 6c before fees, 2.83c after", by["hours_with_gap_after_fees"] == 1 and by["events_with_gap"] == 1
           and close(by["max_profit_c"], round(100 * p_buy, 2), 0.011), (by, p_buy))
     p_sell = 1.10 - 1 - 0.07 * (0.70 * 0.30 + 0.40 * 0.60)
     check("baskets: selling both YES at 70c + 40c leaves 10c before fees, 6.85c after", sl["hours_with_gap_after_fees"] == 1 and close(sl["max_profit_c"], round(100 * p_sell, 2), 0.011), (sl, p_sell))
-    check("baskets: the normal hours (asks 95c + 6c, bids 93c + 4c) show no gap", by["hours_with_gap_before_fees"] == 1 and sl["hours_with_gap_before_fees"] == 1)
+    check("baskets: the normal hours (asks 95c + 6c, bids 93c + 4c) show no gap", by["hours_with_gap_before_fees"] == 1 and sl["hours_with_gap_before_fees"] == 1, (by, sl))
     conn.close()
 
     # background runner + storage
