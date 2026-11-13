@@ -71,8 +71,61 @@ def build(tmp):
     return wdb, T0
 
 
+def scalp_tests(tmp):
+    """15-minute contracts with hand-made prints: every outcome below can be worked out on paper."""
+    wdb = WarehouseDB(Path(tmp) / "s.db")
+    wdb.execute("INSERT INTO wh_series VALUES('Q', 'Crypto', 'Q', 'quadratic', 1.0, '15min', '{}', 0)")
+    O = 1_790_000_000.0
+    n = [0]
+
+    def mk(t, o, res, prints, complete=1, dur=900):
+        wdb.execute("INSERT INTO wh_markets(ticker, event_ticker, series_ticker, category, status, open_ts, close_ts, result, volume, complete) "
+                    "VALUES(?,?, 'Q', 'Crypto', 'finalized', ?, ?, ?, 100, ?)", (t, t, o, o + dur, res, complete))
+        for sec, yp, side in prints:
+            n[0] += 1
+            wdb.execute("INSERT INTO wh_trades VALUES(?,?,?,?,?,?,?,0)", (f"s{n[0]}", t, o + sec, yp, 1, side, "bid" if side == "yes" else "ask"))
+    # M1: 50c at 2 min; rises: 57c print at 4 min (taker target 56c+1c reached), ends YES
+    mk("Q-1", O, "yes", [(10, .50, "yes"), (60, .50, "no"), (110, .50, "yes"), (130, .49, "no"), (200, .54, "yes"), (240, .57, "yes"), (600, .80, "yes"), (800, .95, "yes")])
+    # M2: 50c at 2 min; falls straight to 10c, ends NO (YES buyer never reaches +10%)
+    mk("Q-2", O + 900, "no", [(10, .50, "yes"), (60, .50, "no"), (110, .50, "yes"), (200, .40, "no"), (300, .30, "no"), (500, .10, "no"), (800, .03, "no")])
+    mk("Q-3", O + 1800, "no", [(10, .50, "yes")] * 6, complete=2)          # cut at the cap: skipped
+    mk("Q-4", O + 2700, "yes", [(10, .50, "yes")] * 6, dur=86400)          # a daily contract: not a short one
+    conn = __import__("sqlite3").connect(str(Path(tmp) / "s.db"))
+    conn.row_factory = __import__("sqlite3").Row
+    r = ST.scalp(conn, {"series": ["Q"]})
+    check("scalp: only the settled short contracts with full trade lists are replayed", r["markets"] == 2 and r["skipped_too_busy"] == 1, (r.get("markets"), r.get("skipped_too_busy")))
+    tb = {(x["exec"], x["stop"], x["entry_min"], x["bucket"]): x for x in r["table"]}
+    fee = lambda p: 0.07 * p * (1 - p)
+    # taker, no stop, entry at 2 min, 40-59c bucket: 4 entries (YES and NO of M1 and M2).
+    #  M1 YES: pay 51c, target 57c (51 x 1.1 = 56.1 -> 57c), needs a 58c print: reached at 600s (80c) -> +6c - fees
+    #  M1 NO : pay 51c (NO at 50c), NO falls, held, lost: -51c - fee
+    #  M2 YES: pay 51c, never up, held, lost.   M2 NO: pay 51c, NO rises to 60c at 200s -> target 57c hit -> +6c - fees
+    a = tb[("taker", "none", 2, "40-59c")]
+    win = 0.57 - 0.51 - fee(0.51) - fee(0.57)
+    lose = -0.51 - fee(0.51)
+    check("scalp taker, no stop: 2 of 4 reach +10% (after paying the spread), 2 lose the whole stake", a["entries"] == 4 and a["win_pct"] == 50.0
+          and close(a["stat"]["ret_c"], 100 * (2 * win + 2 * lose) / 4, 0.002), a)
+    # with a 25% stop: the losers sell when the side's price is at or under 38.25c: M1 NO at 600s (NO = 20c -> sells at 19c), M2 YES at 300s (30c -> 29c)
+    b = tb[("taker", "-25%", 2, "40-59c")]
+    l1 = 0.19 - 0.51 - fee(0.51) - fee(0.19)
+    l2 = 0.29 - 0.51 - fee(0.51) - fee(0.29)
+    check("scalp taker, 25% stop: losers are sold 1c under the print that triggers the stop", close(b["stat"]["ret_c"], 100 * (2 * win + l1 + l2) / 4, 0.002), b)
+    # resting orders: buy limit 49c. M1 YES fills at 130s (49c, a seller hit it); target 54c (49 x 1.1 = 53.9): the 54c print at 200s was a buyer -> sold at 54c, no fees
+    #  M1 NO: NO limit 49c needs NO <= 49c with a seller of NO (= a YES buyer at >= 51c): 200s (YES 54c -> NO 46c, below the limit) -> filled, then NO falls, lost 49c
+    #  M2 YES: YES falls through 49c at 200s (40c) -> filled, lost 49c.   M2 NO: NO never trades at or under 49c within 2 minutes after 120s? 200s is 80s later: NO = 60c -> not filled
+    m_ = tb[("maker", "none", 2, "40-59c")]
+    check("scalp resting orders: no fee, one of four never fills, the fills are the ones the price moved against",
+          m_["entries"] == 3 and m_["filled_pct"] == 75.0 and close(m_["stat"]["ret_c"], 100 * ((0.54 - 0.49) + 2 * (-0.49)) / 3, 0.002), m_)
+    ov = {(x["exec"], x["stop"]): x for x in r["overall"]}
+    check("scalp: how each trade ended is counted", ov[("taker", "none")]["ends"].get("target", 0) >= 2 and "held, lost" in ov[("taker", "none")]["ends"], ov[("taker", "none")]["ends"])
+    check("scalp: nothing above 90c is entered (a +10% target would be over $1)", not any(x["bucket"] not in ("5-19c", "20-39c", "40-59c", "60-79c", "80-90c") for x in r["table"]))
+    check("scalp: no short contracts in scope -> a note, not an error", ST.scalp(conn, {"series": ["NOPE"]})["markets"] == 0)
+    conn.close()
+
+
 def main():
     tmp = tempfile.mkdtemp()
+    scalp_tests(tempfile.mkdtemp())
     wdb, T0 = build(tmp)
     st = ST.Studies(wdb)
     conn = st._ro()

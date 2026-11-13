@@ -663,14 +663,18 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         return {"ts": r["ts"], "chars": len(txt), "body_text": txt[:max(100, min(chars, 200000))]}
 
     @app.get("/api/studies")
-    def studies_list(category: str = ""):
-        return {"studies": studies.latest({"categories": [category]} if category else None), "kinds": list(STUDY_KINDS), "category": category,
+    def studies_list(category: str = "", series: str = ""):
+        flt = {"categories": [category]} if category else None
+        if series:
+            flt = {"series": [x.strip()[:80] for x in series.split(",") if x.strip()][:50]}
+        return {"studies": studies.latest(flt), "kinds": list(STUDY_KINDS), "category": category,
                 "scope": wdb.query("SELECT category, COUNT(*) markets, SUM(result IN ('yes','no')) settled FROM wh_markets GROUP BY category")}
 
     @app.post("/api/studies/run")
     async def studies_run(request: Request):
         b = await request.json()
-        kinds = [k for k in (b.get("kinds") or STUDY_KINDS) if k in STUDY_KINDS]
+        from .studies import RUN as STUDY_RUN
+        kinds = [k for k in (b.get("kinds") or STUDY_KINDS) if k in STUDY_RUN]      # "scalp" runs only when named
         flt = {k: [str(x)[:80] for x in b[k]][:50] for k in ("categories", "series") if isinstance(b.get(k), list) and b[k]}
         started, skipped = [], []
         for k in kinds:

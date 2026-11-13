@@ -439,6 +439,13 @@ def main():
     check("sample override: the market cut at the old cap is refetched in full (complete = 1, all 3 trades)",
           q("SELECT complete FROM wh_markets WHERE ticker='KXNFL-26NOV09-GB'")[0]["complete"] == 1
           and len(q("SELECT 1 FROM wh_trades WHERE ticker='KXNFL-26NOV09-GB'")) == 3 and st5["errors"] == 0, st5)
+    # a series named in the overrides is collected whatever its volume rank (the 15-minute contracts are picked this way)
+    r = c.post("/api/config", headers=HD, json={"warehouse": {"sample": {"overrides": {"Sports": {"max_trades_per_market": 100, "series_per_category": 1},
+                                                                                       "KXNBA": {"days": 30, "markets_per_series": 50}}}}})
+    st6 = wh.sync()
+    check("sample: a series named in the overrides is collected although it is not among the busiest",
+          len(q("SELECT 1 FROM wh_markets WHERE ticker='KXNBA-26NOV08-BOS'")) == 1 and (wh.status()["sample_info"] or {}).get("KXNBA") == "named series" and st6["errors"] == 0,
+          (st6, wh.status()["sample_info"]))
     # long-lived markets: candle requests are split so none asks for more than Kalshi's 5000-candle limit
     mrow = dict(q("SELECT ticker, series_ticker, category, tier, open_ts, close_ts, settled_ts, status, volume, trades_synced_to, candles_synced_to FROM wh_markets WHERE ticker='KXHIGHNY-26NOV05-B40'")[0])
     mrow.update(open_ts=time.time() - 400 * 86400, candles_synced_to=0, close_ts=time.time() + 86400, tier="live", settled_ts=None)

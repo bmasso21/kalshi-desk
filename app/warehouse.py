@@ -253,10 +253,11 @@ class Warehouse:
                     pass
         return best
 
-    def _sample_opt(self, category, key: str, default):
-        """A sample setting, with an optional per-category override (sample.overrides = {category: {key: value}})."""
+    def _sample_opt(self, category, key: str, default, series=None):
+        """A sample setting, with an optional override per category or per series (sample.overrides = {name: {key: value}})."""
         sc = self.cfg.get("sample") or {}
-        ov = (sc.get("overrides") or {}).get(category or "") or {}
+        ovs = sc.get("overrides") or {}
+        ov = {**(ovs.get(category or "") or {}), **(ovs.get(series or "") or {})}     # a series entry beats its category's
         v = ov.get(key, sc.get(key))
         return default if v in (None, "") else v
 
@@ -291,6 +292,22 @@ class Warehouse:
                 self.db.upsert_series(s, cat)
                 out.append({"ticker": s["ticker"], "category": s.get("category") or cat, "sample_cat": cat})
             info[cat] = f"{min(n, len(vols))} of {len(ser)} series ({how})"
+        # series named one by one in the overrides (e.g. the 15-minute contracts) are collected whatever their volume rank
+        have = {o["ticker"] for o in out}
+        for name in (sc.get("overrides") or {}):
+            if name in cats or name in have or name in exclude or self._stop.is_set():
+                continue
+            try:
+                s = self._retry(self.client.series, name)
+            except Exception as e:
+                info[name] = f"error: {e}"[:120]
+                continue
+            if not s or not s.get("ticker"):
+                info[name] = "not found"
+                continue
+            self.db.upsert_series(s, s.get("category"))
+            out.append({"ticker": s["ticker"], "category": s.get("category"), "sample_cat": s.get("category"), "named": True})
+            info[name] = "named series"
         self.db.put("sample_info", info)
         return out
 
@@ -299,10 +316,18 @@ class Warehouse:
         st, cat = s["ticker"], s.get("category")
         since = time.time() - days * 86400
         got = []
-        for m in self.client.paginate("/markets", "markets", {"series_ticker": st, "status": "settled", "limit": 1000}, max_items=max(3000, per * 3)):
-            ts = iso_ts(m.get("settlement_ts")) or iso_ts(m.get("close_time")) or 0
-            if ts >= since and (m.get("result") in ("yes", "no")):
-                got.append((ts, m))
+
+        def pull(params):
+            for m in self.client.paginate("/markets", "markets", params, max_items=max(3000, per * 3)):
+                ts = iso_ts(m.get("settlement_ts")) or iso_ts(m.get("close_time")) or 0
+                if ts >= since and (m.get("result") in ("yes", "no")):
+                    got.append((ts, m))
+        base = {"series_ticker": st, "status": "settled", "limit": 1000}
+        try:                                    # ask only for the window (a series of 15-minute contracts has thousands of older ones)
+            pull({**base, "min_close_ts": int(since)})
+        except Exception:
+            got.clear()
+            pull(base)
         got.sort(key=lambda x: -x[0])
         for _, m in got[:per]:
             self.db.upsert_market(m, st, cat, "live")
@@ -350,15 +375,15 @@ class Warehouse:
                         break
                     self.state["progress"] = f"sample markets {i + 1}/{len(samp)} {s['ticker']}"
                     try:
-                        stats["markets"] += self._retry(self._sync_sample_markets, s, float(self._sample_opt(s.get("sample_cat"), "days", 45)),
-                                                        int(self._sample_opt(s.get("sample_cat"), "markets_per_series", 60)))
+                        stats["markets"] += self._retry(self._sync_sample_markets, s, float(self._sample_opt(s.get("sample_cat"), "days", 45, s["ticker"])),
+                                                        int(self._sample_opt(s.get("sample_cat"), "markets_per_series", 60, s["ticker"])))
                     except Exception as e:
                         stats["errors"] += 1
                         self.state["error"] = f"{s['ticker']}: {e}"[:300]
                 # markets cut at an earlier, lower trade cap are fetched again when their category's cap has been raised
-                for r in self.db.query("SELECT m.ticker, m.category, (SELECT COUNT(*) FROM wh_trades t WHERE t.ticker = m.ticker) n "
+                for r in self.db.query("SELECT m.ticker, m.category, m.series_ticker, (SELECT COUNT(*) FROM wh_trades t WHERE t.ticker = m.ticker) n "
                                        "FROM wh_markets m WHERE m.complete = 2"):
-                    if r["n"] < int(self._sample_opt(r["category"], "max_trades_per_market", 5000)):
+                    if r["n"] < int(self._sample_opt(r["category"], "max_trades_per_market", 5000, r["series_ticker"])):
                         self.db.execute("UPDATE wh_markets SET complete=0, trades_synced_to=0 WHERE ticker=?", (r["ticker"],))
             # 2) trades + candles for markets that still need them
             todo = self.db.query(
@@ -440,7 +465,7 @@ class Warehouse:
         end = int(min(now, (m["close_ts"] or now) + 3600))
         nt = nc = 0
         sampled = m["series_ticker"] not in getattr(self, "_full_scope", {m["series_ticker"]})
-        cap = int(self._sample_opt(m["category"], "max_trades_per_market", 5000)) if sampled else 200000
+        cap = int(self._sample_opt(m["category"], "max_trades_per_market", 5000, m["series_ticker"])) if sampled else 200000
         truncated = False
         # trades (skip markets that never traded)
         if (m["volume"] or 0) > 0 or m["volume"] is None:

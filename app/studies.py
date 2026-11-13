@@ -280,7 +280,143 @@ def baskets(conn, flt: dict | None = None) -> dict:
 # averaging event by event shows favorites winning and longshots losing even in a perfectly fair market.
 
 
-RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets}
+# ---------------------------------------------------------------- scalp --
+EXTRA = ("scalp",)                   # run only when asked for: it applies to short contracts (15 minutes and the like)
+SCALP_ENTRY_MIN = (2, 5, 10)         # minutes after the contract opens
+SCALP_STOPS = (None, 0.25, 0.50)     # sell if the price falls this fraction below what was paid; None = hold to the end
+SCALP_TARGET = 0.10                  # take profit at +10%
+SCALP_BUCKETS = ((0.05, 0.20, "5-19c"), (0.20, 0.40, "20-39c"), (0.40, 0.60, "40-59c"), (0.60, 0.80, "60-79c"), (0.80, 0.9001, "80-90c"))
+SCALP_MAKER_WAIT = 120               # seconds a resting buy order waits before giving up
+
+
+def _scalp_one(tr, i0, t_entry, side, p0, res_yes, taker_rate, maker_rate):
+    """One entry (one side of one contract at one moment), every variant in a single pass over the later prints.
+    tr: [(ts, yes_price, taker_bought_yes)], i0: first print after the entry moment. Returns {(exec, stop): outcome}.
+    Prices are per contract in dollars. Deliberately conservative: a taker pays 1c over the last print and sells 1c
+    under the print that triggers a stop; a +10% target counts only once a print is 1c THROUGH it (taker exit) or a
+    buyer lifts it / trades through it (resting exit)."""
+    win = 1.0 if (side == "yes") == res_yes else 0.0
+    fee = lambda rate, px: rate * px * (1 - px)
+    out, live = {}, []
+    for ex in ("taker", "maker"):
+        cost = round(p0 + 0.01, 4) if ex == "taker" else round(p0 - 0.01, 4)
+        if cost <= 0.0 or cost >= 0.99:
+            continue
+        for stop in SCALP_STOPS:
+            live.append({"ex": ex, "stop": stop, "cost": cost, "in": ex == "taker", "target": math.ceil(cost * (1 + SCALP_TARGET) * 100 - 1e-9) / 100,
+                         "fees": fee(taker_rate, cost) if ex == "taker" else 0.0})
+    for j in range(i0, len(tr)):
+        if not live:
+            break
+        ts, yp, tby = tr[j]
+        px = yp if side == "yes" else 1 - yp
+        taker_bought_side = tby == (side == "yes")
+        for v in list(live):
+            if not v["in"]:                                   # resting buy 1c under the last print
+                if ts - t_entry > SCALP_MAKER_WAIT:
+                    out[(v["ex"], v["stop"])] = {"how": "unfilled"}
+                    live.remove(v)
+                elif px < v["cost"] - 1e-9 or (abs(px - v["cost"]) < 1e-9 and not taker_bought_side):
+                    v["in"] = True
+                    v["fees"] = fee(maker_rate, v["cost"])
+                continue
+            if v["ex"] == "taker":
+                hit = px >= v["target"] + 0.01 - 1e-9
+            else:
+                hit = px > v["target"] + 1e-9 or (abs(px - v["target"]) < 1e-9 and taker_bought_side)
+            if hit and v["target"] < 1.0:
+                f2 = fee(taker_rate if v["ex"] == "taker" else maker_rate, v["target"])
+                out[(v["ex"], v["stop"])] = {"how": "target", "ret": v["target"] - v["cost"] - v["fees"] - f2, "cost": v["cost"]}
+                live.remove(v)
+            elif v["stop"] is not None and px <= v["cost"] * (1 - v["stop"]) + 1e-9:
+                sell = max(0.01, px - 0.01)
+                out[(v["ex"], v["stop"])] = {"how": "stop", "ret": sell - v["cost"] - v["fees"] - fee(taker_rate, sell), "cost": v["cost"]}
+                live.remove(v)
+    for v in live:
+        if not v["in"]:
+            out[(v["ex"], v["stop"])] = {"how": "unfilled"}
+        else:
+            out[(v["ex"], v["stop"])] = {"how": "held, won" if win else "held, lost", "ret": win - v["cost"] - v["fees"], "cost": v["cost"]}
+    return out
+
+
+def scalp(conn, flt: dict | None = None) -> dict:
+    """Short contracts replayed trade by trade: buy a side a few minutes in, sell at +10%, with and without a stop."""
+    import bisect
+    flt = flt or {}
+    w, args = _where(flt)
+    mk = conn.execute(f"""SELECT m.ticker, m.series_ticker ser, m.open_ts o, m.close_ts c, m.result res, s.fee_type ft, COALESCE(s.fee_multiplier, 1) mult
+                          FROM wh_markets m LEFT JOIN wh_series s ON s.series_ticker = m.series_ticker
+                          WHERE {w} AND m.complete = 1 AND m.close_ts - m.open_ts BETWEEN 240 AND 1500""", args).fetchall()
+    cut = conn.execute(f"SELECT COUNT(*) n FROM wh_markets m WHERE {w} AND m.complete = 2 AND m.close_ts - m.open_ts BETWEEN 240 AND 1500", args).fetchone()["n"]
+    if not mk:
+        return {"markets": 0, "note": "no settled short contracts (4 to 25 minutes long) with stored trades in scope", "skipped_too_busy": cut}
+    cells, ser_cells, mix = {}, {}, {}
+    used = 0
+
+    def add(store, key, grp, o):
+        c = store.setdefault(key, {"g": {}, "n": 0, "wins": 0, "unfilled": 0, "cost": 0.0})
+        if o["how"] == "unfilled":
+            c["unfilled"] += 1
+            return
+        g = c["g"].setdefault(grp, [0.0, 0.0])
+        g[0] += 1
+        g[1] += o["ret"]
+        c["n"] += 1
+        c["wins"] += 1 if o["ret"] > 0 else 0
+        c["cost"] += o["cost"]
+    for m in mk:
+        rows = conn.execute("SELECT ts, yes_price yp, taker_outcome_side tos, taker_book_side tbs FROM wh_trades WHERE ticker=? AND ts<=? ORDER BY ts", (m["ticker"], m["c"])).fetchall()
+        tr = [(r["ts"], r["yp"], (r["tos"] == "yes") if r["tos"] in ("yes", "no") else (r["tbs"] == "bid")) for r in rows if r["yp"] is not None and 0 < r["yp"] < 1]
+        if len(tr) < 5:
+            continue
+        used += 1
+        tss = [t[0] for t in tr]
+        mrate = {"quadratic_with_maker_fees": 0.0175, "quadratic_with_combo_maker_fees": 0.035}.get(m["ft"], 0.0) * m["mult"]
+        trate = TAKER * m["mult"]
+        for em in SCALP_ENTRY_MIN:
+            t0 = m["o"] + em * 60
+            if t0 >= m["c"] - 60:
+                continue
+            i0 = bisect.bisect_right(tss, t0)
+            if i0 == 0 or t0 - tss[i0 - 1] > 90:               # no recent print to price the entry from
+                continue
+            yp0 = tr[i0 - 1][1]
+            for side in ("yes", "no"):
+                p0 = yp0 if side == "yes" else round(1 - yp0, 4)
+                b = next((lab for lo, hi, lab in SCALP_BUCKETS if lo <= p0 < hi), None)
+                if not b:
+                    continue
+                for (ex, stop), o in _scalp_one(tr, i0, t0, side, p0, m["res"] == "yes", trate, mrate).items():
+                    sk = "none" if stop is None else f"-{int(stop * 100)}%"
+                    grp = int(m["c"])                          # contracts that end at the same moment are one cluster
+                    add(cells, (ex, sk, em, b), grp, o)
+                    add(cells, (ex, sk, "all", "all"), grp, o)
+                    add(ser_cells, (m["ser"], ex, sk), grp, o)
+                    if o["how"] != "unfilled":
+                        mx = mix.setdefault((ex, sk), {})
+                        mx[o["how"]] = mx.get(o["how"], 0) + 1
+
+    def row(c):
+        st = _stat(c["g"])
+        tot = c["n"] + c["unfilled"]
+        return {"entries": c["n"], "win_pct": round(100 * c["wins"] / c["n"], 1) if c["n"] else None,
+                "avg_cost_c": round(100 * c["cost"] / c["n"], 1) if c["n"] else None,
+                "ret_pct_of_stake": round(100 * sum(g[1] for g in c["g"].values()) / c["cost"], 2) if c["cost"] else None,
+                "filled_pct": round(100 * c["n"] / tot, 1) if tot else None, "stat": st}
+    order = {lab: i for i, (_, _, lab) in enumerate(SCALP_BUCKETS)}
+    table = [{"exec": k[0], "stop": k[1], "entry_min": k[2], "bucket": k[3], **row(c)} for k, c in cells.items() if k[2] != "all"]
+    table.sort(key=lambda x: (x["exec"] != "taker", x["stop"], x["entry_min"], order[x["bucket"]]))
+    overall = [{"exec": k[0], "stop": k[1], **row(c), "ends": mix.get((k[0], k[1]), {})} for k, c in cells.items() if k[2] == "all"]
+    overall.sort(key=lambda x: (x["exec"] != "taker", x["stop"]))
+    by_series = [{"series": k[0], "exec": k[1], "stop": k[2], **row(c)} for k, c in ser_cells.items()]
+    by_series.sort(key=lambda x: (x["series"], x["exec"] != "taker", x["stop"]))
+    return {"markets": used, "skipped_too_busy": cut, "from": min(m["c"] for m in mk), "to": max(m["c"] for m in mk),
+            "target_pct": int(SCALP_TARGET * 100), "entry_minutes": list(SCALP_ENTRY_MIN), "maker_wait_sec": SCALP_MAKER_WAIT,
+            "overall": overall, "table": table, "by_series": by_series}
+
+
+RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp}
 
 
 class Studies:
@@ -332,7 +468,7 @@ class Studies:
         """The newest run of each study for one scope (the same filters), default = everything stored."""
         key = json.dumps(filters or {})
         out = {}
-        for k in KINDS:
+        for k in KINDS + EXTRA:
             r = self.db.query("SELECT * FROM wh_studies WHERE kind=? AND params=? ORDER BY id DESC LIMIT 1", (k, key))
             done = self.db.query("SELECT * FROM wh_studies WHERE kind=? AND params=? AND status='done' ORDER BY id DESC LIMIT 1", (k, key))
             x = r[0] if r else None
