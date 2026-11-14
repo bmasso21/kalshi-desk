@@ -176,6 +176,16 @@ def main():
     pk2 = {(p_["ticker"], p_["side"]): p_ for p_ in fv.status()["picks"]}
     check("tiers: Over 44.5 at 46c is an edge pick; New Orleans +3.5 at 47c is a lean; nothing else is recorded",
           pk2[(f"{TO}-44", "yes")]["tier"] == "edge" and pk2[(f"{SP}-GB3", "no")]["tier"] == "lean" and len(pk2) == 2 and r["picks"] == 1 and r["leans"] == 1, {k_: v_["tier"] for k_, v_ in pk2.items()})
+    # an underdog at 22c that is "at fair" by a fraction of a cent is NOT a lean (even margin removal flatters underdogs)
+    k.mk["KXNFLGAME-X"] = None
+    del k.mk["KXNFLGAME-X"]
+    ev4 = {"id": "e4", "commence_time": iso, "home_team": H, "away_team": A, "bookmakers": [book(b_, H, 1.25, A, 4.30) for b_ in ("dk", "fd", "mgm")]}
+    dogfair = (1 / 4.30) / (1 / 4.30 + 1 / 1.25)
+    k.mk[f"{EV}-NO"].update(yes_bid_dollars="0.1900", yes_ask_dollars="0.2100")
+    k.mk[f"{EV}-GB"].update(yes_bid_dollars="0.7800", yes_ask_dollars="0.8000")
+    n_before = len(wdb.query("SELECT 1 FROM fv_picks2"))
+    fv.scan_sport("americanfootball_nfl", {"series": "KXNFLGAME", "markets": "h2h"}, [ev4])
+    check("an underdog under 30c never becomes a lean", dogfair - 0.21 - 0.07 * 0.21 * 0.79 > 0 and len(wdb.query("SELECT 1 FROM fv_picks2")) == n_before, wdb.query("SELECT label, price, tier FROM fv_picks2"))
     k.mk[f"{SP}-GB3"].update(yes_bid_dollars="0.5000", yes_ask_dollars="0.5200")
     fv.upkeep()
     check("a NO pick is tracked at the NO price (1 - 51c = 49c)", close(wdb.query("SELECT last_mid FROM fv_picks2 WHERE side='no'")[0]["last_mid"], 0.49))
