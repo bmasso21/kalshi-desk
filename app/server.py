@@ -41,6 +41,9 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     from .sports import evaluate as sp_evaluate
     oddspapi = OddsPapi(lambda: cfg.data.get("sports") or {}, wdb)
     app_sp_state = {"running": False}
+    from .fairvalue import FairValue
+    fairvalue = FairValue(lambda: cfg.data.get("sports") or {}, wdb,
+                          KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
     eng.weather = WxCollector(eng, wx_store)
     from .maintenance import Maintenance
     maint = Maintenance(eng, wdb)
@@ -75,6 +78,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             eng.start()
             eng.warehouse.start()
             eng.weather.start()
+            fairvalue.start()
             maint.start()
             try:
                 mm_shadow.resume()
@@ -457,7 +461,25 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             for k in ("api_url_override",):
                 al.pop(k, None)              # test-only setting, never from the browser
         if isinstance(patch.get("sports"), dict):
-            sp = {k: v for k, v in patch["sports"].items() if k in ("oddspapi_key", "monthly_cap")}
+            sp = {k: v for k, v in patch["sports"].items() if k in ("oddspapi_key", "monthly_cap", "theodds_key", "fv_enabled", "fv_poll_hours", "fv_monthly_cap", "fv_min_edge")}
+            if "theodds_key" in sp:
+                v = str(sp["theodds_key"] or "").strip()
+                if not v or v.endswith("…"):
+                    sp.pop("theodds_key")
+                elif not re.fullmatch(r"[A-Za-z0-9]{20,64}", v):
+                    sp.pop("theodds_key")
+                    errors.append("The Odds API key should be 20-64 letters/digits (copy it from the email they sent you)")
+                else:
+                    sp["theodds_key"] = v
+            if "fv_enabled" in sp:
+                sp["fv_enabled"] = bool(sp["fv_enabled"])
+            for k_, lo_, hi_, cast_ in (("fv_poll_hours", 1, 48, float), ("fv_monthly_cap", 0, 500, int), ("fv_min_edge", 0.0, 0.2, float)):
+                if k_ in sp:
+                    try:
+                        sp[k_] = max(lo_, min(hi_, cast_(float(sp[k_]))))
+                    except (TypeError, ValueError):
+                        sp.pop(k_)
+                        errors.append(f"{k_} must be a number between {lo_} and {hi_}")
             if "oddspapi_key" in sp:
                 v = str(sp["oddspapi_key"] or "").strip()
                 if not v or v.endswith("…"):
@@ -488,7 +510,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             eng.connect()
         safe = {k: v for k, v in patch.items() if "key" not in k}
         if isinstance(safe.get("sports"), dict):
-            safe["sports"] = {k: v for k, v in safe["sports"].items() if k != "oddspapi_key"}
+            safe["sports"] = {k: v for k, v in safe["sports"].items() if k not in ("oddspapi_key", "theodds_key")}
         if isinstance(safe.get("alerts"), dict):
             safe["alerts"] = {k: v for k, v in safe["alerts"].items() if k not in ("pushover_user", "pushover_token", "healthcheck_url")}
         if post_update_rescale:
@@ -596,6 +618,20 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         return {"configured": oddspapi.configured, "usage": oddspapi.usage(), "running": app_sp_state["running"],
                 "calls": oddspapi.calls(60), "discover": wdb.get("sp_discover"), "study": st.summary(),
                 "eval": wdb.get("sp_eval")}
+
+    @app.get("/api/fairvalue")
+    def fairvalue_status():
+        return fairvalue.status()
+
+    @app.post("/api/fairvalue/poll")
+    def fairvalue_poll(sport: str = ""):
+        """Pull sportsbook odds now (one credit per sport) and compare with Kalshi. Paper only: places no orders."""
+        if not fairvalue.configured:
+            raise HTTPException(400, "Add your key for The Odds API in Settings first")
+        out = fairvalue.poll(sport or None)
+        fairvalue.upkeep()
+        db.audit("fairvalue_poll", json.dumps({"used": out["usage"]["used"], "error": out["error"]}))
+        return out
 
     @app.post("/api/sports/study")
     async def sports_study(request: Request):

@@ -156,6 +156,17 @@ DEFAULTS = {
     "sports": {
         "oddspapi_key": "",             # entered in Settings, never shown again
         "monthly_cap": 240,             # hard stop below the free plan's 250 requests/month
+        # fair-value scanner (paper only): The Odds API, free plan = 500 credits a month, one credit per sport per pull
+        "theodds_key": "",              # entered in Settings, never shown again
+        "fv_enabled": True,
+        "fv_poll_hours": 6,             # 4 sports x 4 pulls a day x 30 days = 480 credits
+        "fv_monthly_cap": 450,
+        "fv_min_edge": 0.02,            # Kalshi's ask must beat the fair price by this much AFTER the taker fee
+        "fv_min_books": 3,
+        "fv_max_book_range": 0.05,      # skip games the sportsbooks themselves disagree on
+        "fv_max_spread": 0.06,
+        "fv_min_lead_min": 10,          # before the game starts only
+        "fv_hours_ahead": 48,
     },
     # --- scanner ----------------------------------------------------------
     "scanner": {
@@ -290,6 +301,8 @@ class Config:
         sp = d.get("sports", {})
         if sp.get("oddspapi_key"):
             sp["oddspapi_key"] = sp["oddspapi_key"][:4] + "…"
+        if sp.get("theodds_key"):
+            sp["theodds_key"] = sp["theodds_key"][:4] + "…"
         if a.get("healthcheck_url"):
             a["healthcheck_url"] = a["healthcheck_url"][:30] + "…"
         return d
