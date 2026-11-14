@@ -461,7 +461,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             for k in ("api_url_override",):
                 al.pop(k, None)              # test-only setting, never from the browser
         if isinstance(patch.get("sports"), dict):
-            sp = {k: v for k, v in patch["sports"].items() if k in ("oddspapi_key", "monthly_cap", "theodds_key", "fv_enabled", "fv_poll_hours", "fv_monthly_cap", "fv_min_edge")}
+            sp = {k: v for k, v in patch["sports"].items() if k in ("oddspapi_key", "monthly_cap", "theodds_key", "fv_enabled", "fv_monthly_cap", "fv_min_edge", "fv_lean_edge")}
             if "theodds_key" in sp:
                 v = str(sp["theodds_key"] or "").strip()
                 if not v or v.endswith("…"):
@@ -473,7 +473,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                     sp["theodds_key"] = v
             if "fv_enabled" in sp:
                 sp["fv_enabled"] = bool(sp["fv_enabled"])
-            for k_, lo_, hi_, cast_ in (("fv_poll_hours", 1, 48, float), ("fv_monthly_cap", 0, 500, int), ("fv_min_edge", 0.0, 0.2, float)):
+            for k_, lo_, hi_, cast_ in (("fv_monthly_cap", 0, 500, int), ("fv_min_edge", 0.0, 0.2, float), ("fv_lean_edge", -0.05, 0.2, float)):
                 if k_ in sp:
                     try:
                         sp[k_] = max(lo_, min(hi_, cast_(float(sp[k_]))))

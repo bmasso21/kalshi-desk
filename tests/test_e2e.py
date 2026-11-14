@@ -231,10 +231,14 @@ def run(keytype: str):
     q.cycle()
     eng.place = real_place
     check("quoter: a market it cannot fund is dropped and skipped for a day (no endless retries)",
-          "KXA-1" in q.unfunded and q.unfunded["KXA-1"] > time.time() + 80000 and not q.selected and q.programs_ts == 1
+          "KXA" in q.unfunded and q.unfunded["KXA"] > time.time() + 80000 and not q.selected and q.programs_ts == 1
+          and "KXA" in cfg.data["quoter_skip"]["demo"]
           and any(e_["kind"] == "skip" for e_ in q.events), (q.unfunded, [e_["kind"] for e_ in list(q.events)[-4:]]))
-    check("quoter: the skipped market is left out of the next pick", "KXA-1" not in [x["ticker"] for x in q.select(eng.client)[0]])
+    check("quoter: the whole series is left out of the next pick", not any(x["ticker"].startswith("KXA-") for x in q.select(eng.client)[0]))
+    q._skips_loaded = None
+    check("quoter: the skip list survives a restart", "KXA" in q._skips())
     q.unfunded.clear()
+    q._save_skips()
     q.quotes.update(real_quotes)
     q.selected = real_sel
     q.programs_ts = time.time()

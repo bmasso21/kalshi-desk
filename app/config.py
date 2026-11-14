@@ -159,7 +159,11 @@ DEFAULTS = {
         # fair-value scanner (paper only): The Odds API, free plan = 500 credits a month, one credit per sport per pull
         "theodds_key": "",              # entered in Settings, never shown again
         "fv_enabled": True,
-        "fv_poll_hours": 6,             # 4 sports x 4 pulls a day x 30 days = 480 credits
+        # football: winner + spread + total (3 credits) every 12 h; NBA and NHL: winner only (1 credit) once a day.
+        # A sport with no Kalshi game in the next two days is skipped without spending anything.
+        "fv_lean_edge": 0.0,            # "lean" tier: at fair or better after the fee (how the NFL / college plays were picked)
+        "fv_min_price": 0.10,           # skip longshots and near-certainties: margin removal is least reliable there
+        "fv_max_price": 0.92,
         "fv_monthly_cap": 450,
         "fv_min_edge": 0.02,            # Kalshi's ask must beat the fair price by this much AFTER the taker fee
         "fv_min_books": 3,

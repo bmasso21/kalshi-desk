@@ -61,6 +61,26 @@ class Quoter:
         self.cycles = 0
 
     # ------------------------------------------------------------ helpers --
+    def _skips(self) -> dict:
+        """Series this account cannot trade (kept per environment and across restarts)."""
+        env = getattr(self.e.cfg, "env", None)
+        if env is None:                                  # a bare engine (tests): nothing saved
+            return self.unfunded
+        if getattr(self, "_skips_loaded", None) != env:
+            saved = ((self.e.cfg.data.get("quoter_skip") or {}).get(env) or {})
+            self.unfunded = {k: float(v) for k, v in saved.items() if float(v) > time.time()}
+            self._skips_loaded = env
+        return self.unfunded
+
+    def _save_skips(self):
+        try:
+            allv = dict(self.e.cfg.data.get("quoter_skip") or {})
+            allv[self.e.cfg.env] = {k: v for k, v in self.unfunded.items() if v > time.time()}
+            self.e.cfg.data["quoter_skip"] = allv            # set whole (a merge would never drop an expired entry)
+            self.e.cfg.save()
+        except Exception as e:
+            self.log("error", f"could not save the skip list: {e}")
+
     def log(self, kind, msg):
         self.events.appendleft({"ts": time.time(), "kind": kind, "msg": msg})
 
@@ -233,7 +253,8 @@ class Quoter:
             except Exception as e:
                 self.log("error", f"all-markets screen failed (using reward markets only): {e}")
         now_ = time.time()
-        rows = [r for r in rows if self.unfunded.get(r["ticker"], 0) < now_]      # markets Kalshi would not let this account trade
+        skip = self._skips()
+        rows = [r for r in rows if skip.get(r["ticker"].split("-")[0], 0) < now_]   # series Kalshi would not let this account trade
         if trading_first:
             picked = mm.pick_trading_first(rows, size, int(c["max_markets"]), float(c["max_capital"]),
                                            float(c.get("min_spread") or 0.02), float(c.get("max_volume_24h") or 0),
@@ -437,10 +458,12 @@ class Quoter:
                     if "insufficient_shard_balance" in str(e):
                         # The market trades on an exchange index where this account holds nothing. Retrying every
                         # cycle would never work: leave it alone for a day and pick another market now.
-                        self.unfunded[t] = time.time() + 86400
-                        self.selected = [x for x in self.selected if x["ticker"] != t]
+                        ser = t.split("-")[0]
+                        self.unfunded[ser] = time.time() + 86400
+                        self._save_skips()
+                        self.selected = [x for x in self.selected if x["ticker"].split("-")[0] != ser]
                         self.programs_ts = 1
-                        self.log("skip", f"{t}: not tradable from this account's funded exchange index - skipped for 24h, picking another market")
+                        self.log("skip", f"{ser}: this account's funded exchange index cannot trade this series - the whole series is skipped for 24h, picking another market")
                         break
         self._update_state(client, committed)
 
