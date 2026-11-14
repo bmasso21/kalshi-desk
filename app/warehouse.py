@@ -171,14 +171,22 @@ class WarehouseDB:
         return len(rows)
 
     def counts(self) -> dict:
+        """Row counts for the status page. Counting tens of millions of trades row by row took longer than the page
+        waits and held the database meanwhile, so trades use the highest row number (rows are only ever added, never
+        deleted, so it is the count) and the whole answer is reused for a minute."""
+        c = getattr(self, "_counts", None)
+        if c and time.time() - c[0] < 60:
+            return c[1]
         q = lambda s: self.query(s)[0]["n"]
-        return {"series": q("SELECT COUNT(*) n FROM wh_series"),
-                "markets": q("SELECT COUNT(*) n FROM wh_markets"),
-                "settled_markets": q("SELECT COUNT(*) n FROM wh_markets WHERE result IN ('yes','no')"),
-                "complete_markets": q("SELECT COUNT(*) n FROM wh_markets WHERE complete=1"),
-                "trades": q("SELECT COUNT(*) n FROM wh_trades"),
-                "candles": q("SELECT COUNT(*) n FROM wh_candles"),
-                "ticks": q("SELECT COUNT(*) n FROM wh_ticks")}
+        out = {"series": q("SELECT COUNT(*) n FROM wh_series"),
+               "markets": q("SELECT COUNT(*) n FROM wh_markets"),
+               "settled_markets": q("SELECT COUNT(*) n FROM wh_markets WHERE result IN ('yes','no')"),
+               "complete_markets": q("SELECT COUNT(*) n FROM wh_markets WHERE complete=1"),
+               "trades": q("SELECT COALESCE(MAX(rowid), 0) n FROM wh_trades"),
+               "candles": q("SELECT COUNT(*) n FROM wh_candles"),
+               "ticks": q("SELECT COUNT(*) n FROM wh_ticks")}
+        self._counts = (time.time(), out)
+        return out
 
 
 class Warehouse:
