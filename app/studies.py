@@ -283,97 +283,174 @@ def baskets(conn, flt: dict | None = None) -> dict:
 # ---------------------------------------------------------------- scalp --
 EXTRA = ("scalp",)                   # run only when asked for: it applies to short contracts (15 minutes and the like)
 SCALP_ENTRY_MIN = (2, 5, 10)         # minutes after the contract opens
-SCALP_STOPS = (None, 0.25, 0.50)     # sell if the price falls this fraction below what was paid; None = hold to the end
-SCALP_TARGET = 0.10                  # take profit at +10%
+SCALP_STOPS = (None, 0.25, 0.50)     # sell if the price falls this fraction below what was paid; None = no stop
+SCALP_TARGETS = (0.05, 0.10, 0.20, 0.35, 0.60, None)   # take profit at +x%; None = hold to the end
 SCALP_BUCKETS = ((0.05, 0.20, "5-19c"), (0.20, 0.40, "20-39c"), (0.40, 0.60, "40-59c"), (0.60, 0.80, "60-79c"), (0.80, 0.9001, "80-90c"))
 SCALP_MAKER_WAIT = 120               # seconds a resting buy order waits before giving up
+SCALP_MOVE = 0.05                    # "rising"/"falling": the side has moved this much since the contract's first trade
+SCALP_MIN_N = 150                    # a combination needs this many trades in EACH half before it is ranked
 
 
-def _scalp_one(tr, i0, t_entry, side, p0, res_yes, taker_rate, maker_rate):
-    """One entry (one side of one contract at one moment), every variant in a single pass over the later prints.
-    tr: [(ts, yes_price, taker_bought_yes)], i0: first print after the entry moment. Returns {(exec, stop): outcome}.
-    Prices are per contract in dollars. Deliberately conservative: a taker pays 1c over the last print and sells 1c
-    under the print that triggers a stop; a +10% target counts only once a print is 1c THROUGH it (taker exit) or a
-    buyer lifts it / trades through it (resting exit)."""
+def _tname(g):
+    return "hold" if g is None else f"+{int(round(g * 100))}%"
+
+
+def _sname(st):
+    return "none" if st is None else f"-{int(round(st * 100))}%"
+
+
+class _Acc:
+    """Mean return with a standard error that treats contracts ending at the same moment as one cluster, in O(1) memory.
+    Entries must arrive grouped by cluster (the replay walks contracts in closing order)."""
+    __slots__ = ("n", "s", "cost", "wins", "unf", "k", "ss", "sn", "nn", "cg", "cs", "cn")
+
+    def __init__(self):
+        self.n = self.s = self.cost = self.wins = self.unf = self.k = self.ss = self.sn = self.nn = self.cs = self.cn = 0
+        self.cg = None
+
+    def _fold(self):
+        if self.cn:
+            self.k += 1
+            self.ss += self.cs * self.cs
+            self.sn += self.cs * self.cn
+            self.nn += self.cn * self.cn
+        self.cs = self.cn = 0
+
+    def add(self, grp, ret, cost):
+        if grp != self.cg:
+            self._fold()
+            self.cg = grp
+        self.cs += ret
+        self.cn += 1
+        self.n += 1
+        self.s += ret
+        self.cost += cost
+        self.wins += 1 if ret > 0 else 0
+
+    def out(self):
+        self._fold()
+        self.cg = None
+        if not self.n:
+            return {"entries": 0, "unfilled": self.unf, "win_pct": None, "ret_c": None, "t": None, "on_stake_pct": None, "events": 0, "avg_cost_c": None}
+        mean = self.s / self.n
+        var = self.ss - 2 * mean * self.sn + mean * mean * self.nn
+        se = math.sqrt(max(var, 0) * (self.k / (self.k - 1))) / self.n if self.k > 1 else None
+        return {"entries": self.n, "unfilled": self.unf, "win_pct": round(100 * self.wins / self.n, 1), "ret_c": round(100 * mean, 3),
+                "t": round(mean / se, 2) if se else None, "on_stake_pct": round(100 * self.s / self.cost, 2) if self.cost else None,
+                "events": self.k, "avg_cost_c": round(100 * self.cost / self.n, 1),
+                "filled_pct": round(100 * self.n / (self.n + self.unf), 1)}
+
+
+def _scalp_paths(tr, i0, t_entry, side, p0, res_yes, taker_rate, maker_rate):
+    """One entry (one side of one contract at one moment): the outcome of EVERY target x stop combination, for tap
+    orders and for resting orders, in two passes over the later prints.
+    tr: [(ts, yes_price, taker_bought_yes)], i0: first print after the entry moment.
+    Returns {exec: None (resting buy never filled) | {(target, stop): (return, cost)}}.
+    Deliberately conservative: a taker pays 1c over the last print and sells 1c under the print that triggers a stop;
+    a target counts for a taker only once a print is 1c THROUGH it, for a resting sell once a buyer lifts it or the
+    price trades through it."""
     win = 1.0 if (side == "yes") == res_yes else 0.0
+    yes = side == "yes"
     fee = lambda rate, px: rate * px * (1 - px)
-    out, live = {}, []
+    res = {}
     for ex in ("taker", "maker"):
         cost = round(p0 + 0.01, 4) if ex == "taker" else round(p0 - 0.01, 4)
         if cost <= 0.0 or cost >= 0.99:
             continue
-        for stop in SCALP_STOPS:
-            live.append({"ex": ex, "stop": stop, "cost": cost, "in": ex == "taker", "target": math.ceil(cost * (1 + SCALP_TARGET) * 100 - 1e-9) / 100,
-                         "fees": fee(taker_rate, cost) if ex == "taker" else 0.0})
-    for j in range(i0, len(tr)):
-        if not live:
-            break
-        ts, yp, tby = tr[j]
-        px = yp if side == "yes" else 1 - yp
-        taker_bought_side = tby == (side == "yes")
-        for v in list(live):
-            if not v["in"]:                                   # resting buy 1c under the last print
+        j = i0
+        if ex == "maker":                                    # resting buy 1c under the last print
+            filled = False
+            while j < len(tr):
+                ts, yp, tby = tr[j]
                 if ts - t_entry > SCALP_MAKER_WAIT:
-                    out[(v["ex"], v["stop"])] = {"how": "unfilled"}
-                    live.remove(v)
-                elif px < v["cost"] - 1e-9 or (abs(px - v["cost"]) < 1e-9 and not taker_bought_side):
-                    v["in"] = True
-                    v["fees"] = fee(maker_rate, v["cost"])
+                    break
+                px = yp if yes else 1 - yp
+                j += 1
+                if px < cost - 1e-9 or (abs(px - cost) < 1e-9 and tby != yes):
+                    filled = True
+                    break
+            if not filled:
+                res[ex] = None
                 continue
-            if v["ex"] == "taker":
-                hit = px >= v["target"] + 0.01 - 1e-9
+        f_in = fee(taker_rate if ex == "taker" else maker_rate, cost)
+        tg = sorted((math.ceil(cost * (1 + g) * 100 - 1e-9) / 100, g) for g in SCALP_TARGETS if g is not None)
+        tg = [(T, g) for T, g in tg if T < 1.0]
+        sp = sorted(((cost * (1 - st), st) for st in SCALP_STOPS if st is not None), reverse=True)
+        t_hit, s_hit = {}, {}
+        ti = si = 0
+        for k in range(j, len(tr)):
+            if ti >= len(tg) and si >= len(sp):
+                break
+            ts, yp, tby = tr[k]
+            px = yp if yes else 1 - yp
+            if ex == "taker":
+                eff = px - 0.01
             else:
-                hit = px > v["target"] + 1e-9 or (abs(px - v["target"]) < 1e-9 and taker_bought_side)
-            if hit and v["target"] < 1.0:
-                f2 = fee(taker_rate if v["ex"] == "taker" else maker_rate, v["target"])
-                out[(v["ex"], v["stop"])] = {"how": "target", "ret": v["target"] - v["cost"] - v["fees"] - f2, "cost": v["cost"]}
-                live.remove(v)
-            elif v["stop"] is not None and px <= v["cost"] * (1 - v["stop"]) + 1e-9:
-                sell = max(0.01, px - 0.01)
-                out[(v["ex"], v["stop"])] = {"how": "stop", "ret": sell - v["cost"] - v["fees"] - fee(taker_rate, sell), "cost": v["cost"]}
-                live.remove(v)
-    for v in live:
-        if not v["in"]:
-            out[(v["ex"], v["stop"])] = {"how": "unfilled"}
-        else:
-            out[(v["ex"], v["stop"])] = {"how": "held, won" if win else "held, lost", "ret": win - v["cost"] - v["fees"], "cost": v["cost"]}
-    return out
+                eff = px if tby == yes else px - 0.0001      # at the limit price it fills only when a buyer lifts it
+            while ti < len(tg) and eff >= tg[ti][0] - 1e-9:
+                t_hit[tg[ti][1]] = (k, tg[ti][0])
+                ti += 1
+            while si < len(sp) and px <= sp[si][0] + 1e-9:
+                s_hit[sp[si][1]] = (k, max(0.01, px - 0.01))
+                si += 1
+        out = {}
+        for g in SCALP_TARGETS:
+            for st in SCALP_STOPS:
+                th, sh = t_hit.get(g), s_hit.get(st)
+                if th and (not sh or th[0] < sh[0]):
+                    r = th[1] - cost - f_in - fee(taker_rate if ex == "taker" else maker_rate, th[1])
+                elif sh:
+                    r = sh[1] - cost - f_in - fee(taker_rate, sh[1])
+                else:
+                    r = win - cost - f_in
+                out[(g, st)] = (r, cost)
+        res[ex] = out
+    return res
+
+
+def _compress(rows):
+    """Consecutive prints at the same price from the same side carry no extra information for this replay."""
+    tr, last = [], None
+    for r in rows:
+        yp = r["yp"]
+        if yp is None or not 0 < yp < 1:
+            continue
+        tby = (r["tos"] == "yes") if r["tos"] in ("yes", "no") else (r["tbs"] == "bid")
+        if last != (yp, tby):
+            tr.append((r["ts"], yp, tby))
+            last = (yp, tby)
+    return tr
 
 
 def scalp(conn, flt: dict | None = None) -> dict:
-    """Short contracts replayed trade by trade: buy a side a few minutes in, sell at +10%, with and without a stop."""
+    """Short contracts replayed trade by trade over a grid: when to buy, which price, rising or falling, which profit
+    target, which stop, tap or resting orders. Winners are picked on the first half of the dates and checked on the second."""
     import bisect
     flt = flt or {}
     w, args = _where(flt)
     mk = conn.execute(f"""SELECT m.ticker, m.series_ticker ser, m.open_ts o, m.close_ts c, m.result res, s.fee_type ft, COALESCE(s.fee_multiplier, 1) mult
                           FROM wh_markets m LEFT JOIN wh_series s ON s.series_ticker = m.series_ticker
-                          WHERE {w} AND m.complete = 1 AND m.close_ts - m.open_ts BETWEEN 240 AND 1500""", args).fetchall()
+                          WHERE {w} AND m.complete = 1 AND m.close_ts - m.open_ts BETWEEN 240 AND 1500 ORDER BY m.close_ts""", args).fetchall()
     cut = conn.execute(f"SELECT COUNT(*) n FROM wh_markets m WHERE {w} AND m.complete = 2 AND m.close_ts - m.open_ts BETWEEN 240 AND 1500", args).fetchone()["n"]
     if not mk:
         return {"markets": 0, "note": "no settled short contracts (4 to 25 minutes long) with stored trades in scope", "skipped_too_busy": cut}
-    cells, ser_cells, mix = {}, {}, {}
+    mid = mk[len(mk) // 2]["c"]                                # half the contracts end before this moment
+    grid, marg = {}, {}
     used = 0
-
-    def add(store, key, grp, o):
-        c = store.setdefault(key, {"g": {}, "n": 0, "wins": 0, "unfilled": 0, "cost": 0.0})
-        if o["how"] == "unfilled":
-            c["unfilled"] += 1
-            return
-        g = c["g"].setdefault(grp, [0.0, 0.0])
-        g[0] += 1
-        g[1] += o["ret"]
-        c["n"] += 1
-        c["wins"] += 1 if o["ret"] > 0 else 0
-        c["cost"] += o["cost"]
     for m in mk:
         rows = conn.execute("SELECT ts, yes_price yp, taker_outcome_side tos, taker_book_side tbs FROM wh_trades WHERE ticker=? AND ts<=? ORDER BY ts", (m["ticker"], m["c"])).fetchall()
-        tr = [(r["ts"], r["yp"], (r["tos"] == "yes") if r["tos"] in ("yes", "no") else (r["tbs"] == "bid")) for r in rows if r["yp"] is not None and 0 < r["yp"] < 1]
-        if len(tr) < 5:
+        if len(rows) < 5:
+            continue
+        tr = _compress(rows)
+        if not tr:
             continue
         used += 1
         tss = [t[0] for t in tr]
         mrate = {"quadratic_with_maker_fees": 0.0175, "quadratic_with_combo_maker_fees": 0.035}.get(m["ft"], 0.0) * m["mult"]
         trate = TAKER * m["mult"]
+        half = 0 if m["c"] < mid else 1
+        grp = int(m["c"])
+        yref = tr[0][1]
         for em in SCALP_ENTRY_MIN:
             t0 = m["o"] + em * 60
             if t0 >= m["c"] - 60:
@@ -387,33 +464,61 @@ def scalp(conn, flt: dict | None = None) -> dict:
                 b = next((lab for lo, hi, lab in SCALP_BUCKETS if lo <= p0 < hi), None)
                 if not b:
                     continue
-                for (ex, stop), o in _scalp_one(tr, i0, t0, side, p0, m["res"] == "yes", trate, mrate).items():
-                    sk = "none" if stop is None else f"-{int(stop * 100)}%"
-                    grp = int(m["c"])                          # contracts that end at the same moment are one cluster
-                    add(cells, (ex, sk, em, b), grp, o)
-                    add(cells, (ex, sk, "all", "all"), grp, o)
-                    add(ser_cells, (m["ser"], ex, sk), grp, o)
-                    if o["how"] != "unfilled":
-                        mx = mix.setdefault((ex, sk), {})
-                        mx[o["how"]] = mx.get(o["how"], 0) + 1
+                mv = (yp0 - yref) if side == "yes" else (yref - yp0)
+                sig = "rising" if mv >= SCALP_MOVE - 1e-9 else "falling" if mv <= -SCALP_MOVE + 1e-9 else "flat"
+                for ex, outs in _scalp_paths(tr, i0, t0, side, p0, m["res"] == "yes", trate, mrate).items():
+                    if outs is None:
+                        for key in (("exit", ex, "hold", "none"), ("series", m["ser"], ex, "hold")):
+                            marg.setdefault(key, [_Acc(), _Acc(), _Acc()])[2].unf += 1
+                        continue
+                    for (g, st), (r, cost) in outs.items():
+                        tn, sn = _tname(g), _sname(st)
+                        c = grid.get((ex, em, b, sig, tn, sn))
+                        if c is None:
+                            c = grid[(ex, em, b, sig, tn, sn)] = [_Acc(), _Acc()]
+                        c[half].add(grp, r, cost)
+                        keys = [("exit", ex, tn, sn)]
+                        if st is None:
+                            keys += [("signal", ex, sig, tn), ("price", ex, b, tn), ("minute", ex, em, tn), ("series", m["ser"], ex, tn)]
+                        for key in keys:
+                            a3 = marg.get(key)
+                            if a3 is None:
+                                a3 = marg[key] = [_Acc(), _Acc(), _Acc()]
+                            a3[half].add(grp, r, cost)
+                            a3[2].add(grp, r, cost)
 
-    def row(c):
-        st = _stat(c["g"])
-        tot = c["n"] + c["unfilled"]
-        return {"entries": c["n"], "win_pct": round(100 * c["wins"] / c["n"], 1) if c["n"] else None,
-                "avg_cost_c": round(100 * c["cost"] / c["n"], 1) if c["n"] else None,
-                "ret_pct_of_stake": round(100 * sum(g[1] for g in c["g"].values()) / c["cost"], 2) if c["cost"] else None,
-                "filled_pct": round(100 * c["n"] / tot, 1) if tot else None, "stat": st}
-    order = {lab: i for i, (_, _, lab) in enumerate(SCALP_BUCKETS)}
-    table = [{"exec": k[0], "stop": k[1], "entry_min": k[2], "bucket": k[3], **row(c)} for k, c in cells.items() if k[2] != "all"]
-    table.sort(key=lambda x: (x["exec"] != "taker", x["stop"], x["entry_min"], order[x["bucket"]]))
-    overall = [{"exec": k[0], "stop": k[1], **row(c), "ends": mix.get((k[0], k[1]), {})} for k, c in cells.items() if k[2] == "all"]
-    overall.sort(key=lambda x: (x["exec"] != "taker", x["stop"]))
-    by_series = [{"series": k[0], "exec": k[1], "stop": k[2], **row(c)} for k, c in ser_cells.items()]
-    by_series.sort(key=lambda x: (x["series"], x["exec"] != "taker", x["stop"]))
-    return {"markets": used, "skipped_too_busy": cut, "from": min(m["c"] for m in mk), "to": max(m["c"] for m in mk),
-            "target_pct": int(SCALP_TARGET * 100), "entry_minutes": list(SCALP_ENTRY_MIN), "maker_wait_sec": SCALP_MAKER_WAIT,
-            "overall": overall, "table": table, "by_series": by_series}
+    def tab(kind, names):
+        out = []
+        for key, a3 in marg.items():
+            if key[0] != kind:
+                continue
+            out.append({**dict(zip(names, key[1:])), "all": a3[2].out(), "first_half": a3[0].out(), "second_half": a3[1].out()})
+        return out
+    order_t = {_tname(g): i for i, g in enumerate(SCALP_TARGETS)}
+    order_s = {_sname(x): i for i, x in enumerate(SCALP_STOPS)}
+    order_b = {lab: i for i, (_, _, lab) in enumerate(SCALP_BUCKETS)}
+    exits = sorted(tab("exit", ("exec", "target", "stop")), key=lambda x: (x["exec"] != "taker", order_t[x["target"]], order_s[x["stop"]]))
+    signals = sorted(tab("signal", ("exec", "signal", "target")), key=lambda x: (x["exec"] != "taker", x["signal"], order_t[x["target"]]))
+    prices = sorted(tab("price", ("exec", "bucket", "target")), key=lambda x: (x["exec"] != "taker", order_b[x["bucket"]], order_t[x["target"]]))
+    minutes = sorted(tab("minute", ("exec", "entry_min", "target")), key=lambda x: (x["exec"] != "taker", x["entry_min"], order_t[x["target"]]))
+    series = sorted(tab("series", ("series", "exec", "target")), key=lambda x: (x["series"], x["exec"] != "taker", order_t[x["target"]]))
+    # the search: rank on the first half only, then look at the second half
+    cells = []
+    for key, (h1, h2) in grid.items():
+        a, b2 = h1.out(), h2.out()
+        if a["entries"] >= SCALP_MIN_N and b2["entries"] >= SCALP_MIN_N:
+            cells.append({"exec": key[0], "entry_min": key[1], "bucket": key[2], "signal": key[3], "target": key[4], "stop": key[5], "first_half": a, "second_half": b2})
+    pos1 = [c for c in cells if c["first_half"]["ret_c"] > 0]
+    held = [c for c in pos1 if c["second_half"]["ret_c"] > 0]
+    strong = [c for c in pos1 if (c["first_half"]["t"] or 0) >= 2]
+    strong_held = [c for c in strong if c["second_half"]["ret_c"] > 0 and (c["second_half"]["t"] or 0) >= 2]
+    top = sorted(cells, key=lambda c: -(c["first_half"]["on_stake_pct"] or -1e9))[:25]
+    return {"markets": used, "skipped_too_busy": cut, "from": mk[0]["c"], "to": mk[-1]["c"], "split_at": mid,
+            "entry_minutes": list(SCALP_ENTRY_MIN), "maker_wait_sec": SCALP_MAKER_WAIT, "move_c": int(SCALP_MOVE * 100), "min_n": SCALP_MIN_N,
+            "exits": exits, "signals": signals, "prices": prices, "minutes": minutes, "by_series": series,
+            "search": {"combinations_tested": len(cells), "positive_first_half": len(pos1), "of_those_positive_second_half": len(held),
+                       "strong_first_half": len(strong), "of_those_strong_second_half": len(strong_held),
+                       "top_by_first_half": top, "confirmed": sorted(strong_held, key=lambda c: -(c["second_half"]["on_stake_pct"] or 0))[:25]}}
 
 
 RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp}

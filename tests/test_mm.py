@@ -491,6 +491,16 @@ def trading_first_tests():
 
 
 def onesided_tests():
+    # valuation when a market has closed but not settled (no quote): pairs are worth $1, the rest keeps its last price
+    v = mm.SimQuoter(INFO, P, "touch")
+    v.s.update(pos_yes=90, pos_no=90, cost=89.6)
+    check("valuation: 90 YES + 90 NO are worth $90 with no quote at all (not $0)", abs(v.value(None) - 90) < 1e-9, v.value(None))
+    v.s.update(pos_yes=0, pos_no=30, cost=21.7)
+    check("valuation: an unhedged position with no quote and no earlier price is carried at cost, not at $0", abs(v.value(None) - 21.7) < 1e-9, v.value(None))
+    check("valuation: with a quote it is priced as before", abs(v.value(0.25) - 22.5) < 1e-9)
+    check("valuation: once the quote disappears the last price seen is kept", abs(v.value(None) - 22.5) < 1e-9, v.value(None))
+    v.s["settled"] = "yes"
+    check("valuation: settlement still decides in the end", v.value(None) == 0)
     # book: YES bid 40c, NO bid 58c -> NO is the favorite side
     a = mm.SimQuoter(INFO, {**P, "min_quote_price": 0.55}, "touch")
     a.requote(1000, MK, YES, NO)

@@ -94,32 +94,57 @@ def scalp_tests(tmp):
     conn.row_factory = __import__("sqlite3").Row
     r = ST.scalp(conn, {"series": ["Q"]})
     check("scalp: only the settled short contracts with full trade lists are replayed", r["markets"] == 2 and r["skipped_too_busy"] == 1, (r.get("markets"), r.get("skipped_too_busy")))
-    tb = {(x["exec"], x["stop"], x["entry_min"], x["bucket"]): x for x in r["table"]}
     fee = lambda p: 0.07 * p * (1 - p)
-    # taker, no stop, entry at 2 min, 40-59c bucket: 4 entries (YES and NO of M1 and M2).
-    #  M1 YES: pay 51c, target 57c (51 x 1.1 = 56.1 -> 57c), needs a 58c print: reached at 600s (80c) -> +6c - fees
-    #  M1 NO : pay 51c (NO at 50c), NO falls, held, lost: -51c - fee
-    #  M2 YES: pay 51c, never up, held, lost.   M2 NO: pay 51c, NO rises to 60c at 200s -> target 57c hit -> +6c - fees
-    a = tb[("taker", "none", 2, "40-59c")]
+    import bisect
+
+    def paths(ticker, side):
+        m = conn.execute("SELECT open_ts o, result res FROM wh_markets WHERE ticker=?", (ticker,)).fetchone()
+        rows = conn.execute("SELECT ts, yes_price yp, taker_outcome_side tos, taker_book_side tbs FROM wh_trades WHERE ticker=? ORDER BY ts", (ticker,)).fetchall()
+        tr = ST._compress(rows)
+        t0 = m["o"] + 120
+        i0 = bisect.bisect_right([t[0] for t in tr], t0)
+        yp0 = tr[i0 - 1][1]
+        return ST._scalp_paths(tr, i0, t0, side, yp0 if side == "yes" else round(1 - yp0, 4), m["res"] == "yes", 0.07, 0.0)
+    # entry at 2 minutes, last print 50c.  Tap orders pay 51c.
+    #  M1 YES: +10% target is 57c (51 x 1.1 = 56.1 -> 57c), needs a 58c print: the 80c print at 600s -> +6c less two fees
+    #  M1 NO : NO only falls: held, lost 51c and the fee.   M2 YES: same.   M2 NO: NO is 60c at 200s -> target hit
     win = 0.57 - 0.51 - fee(0.51) - fee(0.57)
     lose = -0.51 - fee(0.51)
-    check("scalp taker, no stop: 2 of 4 reach +10% (after paying the spread), 2 lose the whole stake", a["entries"] == 4 and a["win_pct"] == 50.0
-          and close(a["stat"]["ret_c"], 100 * (2 * win + 2 * lose) / 4, 0.002), a)
-    # with a 25% stop: the losers sell when the side's price is at or under 38.25c: M1 NO at 600s (NO = 20c -> sells at 19c), M2 YES at 300s (30c -> 29c)
-    b = tb[("taker", "-25%", 2, "40-59c")]
-    l1 = 0.19 - 0.51 - fee(0.51) - fee(0.19)
-    l2 = 0.29 - 0.51 - fee(0.51) - fee(0.29)
-    check("scalp taker, 25% stop: losers are sold 1c under the print that triggers the stop", close(b["stat"]["ret_c"], 100 * (2 * win + l1 + l2) / 4, 0.002), b)
-    # resting orders: buy limit 49c. M1 YES fills at 130s (49c, a seller hit it); target 54c (49 x 1.1 = 53.9): the 54c print at 200s was a buyer -> sold at 54c, no fees
-    #  M1 NO: NO limit 49c needs NO <= 49c with a seller of NO (= a YES buyer at >= 51c): 200s (YES 54c -> NO 46c, below the limit) -> filled, then NO falls, lost 49c
-    #  M2 YES: YES falls through 49c at 200s (40c) -> filled, lost 49c.   M2 NO: NO never trades at or under 49c within 2 minutes after 120s? 200s is 80s later: NO = 60c -> not filled
-    m_ = tb[("maker", "none", 2, "40-59c")]
-    check("scalp resting orders: no fee, one of four never fills, the fills are the ones the price moved against",
-          m_["entries"] == 3 and m_["filled_pct"] == 75.0 and close(m_["stat"]["ret_c"], 100 * ((0.54 - 0.49) + 2 * (-0.49)) / 3, 0.002), m_)
-    ov = {(x["exec"], x["stop"]): x for x in r["overall"]}
-    check("scalp: how each trade ended is counted", ov[("taker", "none")]["ends"].get("target", 0) >= 2 and "held, lost" in ov[("taker", "none")]["ends"], ov[("taker", "none")]["ends"])
-    check("scalp: nothing above 90c is entered (a +10% target would be over $1)", not any(x["bucket"] not in ("5-19c", "20-39c", "40-59c", "60-79c", "80-90c") for x in r["table"]))
+    a1, a2, a3, a4 = paths("Q-1", "yes")["taker"], paths("Q-1", "no")["taker"], paths("Q-2", "yes")["taker"], paths("Q-2", "no")["taker"]
+    check("scalp tap orders, +10%, no stop: reaches the target only after paying the spread; the others lose the whole stake",
+          close(a1[(0.10, None)][0], win) and close(a2[(0.10, None)][0], lose) and close(a3[(0.10, None)][0], lose) and close(a4[(0.10, None)][0], win), (a1[(0.10, None)], a2[(0.10, None)]))
+    # 25% stop: sell when the side is at or under 38.25c: M1 NO at 600s (NO = 20c -> sold at 19c), M2 YES at 300s (30c -> sold at 29c)
+    check("scalp tap orders, 25% stop: losers are sold 1c under the print that triggers the stop",
+          close(a2[(0.10, 0.25)][0], 0.19 - 0.51 - fee(0.51) - fee(0.19)) and close(a3[(0.10, 0.25)][0], 0.29 - 0.51 - fee(0.51) - fee(0.29)) and close(a1[(0.10, 0.25)][0], win), a2[(0.10, 0.25)])
+    # other targets on M1 YES (cost 51c): +5% = 54c needs 55c -> the 57c print at 240s; +60% = 82c needs 83c -> the 95c print; hold = settles YES at $1
+    check("scalp: each profit target is its own exit; holding pays the settlement and one fee",
+          close(a1[(0.05, None)][0], 0.54 - 0.51 - fee(0.51) - fee(0.54)) and close(a1[(0.60, None)][0], 0.82 - 0.51 - fee(0.51) - fee(0.82))
+          and close(a1[(None, None)][0], 1 - 0.51 - fee(0.51)) and close(a3[(None, None)][0], lose), {k: round(v[0], 4) for k, v in a1.items() if k[1] is None})
+    # a stop that triggers BEFORE a far target is reached wins the race: M2 NO with +60% (cost 51c -> 82c needs 83c: NO is 90c at 500s) vs none -> target at 500s
+    check("scalp: target and stop race by time", close(a4[(0.60, 0.25)][0], 0.82 - 0.51 - fee(0.51) - fee(0.82)) and close(a3[(0.60, 0.50)][0], 0.09 - 0.51 - fee(0.51) - fee(0.09)), (a4[(0.60, 0.25)], a3[(0.60, 0.50)]))
+    # resting orders: buy limit 49c.  M1 YES fills at 130s (49c print, a seller); +10% target 54c: the 54c print at 200s was a buyer -> sold at 54c, no fees
+    #  M1 NO: fills at 200s (NO 46c, through the limit), then falls: lost 49c.  M2 YES: fills at 200s (40c), lost 49c.
+    #  M2 NO: never trades at or under 49c inside 2 minutes -> never filled
+    m1, m2, m3, m4 = paths("Q-1", "yes")["maker"], paths("Q-1", "no")["maker"], paths("Q-2", "yes")["maker"], paths("Q-2", "no")["maker"]
+    check("scalp resting orders: no fee, one of four never fills, and the fills are the ones the price moved against",
+          close(m1[(0.10, None)][0], 0.05) and close(m2[(0.10, None)][0], -0.49) and close(m3[(0.10, None)][0], -0.49) and m4 is None, (m1[(0.10, None)], m4))
+    ex = {(x["exec"], x["target"], x["stop"]): x for x in r["exits"]}
+    check("scalp: the exits table covers every target x stop for both order types (2 x 6 x 3)", len(ex) == 36 and ex[("taker", "+10%", "none")]["all"]["entries"] > 0
+          and ex[("maker", "hold", "none")]["all"]["unfilled"] > 0, len(ex))
+    check("scalp: first and second half are reported separately (winners are picked on one, checked on the other)",
+          ex[("taker", "hold", "none")]["first_half"]["entries"] + ex[("taker", "hold", "none")]["second_half"]["entries"] == ex[("taker", "hold", "none")]["all"]["entries"]
+          and r["search"]["combinations_tested"] == 0 and r["min_n"] == 150, r["search"])
+    check("scalp: tables by signal, price, minute and series are present", all(r[k] for k in ("signals", "prices", "minutes", "by_series")) and {x["signal"] for x in r["signals"]} <= {"rising", "falling", "flat"})
+    check("scalp: nothing above 90c is entered", not any(x["bucket"] not in ("5-19c", "20-39c", "40-59c", "60-79c", "80-90c") for x in r["prices"]))
     check("scalp: no short contracts in scope -> a note, not an error", ST.scalp(conn, {"series": ["NOPE"]})["markets"] == 0)
+    # the clustered statistic: 3 clusters with returns (1,1), (0,), (-1,-1,-1) -> mean -1/6
+    acc = ST._Acc()
+    for g_, r_ in ((1, 1), (1, 1), (2, 0), (3, -1), (3, -1), (3, -1)):
+        acc.add(g_, r_, 0.5)
+    o = acc.out()
+    mean = -1 / 6
+    se = (((2 - 2 * mean) ** 2 + (0 - mean) ** 2 + (-3 - 3 * mean) ** 2) * 3 / 2) ** 0.5 / 6
+    check("scalp: standard error clusters contracts that end together", o["entries"] == 6 and o["events"] == 3 and close(o["ret_c"], 100 * mean, 0.001) and close(o["t"], round(mean / se, 2), 0.011), o)
     conn.close()
 
 

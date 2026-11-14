@@ -753,9 +753,15 @@ class SimQuoter:
             return s["pos_yes"]
         if s["settled"] == "no":
             return s["pos_no"]
-        if mid is None:
-            return 0.0
-        return s["pos_yes"] * mid + s["pos_no"] * (1 - mid)
+        pairs = min(s["pos_yes"], s["pos_no"])          # a YES and a NO together pay $1 however the market settles
+        net_yes, net_no = s["pos_yes"] - pairs, s["pos_no"] - pairs
+        if mid is None:                                 # closed and not settled yet: no quote. Keep the last price seen
+            mid = s.get("last_mid")                      # rather than calling the position worthless.
+            if mid is None:
+                return pairs + (s["cost"] - pairs if (net_yes or net_no) and s["cost"] > pairs else 0.0)
+        else:
+            s["last_mid"] = mid
+        return pairs + net_yes * mid + net_no * (1 - mid)
 
 
 PRESETS = [
