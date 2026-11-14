@@ -43,6 +43,7 @@ class Quoter:
         self.quotes: dict[str, dict[str, dict]] = {}   # ticker -> side('yes'/'no') -> {oid, price, exp, client}
         self.selected: list[dict] = []                  # [{ticker, daily_reward, title}]
         self.programs_ts = 0
+        self.unfunded: dict[str, float] = {}             # ticker -> skip until (its exchange index holds none of the balance)
         self.last_mid: dict[str, Decimal] = {}
         self.cooldown: dict[str, float] = {}
         self.events = collections.deque(maxlen=300)
@@ -231,6 +232,8 @@ class Quoter:
                 info["all_markets"] = xinfo
             except Exception as e:
                 self.log("error", f"all-markets screen failed (using reward markets only): {e}")
+        now_ = time.time()
+        rows = [r for r in rows if self.unfunded.get(r["ticker"], 0) < now_]      # markets Kalshi would not let this account trade
         if trading_first:
             picked = mm.pick_trading_first(rows, size, int(c["max_markets"]), float(c["max_capital"]),
                                            float(c.get("min_spread") or 0.02), float(c.get("max_volume_24h") or 0),
@@ -431,6 +434,14 @@ class Quoter:
                     self.log("blocked", f"{t} {intent} @{px}: {e}")
                 except KalshiError as e:
                     self.log("rejected", f"{t} {intent} @{px}: {e}")
+                    if "insufficient_shard_balance" in str(e):
+                        # The market trades on an exchange index where this account holds nothing. Retrying every
+                        # cycle would never work: leave it alone for a day and pick another market now.
+                        self.unfunded[t] = time.time() + 86400
+                        self.selected = [x for x in self.selected if x["ticker"] != t]
+                        self.programs_ts = 1
+                        self.log("skip", f"{t}: not tradable from this account's funded exchange index - skipped for 24h, picking another market")
+                        break
         self._update_state(client, committed)
 
     def _update_state(self, client, committed=Decimal(0)):

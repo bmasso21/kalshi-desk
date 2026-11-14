@@ -220,6 +220,24 @@ def run(keytype: str):
     n_orders = len(mock.state.S["orders"])
     q.cycle()
     check("unchanged book -> no requote churn", len(mock.state.S["orders"]) == n_orders)
+    # a market on an exchange index the account has no money on: Kalshi rejects the order; the quoter must not retry it all day
+    from app.kalshi_client import KalshiError as _KE
+    real_place, real_quotes, real_sel = eng.place, dict(q.quotes), list(q.selected)
+    q.quotes.clear()
+
+    def _reject(**kw):
+        raise _KE(404, {"error": {"code": "insufficient_shard_balance", "message": "insufficient shard balance"}})
+    eng.place = _reject
+    q.cycle()
+    eng.place = real_place
+    check("quoter: a market it cannot fund is dropped and skipped for a day (no endless retries)",
+          "KXA-1" in q.unfunded and q.unfunded["KXA-1"] > time.time() + 80000 and not q.selected and q.programs_ts == 1
+          and any(e_["kind"] == "skip" for e_ in q.events), (q.unfunded, [e_["kind"] for e_ in list(q.events)[-4:]]))
+    check("quoter: the skipped market is left out of the next pick", "KXA-1" not in [x["ticker"] for x in q.select(eng.client)[0]])
+    q.unfunded.clear()
+    q.quotes.update(real_quotes)
+    q.selected = real_sel
+    q.programs_ts = time.time()
     r_ = c.post("/api/config", headers=H, json={"quoter": {"offset_ticks": 1, "max_move": 0.03}})
     check("quoter options saved (1c behind, calm markets)", r_.status_code == 200 and cfg.quoter["offset_ticks"] == 1 and cfg.quoter["max_move"] == 0.03, r_.text)
     q.cycle()
