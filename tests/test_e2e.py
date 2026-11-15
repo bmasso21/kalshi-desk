@@ -392,6 +392,33 @@ def run(keytype: str):
     r = c.post("/api/order", headers=H, json={"ticker": "KXB-1", "intent": "buy_yes", "price": "0.57", "count": 1, "confirm_token": t})
     check("prod order after confirm", r.status_code == 200, r.text)
     cfg.update({"env": "demo"})
+    eng.connect()
+    # the quoter and auto-trading are per environment: production always starts with both OFF, demo gets its own state back
+    keep = (cfg.quoter.get("enabled"), cfg.auto.get("enabled"), cfg.risk.get("kill_switch"))
+    cfg.update({"quoter": {"enabled": True}, "auto": {"enabled": True}, "risk": {"kill_switch": False}})
+    n_orders_before = len(mock.state.S["orders"])
+    r = c.post("/api/config", headers=H, json={"env": "prod", "quoter": {"enabled": True}, "auto": {"enabled": True}})
+    j_ = r.json()
+    check("switching to production turns the quoter and auto-trading OFF even if the request asks for them on",
+          r.status_code == 200 and cfg.env == "prod" and cfg.quoter["enabled"] is False and cfg.auto["enabled"] is False
+          and any("PRODUCTION" in n_ for n_ in j_["notices"]) and not eng.quoter.active() and eng.switching is False, (cfg.quoter["enabled"], cfg.auto["enabled"], j_.get("notices")))
+    eng.quoter.cycle()
+    check("on production the quoter places nothing until it is turned on there", len(mock.state.S["orders"]) == n_orders_before)
+    check("the switch is in the audit trail", any(a["kind"] == "env_switch" and "demo -> prod: quoter off, auto-trading off" in a["message"] for a in c.get("/api/ledger").json()["audit"]))
+    r = c.post("/api/config", headers=H, json={"env": "demo"})
+    check("back on demo, the quoter and auto-trading are as demo was left (on)", cfg.env == "demo" and cfg.quoter["enabled"] is True and cfg.auto["enabled"] is True, (cfg.quoter["enabled"], cfg.auto["enabled"]))
+    r = c.post("/api/config", headers=H, json={"env": "prod"})
+    r = c.post("/api/config", headers=H, json={"quoter": {"enabled": True}})
+    check("it can still be turned on in production, deliberately, as its own step", cfg.env == "prod" and cfg.quoter["enabled"] is True)
+    c.post("/api/config", headers=H, json={"env": "demo"})
+    c.post("/api/config", headers=H, json={"env": "prod"})
+    check("and that production choice is not remembered: the next switch to production starts off again", cfg.quoter["enabled"] is False)
+    c.post("/api/config", headers=H, json={"env": "demo"})
+    eng.switching = True
+    check("while the environment is changing the quoter is inactive and limits are not rescaled", not eng.quoter.active() and eng.scaler.apply(force=True) is None)
+    eng.switching = False
+    eng.quoter.cancel_all("test")
+    cfg.update({"quoter": {"enabled": keep[0]}, "auto": {"enabled": keep[1]}, "risk": {"kill_switch": keep[2]}})
 
     # settlements + ledger
     st_ = c.get("/api/settlements").json()

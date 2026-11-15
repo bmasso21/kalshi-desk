@@ -501,13 +501,37 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         if "auto" in patch and "strategies" in patch["auto"]:
             patch["auto"]["strategies"] = [s for s in patch["auto"]["strategies"] if s not in NEVER_AUTO]
         old_env = cfg.env
-        if patch.get("env") and patch["env"] != old_env:
+        switching = bool(patch.get("env") and patch["env"] != old_env)
+        notices = []
+        if switching:
+            # While the environment changes, nothing may trade or rescale: for a moment the label says one environment
+            # and the connection is still the other. (On Nov 15 the quoter, enabled for demo, sent two real orders in
+            # the minute the desk was on production; Kalshi refused them only because the cash was short.)
+            eng.switching = True
             eng.quoter.cancel_all("environment switch")
             eng.quoter.selected, eng.quoter.programs_ts = [], 0     # re-pick markets for the new environment
-        cfg.update(patch)
-        post_update_rescale = want_rescale or (scaling_on and patch.get("env") and patch["env"] != old_env)
-        if any(k in patch for k in ("env", "base_url_override")) or any(k.endswith(("_key_id", "_key_path")) for k in patch):
-            eng.connect()
+            flags = dict(cfg.data.get("env_flags") or {})
+            flags[old_env] = {"quoter": bool(cfg.quoter.get("enabled")), "auto": bool(cfg.auto.get("enabled"))}
+            cfg.data["env_flags"] = flags
+            # The quoter and auto-trading are switched on per environment. Production ALWAYS starts with both off,
+            # whatever demo had and whatever this request says: they must be turned on there, on purpose, each time.
+            want = {"quoter": False, "auto": False} if patch["env"] == "prod" else (flags.get(patch["env"]) or {"quoter": False, "auto": False})
+            was = flags[old_env]
+            patch["quoter"] = {**(patch.get("quoter") if isinstance(patch.get("quoter"), dict) else {}), "enabled": want["quoter"]}
+            patch["auto"] = {**(patch.get("auto") if isinstance(patch.get("auto"), dict) else {}), "enabled": want["auto"]}
+            if patch["env"] == "prod" and (was["quoter"] or was["auto"]):
+                notices.append("Switched to PRODUCTION: the quoter and auto-trading were turned OFF. They never carry over from demo; turn them on here deliberately if you want them live.")
+            elif patch["env"] != "prod" and (want["quoter"] or want["auto"]):
+                notices.append("Back on demo: the quoter / auto-trading are restored to how demo was left.")
+        try:
+            cfg.update(patch)
+            post_update_rescale = want_rescale or (scaling_on and switching)
+            if any(k in patch for k in ("env", "base_url_override")) or any(k.endswith(("_key_id", "_key_path")) for k in patch):
+                eng.connect()
+        finally:
+            eng.switching = False
+        if switching:
+            db.audit("env_switch", f"{old_env} -> {cfg.env}: quoter {'on' if cfg.quoter.get('enabled') else 'off'}, auto-trading {'on' if cfg.auto.get('enabled') else 'off'}")
         safe = {k: v for k, v in patch.items() if "key" not in k}
         if isinstance(safe.get("sports"), dict):
             safe["sports"] = {k: v for k, v in safe["sports"].items() if k not in ("oddspapi_key", "theodds_key")}
@@ -523,6 +547,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             eng.trigger_scan()
         out = get_config()
         out["errors"] = errors
+        out["notices"] = notices
         out["authenticated"] = eng.client.authenticated
         if errors:
             return JSONResponse({**out, "error": " | ".join(errors)}, status_code=400)

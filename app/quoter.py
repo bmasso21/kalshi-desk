@@ -90,7 +90,8 @@ class Quoter:
 
     def active(self) -> bool:
         c = self.e.cfg
-        return bool(self.cfg.get("enabled")) and not c.risk.get("kill_switch") and self.e.client.authenticated
+        return (bool(self.cfg.get("enabled")) and not c.risk.get("kill_switch") and self.e.client.authenticated
+                and not getattr(self.e, "switching", False))
 
     def cancel_all(self, reason="stop"):
         with self._lock:

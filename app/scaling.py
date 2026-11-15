@@ -118,14 +118,20 @@ class Scaler:
         c = self.cfg
         if not c.get("enabled"):
             return None
+        if getattr(self.e, "switching", False):
+            return None                      # mid-switch the environment label and the connection can disagree
         today = risk.today_key()
         env = self.e.cfg.env
         if not force and c.get("base_day") == today and c.get("base_env") == env:
             return None
         if equity is None:
-            if not self.e.client or not self.e.client.authenticated:
+            client = self.e.client
+            if not client or not client.authenticated:
                 return None
-            equity = self.sim_equity(float(self.e.equity()))
+            real = float(self.e.equity())
+            if self.e.client is not client or self.e.cfg.env != env or getattr(self.e, "switching", False):
+                return None                  # the environment changed while the balance was being read: do not mix the two
+            equity = self.sim_equity(real)
         r = compute(equity, c.get("tiers") or DEFAULT_TIERS, c.get("caps"))
         patch = to_patch(r["limits"], int(c.get("max_markets_cap") or 5))
         patch["scaling"] = {"base": round(equity, 2), "base_day": today, "base_env": env, "base_ts": time.time(),

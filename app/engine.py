@@ -48,6 +48,7 @@ class Engine:
         from .exits import Exits
         self.exits = Exits(self)
         self.feed.listeners.append(self.quoter.on_feed)
+        self.switching = False               # True only while the environment is being changed (nothing trades or rescales)
 
     # ------------------------------------------------------------ connection --
     def connect(self):
@@ -405,6 +406,12 @@ class Engine:
         self._scan_now.set()
 
     def start(self):
+        try:                                 # limits left at $0 by a bad rescale (fixed in 3.14.2) are recomputed at start
+            sc = self.cfg.data.get("scaling") or {}
+            if sc.get("enabled") and float(((sc.get("limits") or {}).get("total")) or 0) <= 0 and self.client.authenticated:
+                self.scaler.apply(force=True)
+        except Exception as e:
+            self.db.audit("scaling_error", f"start-up rescale failed: {e}"[:300])
         threading.Thread(target=self.loop, daemon=True, name="scanner").start()
         if self.cfg.data.get("ws_enabled", True):
             self.feed.start()
