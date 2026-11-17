@@ -435,6 +435,12 @@ def main():
     r = c.post("/api/config", headers=HD, json={"warehouse": {"sample": {"overrides": {"Sports": {"max_trades_per_market": 100, "series_per_category": 1, "bogus": 5}}}}})
     check("sample overrides per category saved and validated", r.status_code == 200 and cfg.data["warehouse"]["sample"]["overrides"] == {"Sports": {"max_trades_per_market": 100, "series_per_category": 1}}
           and cfg.data["warehouse"]["sample"]["enabled"] is True, cfg.data["warehouse"]["sample"])
+    saved = dict(cfg.data["warehouse"]["sample"]["overrides"])
+    r = c.post("/api/config", headers=HD, json={"warehouse": {"sample": {"overrides": {**saved, "KXGOLDH": {"markets_per_series": 9000}, "KXBIG": {"markets_per_series": 99999}}}}})
+    ov = cfg.data["warehouse"]["sample"]["overrides"]
+    check("sample override: one series can be collected deep (hourly contracts list many strikes each hour), up to 12000 markets",
+          r.status_code == 200 and ov["KXGOLDH"] == {"markets_per_series": 9000} and ov["KXBIG"] == {"markets_per_series": 12000}, ov)
+    c.post("/api/config", headers=HD, json={"warehouse": {"sample": {"overrides": saved}}})
     st5 = wh.sync()
     check("sample override: the market cut at the old cap is refetched in full (complete = 1, all 3 trades)",
           q("SELECT complete FROM wh_markets WHERE ticker='KXNFL-26NOV09-GB'")[0]["complete"] == 1

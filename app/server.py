@@ -420,7 +420,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                             if not isinstance(ov, dict):
                                 continue
                             o2 = {}
-                            for k, lo, hi in (("series_per_category", 1, 200), ("markets_per_series", 1, 2000), ("days", 1, 365), ("max_trades_per_market", 100, 200000)):
+                            for k, lo, hi in (("series_per_category", 1, 200), ("markets_per_series", 1, 12000), ("days", 1, 365), ("max_trades_per_market", 100, 200000)):
                                 if k in ov:
                                     try:
                                         o2[k] = max(lo, min(hi, int(float(ov[k]))))
