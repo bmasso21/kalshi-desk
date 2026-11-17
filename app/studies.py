@@ -537,6 +537,131 @@ def _replay(conn, flt, entries, anchor, dmin, dmax, empty_note, stale) -> dict:
                        "top_by_first_half": top, "confirmed": sorted(strong_held, key=lambda c: -(c["second_half"]["on_stake_pct"] or 0))[:25]}}
 
 
+# ---------------------------------------------------------------- gap --
+GAP_BUCKETS = ((0, 2, "$0-2"), (2, 5, "$2-5"), (5, 10, "$5-10"), (10, 15, "$10-15"), (15, 25, "$15-25"), (25, 1e9, "$25+"))
+GAP_STALE = 900          # a strike's last trade may be this old (seconds) and still count toward the price ladder
+
+
+def _strike(m) -> float | None:
+    """The level an 'above X' contract is about (YES = the underlying finishes above it)."""
+    st = (m["strike_type"] or "").lower()
+    if st in ("greater", "greater_or_equal") and m["floor_strike"] is not None:
+        return float(m["floor_strike"])
+    import re
+    x = re.search(r"-T(\d+(?:\.\d+)?)$", m["ticker"] or "")
+    return float(x.group(1)) if x and not st else None
+
+
+def _ladder_mid(ladder, t):
+    """Where the market puts the underlying at moment t: the level where 'finishes above' is a 50/50 bet, read off
+    the last trade of every strike (interpolated between the two strikes either side of 50c). None if every fresh
+    strike is on one side of 50c or fewer than two strikes traded recently."""
+    import bisect
+    pts = []
+    for k, tss, yps in ladder:
+        i = bisect.bisect_right(tss, t)
+        if i and t - tss[i - 1] <= GAP_STALE:
+            pts.append((k, yps[i - 1]))
+    if len(pts) < 2:
+        return None
+    pts.sort()
+    for (k1, p1), (k2, p2) in zip(pts, pts[1:]):
+        if p1 >= 0.5 >= p2 and p1 > p2:
+            return k1 + (p1 - 0.5) / (p1 - p2) * (k2 - k1)
+    return None
+
+
+def gap(conn, flt: dict | None = None, probes: list | None = None) -> dict:
+    """Hourly 'above X' contracts: how far the underlying sat from the strike when the side it favoured was bought,
+    and whether a bigger cushion paid. Buys the favoured side (gold above the strike -> YES, below -> NO) at the last
+    trade + 1c, taker fee, held to settlement. probes: [{ticker, ts, ...}] -> the cushion at those moments."""
+    import bisect
+    flt = flt or {}
+    w, args = _where(flt)
+    mk = conn.execute(f"""SELECT m.ticker, m.series_ticker ser, m.open_ts o, m.close_ts c, m.result res, m.strike_type, m.floor_strike,
+                                 s.fee_type ft, COALESCE(s.fee_multiplier, 1) mult
+                          FROM wh_markets m LEFT JOIN wh_series s ON s.series_ticker = m.series_ticker
+                          WHERE {w} AND m.close_ts - m.open_ts BETWEEN 1800 AND ? ORDER BY m.close_ts""", args + [10 * 86400]).fetchall()
+    events = {}
+    for m in mk:
+        k = _strike(m)
+        if k is not None:
+            events.setdefault((m["ser"], m["c"]), []).append((k, m))
+    if not events:
+        return {"events": 0, "note": "no settled hourly 'above X' contracts in scope"}
+    closes = sorted(c for _, c in events)
+    mid_c = closes[len(closes) // 2]
+    grid, n_ev = {}, 0
+    ladders = {}
+    for key in sorted(events, key=lambda x: x[1]):
+        ser, close = key
+        ladder, mkts = [], []
+        for k, m in sorted(events[key], key=lambda x: x[0]):
+            rows = conn.execute("SELECT ts, yes_price yp FROM wh_trades WHERE ticker=? AND ts<=? ORDER BY ts", (m["ticker"], close)).fetchall()
+            rows = [(r["ts"], r["yp"]) for r in rows if r["yp"] is not None and 0 < r["yp"] < 1]
+            if not rows:
+                continue
+            tss, yps = [r[0] for r in rows], [r[1] for r in rows]
+            ladder.append((k, tss, yps))
+            mkts.append((k, m, tss, yps))
+        ladders[key] = ladder
+        if len(ladder) < 2:
+            continue
+        n_ev += 1
+        half = 0 if close < mid_c else 1
+        for em in HOURLY_ENTRY_MIN:
+            t0 = close - em * 60
+            mid = _ladder_mid(ladder, t0)
+            if mid is None:
+                continue
+            for k, m, tss, yps in mkts:
+                if m["res"] not in ("yes", "no") or t0 <= m["o"]:
+                    continue
+                i = bisect.bisect_right(tss, t0)
+                if not i or t0 - tss[i - 1] > 300:
+                    continue
+                g = mid - k
+                side = "yes" if g > 0 else "no"
+                p = yps[i - 1] if side == "yes" else 1 - yps[i - 1]
+                cost = round(p + 0.01, 4)
+                if not 0.05 <= cost <= 0.97:
+                    continue
+                b = next(lab for lo, hi, lab in GAP_BUCKETS if lo <= abs(g) < hi)
+                pb = next((lab for lo, hi, lab in SCALP_BUCKETS if lo <= p < hi), "90c+")
+                r = (1.0 if m["res"] == side else 0.0) - cost - TAKER * m["mult"] * cost * (1 - cost)
+                for gk in ((em, b), ("all", b), (em, "all"), ("price", pb, b)):
+                    a = grid.get(gk)
+                    if a is None:
+                        a = grid[gk] = [_Acc(), _Acc(), _Acc()]
+                    a[half].add(int(close), r, cost)
+                    a[2].add(int(close), r, cost)
+
+    def row(a):
+        return {"all": a[2].out(), "first_half": a[0].out(), "second_half": a[1].out()}
+    order = {lab: i for i, (_, _, lab) in enumerate(GAP_BUCKETS)}
+    by_gap = [{"gap": k[1], **row(v)} for k, v in grid.items() if k[0] == "all"]
+    by_min_gap = [{"entry_min": k[0], "gap": k[1], **row(v)} for k, v in grid.items() if isinstance(k[0], int) and k[1] != "all"]
+    by_price_gap = [{"bucket": k[1], "gap": k[2], **row(v)} for k, v in grid.items() if k[0] == "price"]
+    out = {"events": n_ev, "from": closes[0], "to": closes[-1], "split_at": mid_c, "stale_sec": GAP_STALE,
+           "by_gap": sorted(by_gap, key=lambda x: order[x["gap"]]),
+           "by_minute_gap": sorted(by_min_gap, key=lambda x: (-x["entry_min"], order[x["gap"]])),
+           "by_price_gap": sorted(by_price_gap, key=lambda x: (x["bucket"], order[x["gap"]]))}
+    if probes:
+        tick = {m["ticker"]: (key, k) for key, ms in events.items() for k, m in ms}
+        res = []
+        for pr in probes:
+            hit = tick.get(pr.get("ticker"))
+            if not hit:
+                res.append({**pr, "note": "contract not collected yet"})
+                continue
+            key, k = hit
+            mid = _ladder_mid(ladders.get(key) or [], float(pr["ts"]))
+            res.append({**pr, "strike": k, "close": key[1], "min_left": round((key[1] - float(pr["ts"])) / 60, 1),
+                        "gold_est": round(mid, 2) if mid is not None else None, "gap": round(mid - k, 2) if mid is not None else None})
+        out["probes"] = res
+    return out
+
+
 RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly}
 
 

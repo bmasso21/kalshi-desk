@@ -1209,6 +1209,29 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         db.audit("prod_history_read", f"days={days} prefix={prefix[:40]} fills={out.get('fills_read')}")
         return out
 
+    @app.get("/api/research/gap")
+    def research_gap(series: str = "KXGOLDH", mine_days: float = 0):
+        """How far the underlying sat from the strike when the favoured side was bought, and whether a bigger cushion
+        paid; with mine_days > 0 also the cushion at each of the LIVE account's own buys in that series (read-only)."""
+        from .studies import gap as gap_study
+        ser = [x.strip()[:80] for x in series.split(",") if x.strip()][:10]
+        probes = None
+        if mine_days > 0:
+            from .history import prod_history
+            try:
+                h = prod_history(cfg, mine_days, "")
+            except Exception as e:
+                raise HTTPException(502, f"could not read the production account: {e}")
+            db.audit("prod_history_read", f"gap days={mine_days} fills={h.get('fills_read')}")
+            probes = [{"ticker": m["ticker"], "ts": m["first"], "side": m.get("side"), "entry_c": m.get("entry_c"), "staked": m.get("staked"),
+                       "pnl": m.get("pnl"), "result": m.get("result")}
+                      for m in (h.get("markets") or []) if any(m["ticker"].startswith(x + "-") for x in ser) and m.get("first")]
+        conn = studies._ro()
+        try:
+            return gap_study(conn, {"series": ser}, probes)
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------- orders --
     @app.post("/api/order")
     async def order(request: Request):

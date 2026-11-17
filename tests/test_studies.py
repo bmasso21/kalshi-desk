@@ -182,10 +182,51 @@ def hourly_tests(tmp):
     conn.close()
 
 
+def gap_tests(tmp):
+    """Where the underlying sat versus the strike, read off the strike ladder."""
+    wdb = WarehouseDB(Path(tmp) / "g.db")
+    wdb.execute("INSERT INTO wh_series VALUES('G', 'Commodities', 'G', 'quadratic', 1.0, 'hourly', '{}', 0)")
+    O = 1_790_000_000.0
+    n = [0]
+
+    def mk(t, o, k, res, prints):
+        wdb.execute("INSERT INTO wh_markets(ticker, event_ticker, series_ticker, category, status, open_ts, close_ts, result, volume, complete, strike_type, floor_strike) "
+                    "VALUES(?,?, 'G', 'Commodities', 'finalized', ?, ?, ?, 100, 1, 'greater', ?)", (t, t, o, o + 3600, res, k))
+        for sec, yp in prints:
+            n[0] += 1
+            wdb.execute("INSERT INTO wh_trades VALUES(?,?,?,?,?,?,?,0)", (f"g{n[0]}", t, o + sec, yp, 1, "yes", "bid"))
+    every = lambda yp: [(60 * i, yp) for i in range(1, 60)]
+    # one hour, three strikes: 3840 at 90c, 3850 at 70c, 3860 at 30c -> 50/50 level = 3850 + (0.2/0.4)*10 = 3855
+    mk("G-A-T3840", O, 3840.0, "yes", every(.90))
+    mk("G-A-T3850", O, 3850.0, "yes", every(.70))
+    mk("G-A-T3860", O, 3860.0, "no", every(.30))
+    conn = __import__("sqlite3").connect(str(Path(tmp) / "g.db"))
+    conn.row_factory = __import__("sqlite3").Row
+    ladder = []
+    for k, t in ((3840.0, "G-A-T3840"), (3850.0, "G-A-T3850"), (3860.0, "G-A-T3860")):
+        rows = conn.execute("SELECT ts, yes_price FROM wh_trades WHERE ticker=? ORDER BY ts", (t,)).fetchall()
+        ladder.append((k, [r[0] for r in rows], [r[1] for r in rows]))
+    check("gap: the market's gold level is where 'above X' is a 50/50 bet (3855 between the 70c and 30c strikes)", close(ST._ladder_mid(ladder, O + 1800), 3855.0))
+    check("gap: no level when every strike is on one side of 50c or the prints are stale",
+          ST._ladder_mid([(1.0, [O], [.9]), (2.0, [O], [.8])], O + 10) is None and ST._ladder_mid(ladder, O + 3600 + 5000) is None)
+    r = ST.gap(conn, {"series": ["G"]}, [{"ticker": "G-A-T3850", "ts": O + 1800}, {"ticker": "G-NOPE", "ts": O}])
+    pr = r["probes"]
+    check("gap: one of your buys is placed on the ladder (gold ~3855, strike 3850, $5 above, 30 minutes left)",
+          close(pr[0]["gold_est"], 3855.0) and close(pr[0]["gap"], 5.0) and pr[0]["min_left"] == 30.0 and pr[1]["note"] == "contract not collected yet", pr)
+    g30 = {x["gap"]: x["all"] for x in r["by_minute_gap"] if x["entry_min"] == 30}
+    fee = lambda c: 0.07 * c * (1 - c)
+    # at :30 -> 3840 YES (gap 15) costs 91c, wins; 3850 YES (gap 5) costs 71c, wins; 3860 NO (gap 5) costs 71c, wins
+    check("gap: the favoured side is bought (YES above the level, NO below), bucketed by the cushion",
+          g30["$15-25"]["entries"] == 1 and close(g30["$15-25"]["ret_c"], round(100 * (1 - .91 - fee(.91)), 3), 0.002)
+          and g30["$5-10"]["entries"] == 2 and close(g30["$5-10"]["ret_c"], round(100 * (1 - .71 - fee(.71)), 3), 0.002), g30)
+    conn.close()
+
+
 def main():
     tmp = tempfile.mkdtemp()
     scalp_tests(tempfile.mkdtemp())
     hourly_tests(tempfile.mkdtemp())
+    gap_tests(tempfile.mkdtemp())
     wdb, T0 = build(tmp)
     st = ST.Studies(wdb)
     conn = st._ro()
