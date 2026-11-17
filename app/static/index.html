@@ -174,6 +174,8 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
   <div id="btDetail"></div>
   <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Short contracts: which entry and exit worked? <span class="mut" style="font-weight:400;font-size:12px">· replay of past trades, places no orders</span></h3>
     <span><select id="scKind" onchange="scKindChange()" title="Contract length"><option value="scalp">15-minute (enter after the open)</option><option value="hourly">Hourly (enter before the close)</option></select> <input id="scSer" style="width:330px" value="KXBTC15M,KXGOLD15M,KXWTI15M,KXNATGAS15M,KXINX15M,KXSILVER15M,KXCOPPER15M,KX10YRRATE15M" title="Series, comma separated"> <button class="b pri" onclick="runScalp()">Run</button> <button class="b" onclick="loadScalp()">Refresh</button></span></div><div id="scBody" class="mut" style="margin-top:6px">Not loaded.</div></div>
+  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Hourly gold cushion (paper) <span class="mut" style="font-weight:400;font-size:12px">· buys the favoured side at the real ask when gold sits $10+ past the strike; places no orders</span></h3>
+    <span><button class="b" onclick="gwCheck()">Check now</button> <button class="b" onclick="loadGW()">Refresh</button></span></div><div id="gwBody" class="mut" style="margin-top:6px">Not loaded.</div></div>
 </section>
 <section id="t-settings" class="hide"><div id="settingsBox"></div></section>
 </main>
@@ -209,7 +211,7 @@ function go(top,sub){TOP=top;const subs=TABS[top];sub=sub||SUBSEL[top]||subs[0][
   document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x.dataset.t===top));
   $('#sub').innerHTML=subs.length>1?subs.map(([k,l])=>`<button class="${k===sub?'on':''}" onclick="go('${top}','${k}')">${l}</button>`).join(''):'';
   const [sec,grp]=sub.split(':');document.querySelectorAll('main>section').forEach(x=>x.classList.toggle('hide',x.id!=='t-'+sec));
-  const LOAD={home:loadHome,scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:()=>{loadRewards();loadMM()},portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,weather:loadWeather,research:loadResearch,fairvalue:loadFV};
+  const LOAD={home:loadHome,scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:()=>{loadRewards();loadMM()},portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,weather:loadWeather,research:()=>{loadResearch();loadGW()},fairvalue:loadFV};
   if(sec==='settings'){SGRP=grp;if(!SET_LOADED){SET_LOADED=true;loadSettings()}else showGrp()}else{SET_LOADED=false;LOAD[sec]()}
   window.scrollTo(0,0)}
 function showGrp(){document.querySelectorAll('#settingsBox [data-g]').forEach(e=>e.classList.toggle('hide',e.dataset.g!==SGRP));const sb=$('#saveBar');if(sb)sb.classList.toggle('hide',SGRP==='alerts'||SGRP==='maint')}
@@ -514,6 +516,15 @@ async function loadClv(){try{const j=await api('/api/clv?days='+$('#clvDays').va
 // edge studies (3.8)
 async function runStudies(){try{const cat=$('#stCat').value;const r=await api('/api/studies/run',{method:'POST',body:cat?{categories:[cat]}:{}});toast(r.started.length?'Studies started (a few minutes)':'Already running','ok');setTimeout(loadStudies,2500)}catch(e){toast(e.message,'err')}}
 function stCell(x){if(!x||x.ret_c==null)return '<td class="r mut">–</td>';const sig=x.t!=null&&Math.abs(x.t)>=2;return `<td class="r ${sig?(x.ret_c>0?'y':'n'):'mut'}" title="${x.events} events · standard error ${x.se_c??'–'}c">${x.ret_c>0?'+':''}${x.ret_c.toFixed(2)}c <span style="font-size:11px">(t ${x.t??'–'})</span></td>`}
+function gwRow(lab,b){if(!b||!b.n)return `<tr><td>${lab}</td><td colspan="6" class="mut">no settled buys yet</td></tr>`;return `<tr><td>${lab}</td><td class="r">${b.n}</td><td class="r">${b.hours}</td><td class="r">${b.wins}/${b.n}</td><td class="r">${b.avg_ask_c}c</td><td class="r">${b.ask_over_last_c??'–'}c</td><td class="r ${b.pnl>0?'y':b.pnl<0?'n':''}">${b.pnl>0?'+':''}$${b.pnl.toFixed(2)} (${b.return_pct}%)</td></tr>`}
+async function loadGW(){const B=$('#gwBody');try{const j=await api('/api/gapwatch'),S=j.summary,t=x=>new Date(x*1000).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+  let h=`<p class="mut">${j.enabled?'On':'Off'} · ${esc(j.series.join(', '))} · reads the ladder ${j.checks.join(', ')} minutes before each close · ${S.open} open paper buys${j.state.error?` · <span class="n">${esc(j.state.error)}</span>`:''}</p>`;
+  h+=`<table><thead><tr><th>Group</th><th class="r">Buys</th><th class="r">Hours</th><th class="r">Won</th><th class="r">Avg ask</th><th class="r">Ask over last trade</th><th class="r">Result ($1 each)</th></tr></thead><tbody>`;
+  h+=gwRow('<b>Rule: $15+ cushion, first time it qualifies</b>',S.rule_15_first_touch);for(const k in S.by_bucket)h+=gwRow('Cushion '+k+' (every check)',S.by_bucket[k]);for(const k in S.by_check)h+=gwRow(`$15+ at ${k} min left`,S.by_check[k]);h+='</tbody></table>';
+  h+=`<details><summary>Latest paper buys and checks</summary><table><thead><tr><th>Close</th><th>Min left</th><th>Strike</th><th>Gold</th><th>Cushion</th><th>Side</th><th class="r">Ask</th><th>Status</th><th class="r">P&L</th></tr></thead><tbody>${j.recent.map(p=>`<tr><td>${t(p.close_ts)}</td><td>${p.check_min}</td><td>${p.strike}</td><td>${p.level}</td><td>$${p.gap.toFixed(2)}</td><td>${p.side.toUpperCase()}</td><td class="r">${Math.round(p.ask*100)}c</td><td>${p.status}${p.result?' ('+p.result+')':''}</td><td class="r">${p.pnl==null?'':(p.pnl>0?'+':'')+p.pnl.toFixed(2)}</td></tr>`).join('')}</tbody></table>
+  <table><thead><tr><th>Checked</th><th>Close</th><th>Min left</th><th>Strikes</th><th>Gold</th><th>Buys</th><th>Note</th></tr></thead><tbody>${j.checks_log.map(c=>`<tr><td>${t(c.ts)}</td><td>${t(c.close_ts)}</td><td>${c.check_min}</td><td>${c.strikes}</td><td>${c.level??'–'}</td><td>${c.picks}</td><td>${esc(c.note)}</td></tr>`).join('')}</tbody></table></details>`;
+  B.innerHTML=h}catch(e){B.textContent=e.message}}
+async function gwCheck(){try{const r=await api('/api/gapwatch/check',{method:'POST'});const x=Object.values(r.results)[0]||{};toast(`${r.minutes_left} min left: ${x.strikes} strikes, gold ${x.level?x.level.toFixed(2):'unreadable'}, ${x.picks} paper buys`,'ok');loadGW()}catch(e){toast(e.message,'err')}}
 const scSer=()=>$('#scSer').value.split(',').map(x=>x.trim()).filter(Boolean);
 const scKind=()=>$('#scKind').value;
 const SC_DEF={scalp:'KXBTC15M,KXGOLD15M,KXWTI15M,KXNATGAS15M,KXINX15M,KXSILVER15M,KXCOPPER15M,KX10YRRATE15M',hourly:'KXGOLDH'};

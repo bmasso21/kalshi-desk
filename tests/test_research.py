@@ -435,6 +435,9 @@ def main():
     r = c.post("/api/config", headers=HD, json={"warehouse": {"sample": {"overrides": {"Sports": {"max_trades_per_market": 100, "series_per_category": 1, "bogus": 5}}}}})
     check("sample overrides per category saved and validated", r.status_code == 200 and cfg.data["warehouse"]["sample"]["overrides"] == {"Sports": {"max_trades_per_market": 100, "series_per_category": 1}}
           and cfg.data["warehouse"]["sample"]["enabled"] is True, cfg.data["warehouse"]["sample"])
+    gwj = c.get("/api/gapwatch", headers=HD)
+    check("hourly cushion watch: status answers (paper only) with the $15+ rule summary",
+          gwj.status_code == 200 and gwj.json()["series"] == ["KXGOLDH"] and "rule_15_first_touch" in gwj.json()["summary"], gwj.text[:200])
     rg = c.get("/api/research/gap?series=KXGOLDH", headers=HD)
     check("gap endpoint: answers with a note when no hourly 'above X' contracts are stored (no production read unless asked)",
           rg.status_code == 200 and rg.json().get("events") == 0 and "probes" not in rg.json(), rg.text[:200])

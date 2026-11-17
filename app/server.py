@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import secrets
 import threading
@@ -44,6 +45,9 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     from .fairvalue import FairValue
     fairvalue = FairValue(lambda: cfg.data.get("sports") or {}, wdb,
                           KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+    from .gapwatch import GapWatch
+    gapwatch = GapWatch(lambda: cfg.data.get("gapwatch") or {}, wdb,
+                        KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
     eng.weather = WxCollector(eng, wx_store)
     from .maintenance import Maintenance
     maint = Maintenance(eng, wdb)
@@ -79,6 +83,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             eng.warehouse.start()
             eng.weather.start()
             fairvalue.start()
+            gapwatch.start()
             maint.start()
             try:
                 mm_shadow.resume()
@@ -1208,6 +1213,20 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             raise HTTPException(502, f"could not read the production account: {e}")
         db.audit("prod_history_read", f"days={days} prefix={prefix[:40]} fills={out.get('fills_read')}")
         return out
+
+    @app.get("/api/gapwatch")
+    def gapwatch_status():
+        return gapwatch.status()
+
+    @app.post("/api/gapwatch/check")
+    def gapwatch_check():
+        """Read the ladder for the next close right now (paper only; recorded under the minutes actually left)."""
+        now = time.time()
+        close = math.ceil(now / 3600) * 3600
+        mins = int((close - now) // 60)
+        out = {s: gapwatch.check(s, close, mins, now) for s in gapwatch.series()}
+        gapwatch.settle(now)
+        return {"close": close, "minutes_left": mins, "results": out}
 
     @app.get("/api/research/gap")
     def research_gap(series: str = "KXGOLDH", mine_days: float = 0):
