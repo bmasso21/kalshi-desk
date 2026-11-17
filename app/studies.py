@@ -281,7 +281,7 @@ def baskets(conn, flt: dict | None = None) -> dict:
 
 
 # ---------------------------------------------------------------- scalp --
-EXTRA = ("scalp",)                   # run only when asked for: it applies to short contracts (15 minutes and the like)
+EXTRA = ("scalp", "hourly")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
 SCALP_ENTRY_MIN = (2, 5, 10)         # minutes after the contract opens
 SCALP_STOPS = (None, 0.25, 0.50)     # sell if the price falls this fraction below what was paid; None = no stop
 SCALP_TARGETS = (0.05, 0.10, 0.20, 0.35, 0.60, None)   # take profit at +x%; None = hold to the end
@@ -425,15 +425,29 @@ def _compress(rows):
 def scalp(conn, flt: dict | None = None) -> dict:
     """Short contracts replayed trade by trade over a grid: when to buy, which price, rising or falling, which profit
     target, which stop, tap or resting orders. Winners are picked on the first half of the dates and checked on the second."""
+    return _replay(conn, flt, SCALP_ENTRY_MIN, "open", 240, 1500, "no settled short contracts (4 to 25 minutes long) with stored trades in scope", 90)
+
+
+HOURLY_ENTRY_MIN = (50, 40, 30, 20, 15, 10, 5)   # minutes BEFORE the contract closes
+
+
+def hourly(conn, flt: dict | None = None) -> dict:
+    """Hourly contracts (gold, oil, indexes ...): the same replay, entering a set number of minutes before the close
+    (for example 30 = buy at 8:30 for the 9:00 close)."""
+    return _replay(conn, flt, HOURLY_ENTRY_MIN, "close", 1800, 10 * 86400, "no settled hourly contracts with stored trades in scope", 300)
+
+
+def _replay(conn, flt, entries, anchor, dmin, dmax, empty_note, stale) -> dict:
+    """stale: seconds the last trade may be old and still price the entry (measured on every print, not the merged ones)."""
     import bisect
     flt = flt or {}
     w, args = _where(flt)
     mk = conn.execute(f"""SELECT m.ticker, m.series_ticker ser, m.open_ts o, m.close_ts c, m.result res, s.fee_type ft, COALESCE(s.fee_multiplier, 1) mult
                           FROM wh_markets m LEFT JOIN wh_series s ON s.series_ticker = m.series_ticker
-                          WHERE {w} AND m.complete = 1 AND m.close_ts - m.open_ts BETWEEN 240 AND 1500 ORDER BY m.close_ts""", args).fetchall()
-    cut = conn.execute(f"SELECT COUNT(*) n FROM wh_markets m WHERE {w} AND m.complete = 2 AND m.close_ts - m.open_ts BETWEEN 240 AND 1500", args).fetchone()["n"]
+                          WHERE {w} AND m.complete = 1 AND m.close_ts - m.open_ts BETWEEN ? AND ? ORDER BY m.close_ts""", args + [dmin, dmax]).fetchall()
+    cut = conn.execute(f"SELECT COUNT(*) n FROM wh_markets m WHERE {w} AND m.complete = 2 AND m.close_ts - m.open_ts BETWEEN ? AND ?", args + [dmin, dmax]).fetchone()["n"]
     if not mk:
-        return {"markets": 0, "note": "no settled short contracts (4 to 25 minutes long) with stored trades in scope", "skipped_too_busy": cut}
+        return {"markets": 0, "note": empty_note, "skipped_too_busy": cut}
     mid = mk[len(mk) // 2]["c"]                                # half the contracts end before this moment
     grid, marg = {}, {}
     used = 0
@@ -446,17 +460,19 @@ def scalp(conn, flt: dict | None = None) -> dict:
             continue
         used += 1
         tss = [t[0] for t in tr]
+        rts = [x["ts"] for x in rows]
         mrate = {"quadratic_with_maker_fees": 0.0175, "quadratic_with_combo_maker_fees": 0.035}.get(m["ft"], 0.0) * m["mult"]
         trate = TAKER * m["mult"]
         half = 0 if m["c"] < mid else 1
         grp = int(m["c"])
         yref = tr[0][1]
-        for em in SCALP_ENTRY_MIN:
-            t0 = m["o"] + em * 60
-            if t0 >= m["c"] - 60:
+        for em in entries:
+            t0 = m["o"] + em * 60 if anchor == "open" else m["c"] - em * 60
+            if t0 >= m["c"] - 60 or t0 <= m["o"]:
                 continue
             i0 = bisect.bisect_right(tss, t0)
-            if i0 == 0 or t0 - tss[i0 - 1] > 90:               # no recent print to price the entry from
+            ri = bisect.bisect_right(rts, t0)
+            if i0 == 0 or ri == 0 or t0 - rts[ri - 1] > stale:   # no recent print to price the entry from
                 continue
             yp0 = tr[i0 - 1][1]
             for side in ("yes", "no"):
@@ -514,14 +530,14 @@ def scalp(conn, flt: dict | None = None) -> dict:
     strong_held = [c for c in strong if c["second_half"]["ret_c"] > 0 and (c["second_half"]["t"] or 0) >= 2]
     top = sorted(cells, key=lambda c: -(c["first_half"]["on_stake_pct"] or -1e9))[:25]
     return {"markets": used, "skipped_too_busy": cut, "from": mk[0]["c"], "to": mk[-1]["c"], "split_at": mid,
-            "entry_minutes": list(SCALP_ENTRY_MIN), "maker_wait_sec": SCALP_MAKER_WAIT, "move_c": int(SCALP_MOVE * 100), "min_n": SCALP_MIN_N,
+            "entry_minutes": list(entries), "entry_from": anchor, "maker_wait_sec": SCALP_MAKER_WAIT, "move_c": int(SCALP_MOVE * 100), "min_n": SCALP_MIN_N,
             "exits": exits, "signals": signals, "prices": prices, "minutes": minutes, "by_series": series,
             "search": {"combinations_tested": len(cells), "positive_first_half": len(pos1), "of_those_positive_second_half": len(held),
                        "strong_first_half": len(strong), "of_those_strong_second_half": len(strong_held),
                        "top_by_first_half": top, "confirmed": sorted(strong_held, key=lambda c: -(c["second_half"]["on_stake_pct"] or 0))[:25]}}
 
 
-RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp}
+RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly}
 
 
 class Studies:

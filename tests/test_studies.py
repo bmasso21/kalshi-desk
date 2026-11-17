@@ -148,9 +148,44 @@ def scalp_tests(tmp):
     conn.close()
 
 
+def hourly_tests(tmp):
+    """Hourly contracts: entries are counted back from the close (30 = buy at :30 for the top-of-the-hour close)."""
+    wdb = WarehouseDB(Path(tmp) / "h.db")
+    wdb.execute("INSERT INTO wh_series VALUES('G', 'Commodities', 'G', 'quadratic', 1.0, 'hourly', '{}', 0)")
+    O = 1_790_000_000.0
+    n = [0]
+
+    def mk(t, o, res, prints, dur=3600, complete=1):
+        wdb.execute("INSERT INTO wh_markets(ticker, event_ticker, series_ticker, category, status, open_ts, close_ts, result, volume, complete) "
+                    "VALUES(?,?, 'G', 'Commodities', 'finalized', ?, ?, ?, 100, ?)", (t, t, o, o + dur, res, complete))
+        for sec, yp, side in prints:
+            n[0] += 1
+            wdb.execute("INSERT INTO wh_trades VALUES(?,?,?,?,?,?,?,0)", (f"h{n[0]}", t, o + sec, yp, 1, side, "bid" if side == "yes" else "ask"))
+    # one print a minute at 64c from the open, then 90c in the last 4 minutes; settles YES
+    mk("G-1", O, "yes", [(60 * i, .64, "yes") for i in range(1, 56)] + [(3360, .90, "yes")])
+    mk("G-2", O + 3600, "no", [(60 * i, .64, "yes") for i in range(1, 56)] + [(3360, .10, "no")])
+    mk("G-3", O + 7200, "yes", [(60, .5, "yes")] * 6, dur=600)            # a 10-minute contract: not an hourly one
+    conn = __import__("sqlite3").connect(str(Path(tmp) / "h.db"))
+    conn.row_factory = __import__("sqlite3").Row
+    r = ST.hourly(conn, {"series": ["G"]})
+    check("hourly: only contracts at least 30 minutes long are replayed, entries counted from the close",
+          r["markets"] == 2 and r["entry_from"] == "close" and 30 in r["entry_minutes"], (r.get("markets"), r.get("entry_from")))
+    mins = {(x["exec"], x["entry_min"], x["target"]): x for x in r["minutes"]}
+    a = mins[("taker", 30, "hold")]["all"]
+    fee = 0.07 * 0.65 * 0.35
+    # at 30 minutes out YES costs 65c (64c + 1c): one wins 35c, one loses 65c; NO costs 37c: one loses, one wins 63c; each pays its fee
+    exp = ((1 - .65 - fee) + (-.65 - fee) + (1 - .37 - 0.07 * .37 * .63) + (-.37 - 0.07 * .37 * .63)) / 4
+    check("hourly: buying at :30 and holding pays the settlement less the ask and one fee", a["entries"] == 4 and close(a["ret_c"], round(100 * exp, 3), 0.002), a)
+    check("hourly: the 50-minute entry exists for an hour-long contract; nothing is entered before the open",
+          ("taker", 50, "hold") in mins and all(x["entry_min"] in ST.HOURLY_ENTRY_MIN for x in r["minutes"]))
+    check("scalp still ignores hourly contracts", ST.scalp(conn, {"series": ["G"]})["markets"] == 1)
+    conn.close()
+
+
 def main():
     tmp = tempfile.mkdtemp()
     scalp_tests(tempfile.mkdtemp())
+    hourly_tests(tempfile.mkdtemp())
     wdb, T0 = build(tmp)
     st = ST.Studies(wdb)
     conn = st._ro()
