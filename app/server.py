@@ -189,6 +189,8 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     def session():
         return {"token": session_token, "version": __version__}
 
+    exch_cache = {"ts": 0.0, "v": None, "err": None, "busy": False}
+
     @app.get("/api/status")
     def status():
         c = eng.client
@@ -198,10 +200,22 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                "kill_switch": cfg.risk["kill_switch"], "auto": cfg.auto["enabled"],
                "feed": {k: fs[k] for k in ("mode", "connected", "reason", "error", "markets_watched",
                                            "books_synced", "since", "last_msg")}}
-        try:
-            out["exchange"] = c.exchange_status()
-        except Exception as e:
-            out["exchange_error"] = str(e)
+        ex = exch_cache
+        if time.time() - ex["ts"] > 30 and not ex["busy"]:          # refreshed in the background: this screen never waits on Kalshi
+            ex["busy"] = True
+
+            def _refresh():
+                try:
+                    ex["v"], ex["err"] = eng.client.exchange_status(), None
+                except Exception as e:
+                    ex["err"] = str(e)
+                finally:
+                    ex["ts"], ex["busy"] = time.time(), False
+            threading.Thread(target=_refresh, daemon=True, name="exchange-status").start()
+        if ex["v"] is not None:
+            out["exchange"] = ex["v"]
+        if ex["err"]:
+            out["exchange_error"] = ex["err"]
         return out
 
     # ------------------------------------------------------------- config --

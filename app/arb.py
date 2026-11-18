@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import threading
 import time
 
@@ -57,6 +58,16 @@ def _quotes(m):
     return (yb or 0.0), (ya if ya and 0 < ya <= 1 else None)
 
 
+def underlying_key(m: dict) -> tuple:
+    """What a strike is ON. Same event prefix, same label in the ticker's last part once its number is removed
+    (MIA2 / MIA5 = Miami's margin; BUF3 = Buffalo's margin, a different thing), the same wording once numbers are
+    removed, and the same close. Strikes only form a ladder when all of these match."""
+    head, last = m["ticker"].rsplit("-", 1) if "-" in m["ticker"] else ("", m["ticker"])
+    label = re.sub(r"[\d.]+$", "", last)
+    words = re.sub(r"[\d.,$%]+", "#", (m.get("yes_sub_title") or m.get("subtitle") or "").lower()).strip()
+    return head, label, words, m.get("close_time")
+
+
 def candidates(event: dict, fee_info: dict) -> list[dict]:
     """Opportunities in ONE event from the market listing's quotes. Each leg: {ticker, side, price} (price = the ask paid)."""
     ms = [m for m in event.get("markets") or [] if (m.get("status") or "active") in ("active", "open")]
@@ -89,7 +100,7 @@ def candidates(event: dict, fee_info: dict) -> list[dict]:
     groups = {}
     for m in ms:
         if (m.get("strike_type") or "").lower() in ("greater", "greater_or_equal") and fnum(m.get("floor_strike")) is not None:
-            groups.setdefault((m["ticker"].rsplit("-", 1)[0], m.get("close_time")), []).append((fnum(m.get("floor_strike")), m))
+            groups.setdefault(underlying_key(m), []).append((fnum(m.get("floor_strike")), m))
     for g in groups.values():
         out += _ladder(sorted(g, key=lambda x: x[0]), mult, ftype)
     return out
@@ -152,9 +163,10 @@ class ArbScanner:
         self._stop = threading.Event()
         self._fees = (0.0, {})
         self.state = {"running": False, "last_scan": None, "error": None, "note": ""}
-        for r in wdb.query("SELECT id, legs FROM arb_opps WHERE kind='ladder'"):     # 3.21.0 paired different underlyings: drop those
+        for r in wdb.query("SELECT id, legs FROM arb_opps WHERE kind='ladder'"):     # 3.21.0/1 paired different underlyings: drop those
             lg = json.loads(r["legs"])
-            if len({l["ticker"].rsplit("-", 1)[0] for l in lg}) > 1:
+            keys = {(l["ticker"].rsplit("-", 1)[0], re.sub(r"[\d.]+$", "", l["ticker"].rsplit("-", 1)[-1])) for l in lg}
+            if len(keys) > 1:
                 wdb.execute("DELETE FROM arb_opps WHERE id=?", (r["id"],))
 
     def opt(self, k, default):

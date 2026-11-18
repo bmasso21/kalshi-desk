@@ -57,6 +57,13 @@ def main():
     ppg = {"event_ticker": "P", "series_ticker": "S", "mutually_exclusive": False, "markets": [
         mk("P-GREEN-20", .15, .17, strike_type="greater", floor_strike=20.3), mk("P-IRVING-24", .30, .32, strike_type="greater", floor_strike=24.0)]}
     check("different underlyings in one event (each player's average) are never treated as a ladder", not A.candidates(ppg, {}))
+    spr = {"event_ticker": "NFLS-MIABUF", "series_ticker": "S", "mutually_exclusive": False, "markets": [
+        mk("NFLS-MIABUF-MIA2", .05, .07, strike_type="greater", floor_strike=2.5, yes_sub_title="Miami wins by over 2.5 points"),
+        mk("NFLS-MIABUF-BUF3", .80, .82, strike_type="greater", floor_strike=3.5, yes_sub_title="Buffalo wins by over 3.5 points"),
+        mk("NFLS-MIABUF-MIA5", .10, .12, strike_type="greater", floor_strike=5.5, yes_sub_title="Miami wins by over 5.5 points")]}
+    sc_ = [x for x in A.candidates(spr, {}) if x["kind"] == "ladder"]
+    check("spreads: one team's margin is never laddered against the other team's (Miami by 2.5+ vs Buffalo by 3.5+)",
+          all({l["ticker"].split("-")[-1][:3] for l in x["legs"]} == {"MIA"} for x in sc_) and len(sc_) == 1, sc_)
     check("ladder: a higher strike priced above a lower one -> YES low + NO high", len(lc) == 1 and lc[0]["legs"][0] == {"ticker": "L-X-100", "side": "yes", "price": 0.40}
           and lc[0]["legs"][1]["ticker"] == "L-X-110" and close(lc[0]["legs"][1]["price"], 0.55), lc)
     # confirm at the order book: sizes cap the sets; a vanished price kills it

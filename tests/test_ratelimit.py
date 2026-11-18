@@ -42,7 +42,7 @@ def main():
     b = KC.KalshiClient("https://api.example.test/trade-api/v2")
     c = KC.KalshiClient("https://other.example.test/trade-api/v2")
     check("public readers of the same host share one request budget", a.read_bucket is b.read_bucket and a.read_bucket is not c.read_bucket)
-    check("the shared budget is 6 reads a second", a.read_bucket.rate == 60 and a.read_bucket.capacity == 120)
+    check("the shared budget is 4 reads a second", a.read_bucket.rate == 40 and a.read_bucket.capacity == 80)
     sleeps = []
     KC.time.sleep = lambda s: sleeps.append(s)
     a.session = Ses([429, 429, 200])
@@ -66,6 +66,18 @@ def main():
     waits = [round(s) for s in sleeps]
     check("without Retry-After: backs off 0.5, 1, 2, 4, 8, 16 s (about 31 s in all) before giving up", ok and a.session.n == 7 and len(sleeps) == 6
           and sum(sleeps) >= 31 and sleeps[-1] >= 16, sleeps)
+    sleeps.clear()
+    acct = KC.KalshiClient("https://api.example.test/trade-api/v2")
+    acct.key_id, acct.private_key = "k", object()          # looks authenticated; signing is stubbed below
+    acct._headers = lambda m, p: {}
+    acct.read_bucket = KC.TokenBucket(rate=1e9, capacity=1e9)       # an account client has its own budget (made so at creation)
+    acct.session = NoRA([429] * 7)
+    try:
+        acct.request("GET", "/portfolio/balance")
+    except KC.KalshiError:
+        pass
+    check("the account client (screens, quoter) gives up quickly on 429s: at most 3 short waits of up to 2 s",
+          len(sleeps) <= 3 and all(s <= 2.26 for s in sleeps) and sum(sleeps) < 6, sleeps)
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 

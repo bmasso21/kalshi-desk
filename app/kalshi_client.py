@@ -76,7 +76,7 @@ class TokenBucket:
 
 # One request budget per host for every unauthenticated (public market data) client in the process: the scanners,
 # the catalogue and the fair-value tools all read Kalshi production, and Kalshi limits reads per caller, so separate
-# budgets used to add up past the limit (429 "too many requests"). 60 tokens/s at 10 per request = 6 reads/s
+# budgets used to add up past the limit (429 "too many requests"). 40 tokens/s at 10 per request = 4 reads/s
 # (the data collector keeps its own, slower budget on top).
 _SHARED_READ: dict = {}
 _SHARED_LOCK = threading.Lock()
@@ -86,7 +86,7 @@ RATE_LIMITS: dict = {}            # host -> deque of 429 timestamps (for the das
 def shared_read_bucket(host: str) -> "TokenBucket":
     with _SHARED_LOCK:
         if host not in _SHARED_READ:
-            _SHARED_READ[host] = TokenBucket(rate=60, capacity=120)
+            _SHARED_READ[host] = TokenBucket(rate=40, capacity=80)
         return _SHARED_READ[host]
 
 
@@ -177,9 +177,16 @@ class KalshiClient:
                 q.append(time.time())
                 if attempt < retries - 1:
                     # a 429 means Kalshi refused the request (nothing was done), so even an order can be resent.
-                    # Wait as long as Kalshi asks, else back off 0.5, 1, 2, 4, 8, 16 s with a little jitter.
+                    # Background readers of public data (no key) can afford to wait: as long as Kalshi asks, else 0.5,
+                    # 1, 2 ... 16 s. The account client serves the screens and the quoter, so it keeps short waits
+                    # (0.25 s doubling, at most 2 s each): a long wait there would tie up the app's request threads.
                     ra = _retry_after(resp)
-                    w = ra if ra is not None else max(0.5, delay * 2)
+                    if self.authenticated:
+                        w = min(ra if ra is not None else delay, 2.0)
+                        if attempt >= 3:
+                            break
+                    else:
+                        w = ra if ra is not None else max(0.5, delay * 2)
                     time.sleep(w + random.uniform(0, 0.25))
                     delay = max(delay * 2, 0.25)
                     continue
