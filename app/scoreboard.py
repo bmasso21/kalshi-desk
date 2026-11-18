@@ -97,6 +97,11 @@ def sources(wdb) -> list[dict]:
                 "market": "Hourly gold (KXGOLDH)",
                 "rows": [{"pnl": r["pnl"], "cost": r["ask"] + r["fee"], "cluster": r["close_ts"], "ts": r["close_ts"]} for r in ff.values() if r["status"] == "settled"],
                 "open": sum(1 for r in ff.values() if r["status"] == "open")})
+    fd = q("SELECT event, price, fee, pnl, settled_ts, status FROM fed_picks")
+    out.append({"key": "fed", "name": "Fed decisions: 3c+ under futures-implied odds", "description": "Kalshi's FOMC outcome odds vs 30-day fed funds futures (FedWatch method)",
+                "market": "Fed decisions (KXFEDDECISION)",
+                "rows": [{"pnl": r["pnl"], "cost": r["price"] + r["fee"], "cluster": r["event"], "ts": r["settled_ts"]} for r in fd if r["status"] == "settled" and r["pnl"] is not None],
+                "open": sum(1 for r in fd if r["status"] == "open")})
     ar = q("SELECT kind, event, cost, pnl_real, settled_ts, status, locked FROM arb_opps")
     for kinds, key, label, desc in ((("no_basket", "ladder"), "arb_locked", "Arbitrage: locked (NO baskets, ladders)",
                                      "Kalshi priced against itself: every outcome pays at least the cost after fees, confirmed at live order-book prices"),
@@ -109,14 +114,20 @@ def sources(wdb) -> list[dict]:
     return out
 
 
+RETIRED = {"gold_fv": "retired 18 Nov: -25% on 51 paper buys (the free live gold price is too noisy)"}
+
+
 def board(wdb, bar: dict | None = None, mm_reports: list | None = None) -> dict:
     strategies = []
     for s in sources(wdb):
         sc = score(s.pop("rows"))
-        strategies.append({**s, "kind": "pick", "score": sc, "verdict": judge(sc, bar)})
+        v = judge(sc, bar)
+        if s["key"] in RETIRED:
+            v = {"status": "retired", "progress_pct": None, "rules": [{"rule": "retired", "ok": False, "detail": RETIRED[s["key"]]}]}
+        strategies.append({**s, "kind": "pick", "score": sc, "verdict": v})
     for rp in mm_reports or []:                             # market-making / resting-order paper runs keep their own verdict
         if rp.get("status") != "running":
-            continue
+            continue                                        # stopped runs (e.g. #7, #10, #11 after failing) drop off the board
         v = rp.get("verdict") or {}
         qm = (rp.get("models") or {}).get("queue") or {}
         strategies.append({"key": f"mm_{rp.get('run_id')}", "name": f"Resting orders: run #{rp.get('run_id')}", "description": rp.get("name"),
@@ -126,7 +137,7 @@ def board(wdb, bar: dict | None = None, mm_reports: list | None = None) -> dict:
                                        "progress_pct": None,
                                        "rules": [{"rule": "own test", "ok": bool(v.get("enough_data")), "detail": f"{v.get('needs')}; now {v.get('status')}"},
                                                  {"rule": "auto-live", "ok": False, "detail": "holds inventory: needs a different live engine, not eligible for automatic promotion"}]}})
-    order = {"qualified": 0, "review": 1, "collecting": 2, "failing": 3}
+    order = {"qualified": 0, "review": 1, "collecting": 2, "failing": 3, "retired": 4}
     strategies.sort(key=lambda s: (order.get(s["verdict"]["status"], 9), -(s["score"].get("trades") or 0)))
     return {"bar": {**DEFAULT_BAR, **(bar or {})}, "strategies": strategies,
             "qualified": [s["key"] for s in strategies if s["verdict"]["status"] == "qualified"]}

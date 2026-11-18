@@ -164,6 +164,8 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
 </section>
 <section id="t-fairvalue" class="hide"><div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Sports fair value <span class="mut" style="font-weight:400;font-size:12px">· sportsbook consensus vs Kalshi, before the game · paper only, places no orders</span></h3>
   <span><button class="b pri" onclick="pollFV()">Pull odds now</button> <button class="b" onclick="loadFV()">Refresh</button></span></div><div id="fvBody" class="mut" style="margin-top:6px">Loading…</div></div></section>
+<section id="t-fed" class="hide"><div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Fed decisions vs futures <span class="mut" style="font-weight:400;font-size:12px">· Kalshi's odds for each FOMC meeting against 30-day fed funds futures (FedWatch method); paper only</span></h3>
+  <span><button class="b" onclick="fedNow()">Check now</button> <button class="b" onclick="loadFed()">Refresh</button></span></div><div id="fedBody" class="mut" style="margin-top:6px">Loading…</div></div></section>
 <section id="t-research" class="hide">
   <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Edge studies <span class="mut" style="font-weight:400;font-size:12px">· past data only, places no orders</span></h3><span><select id="stCat" onchange="loadStudies()"><option value="">All categories</option></select> <button class="b pri" onclick="runStudies()">Run all</button> <button class="b" onclick="loadStudies()">Refresh</button></span></div>
    <details class="how"><summary>How to read these</summary><p class="mut" style="font-size:12px">Each study asks one question of the stored market history. Returns are cents per contract after Kalshi's fee formula (per-order rounding not included). <b>t</b> compares the result with its own noise, counted across events because outcomes in one event move together: under 2 in size means it could easily be luck. Every table is split into the earlier and later half of the period; an effect that shows in only one half is not an effect. Quotes in the last two studies are hourly snapshots without size: they show a gap existed, not how many contracts you could have had.</p></details>
@@ -210,21 +212,21 @@ async function api(u,o={}){o.headers={'Content-Type':'application/json','X-Desk-
   if(!r.ok)throw new Error(j.error||j.detail||('HTTP '+r.status));return j}
 // navigation: five sections, each with sub-pages (the old tabs live on as sub-pages)
 const TABS={home:[['home','Overview']],markets:[['markets','Browse'],['scanner','Scanner']],portfolio:[['portfolio','Positions'],['ledger','Activity'],['clv','CLV']],
-  strategies:[['rewards','Market making'],['fairvalue','Sports fair value'],['weather','Weather (parked)'],['research','Research']],
+  strategies:[['rewards','Market making'],['fairvalue','Sports fair value'],['fed','Fed decisions'],['weather','Weather (parked)'],['research','Research']],
   settings:[['settings:conn','Connection'],['settings:limits','Limits & safety'],['settings:strat','Strategies'],['settings:alerts','Alerts'],['settings:maint','Maintenance']]};
 let TOP='home',SUBSEL={},SGRP='conn',SET_LOADED=false;
 function go(top,sub){TOP=top;const subs=TABS[top];sub=sub||SUBSEL[top]||subs[0][0];SUBSEL[top]=sub;
   document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x.dataset.t===top));
   $('#sub').innerHTML=subs.length>1?subs.map(([k,l])=>`<button class="${k===sub?'on':''}" onclick="go('${top}','${k}')">${l}</button>`).join(''):'';
   const [sec,grp]=sub.split(':');document.querySelectorAll('main>section').forEach(x=>x.classList.toggle('hide',x.id!=='t-'+sec));
-  const LOAD={home:()=>{loadBoard();loadHome()},scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:()=>{loadRewards();loadMM()},portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,weather:loadWeather,research:()=>{loadResearch();loadGW();loadGL();loadCat();loadArb()},fairvalue:loadFV};
+  const LOAD={home:()=>{loadBoard();loadHome()},scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:()=>{loadRewards();loadMM()},portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,weather:loadWeather,research:()=>{loadResearch();loadGW();loadGL();loadCat();loadArb()},fairvalue:loadFV,fed:loadFed};
   if(sec==='settings'){SGRP=grp;if(!SET_LOADED){SET_LOADED=true;loadSettings()}else showGrp()}else{SET_LOADED=false;LOAD[sec]()}
   window.scrollTo(0,0)}
 function showGrp(){document.querySelectorAll('#settingsBox [data-g]').forEach(e=>e.classList.toggle('hide',e.dataset.g!==SGRP));const sb=$('#saveBar');if(sb)sb.classList.toggle('hide',SGRP==='alerts'||SGRP==='maint')}
 document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>go(b.dataset.t));
 function paperRows(reps,withStop){return reps.map(rp=>{const v=rp.models.queue,st=rp.verdict.status;return `<tr${rp.status==='running'?'':' class="mut"'}><td><b>#${rp.run_id}</b> ${esc(rp.name)}${rp.status==='running'?'':' <span class="tag">'+esc(rp.status)+'</span>'}</td><td><b class="${{pass:'y',ahead:'y',fail:'n',behind:'n'}[st]}">${st.toUpperCase()}</b>${rp.verdict.enough_data?'':' <span class="mut" style="font-size:11px">early</span>'}</td><td class="r ${sgn(v.trading_pnl_exit)}"><b>${money(v.trading_pnl_exit)}</b></td><td class="r">${v.fills}</td><td class="r">${rp.days}</td>${withStop?`<td>${rp.status==='running'?`<button class="b" onclick="api('/api/mm/shadow/stop?run=${rp.run_id}',{method:'POST'}).then(loadMM)">Stop</button>`:esc(rp.status)}</td>`:''}</tr>`}).join('')}
 let boardTimer=null;
-const STC={qualified:'y',review:'w',collecting:'mut',failing:'n'};
+const STC={qualified:'y',review:'w',collecting:'mut',failing:'n',retired:'mut'};
 async function loadBoard(){const B=$('#boardBox');clearTimeout(boardTimer);try{
   const [sb,fv,gw,rs,cat,stt]=await Promise.all([api('/api/scoreboard'),api('/api/fairvalue').catch(()=>null),api('/api/gapwatch').catch(()=>null),api('/api/research').catch(()=>null),api('/api/catalog').catch(()=>null),api('/api/status').catch(()=>null)]);
   const al=sb.autolive,ago=t=>{if(!t)return 'never';const m=Math.round((Date.now()/1000-t)/60);return m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago'};
@@ -563,6 +565,16 @@ async function loadArb(){const B=$('#arbBody');try{const j=await api('/api/arb')
   h+=`<p class="mut" style="font-size:12px">${j.totals.map(t=>`${ARBK[t.kind]||t.kind}: ${t.n} found, ${t.settled||0} settled${t.settled?`, real result $${(+t.pnl_real).toFixed(2)} per set summed`:''}`).join(' · ')||'Nothing found yet.'} After each event settles, the real payout is checked against what was assumed.</p>`;
   B.innerHTML=h;B.classList.remove('mut')}catch(e){B.textContent=e.message}}
 async function arbNow(){try{const r=await api('/api/arb/scan',{method:'POST'});toast(r.started?'Scanning every open event (a few minutes)':'Already scanning','ok');setTimeout(loadArb,2000)}catch(e){toast(e.message,'err')}}
+const FEDO={C26:'Cut >25',C25:'Cut 25',H0:'Hold',H25:'Hike 25',H26:'Hike >25'};
+async function loadFed(){const B=$('#fedBody');try{const j=await api('/api/fed'),st=j.state;const by={};j.board.forEach(r=>{(by[r.meeting]=by[r.meeting]||[]).push(r)});
+  const ec=e=>e==null?'<td class="r mut">–</td>':`<td class="r ${e>=0.03?'y':e<=-0.05?'n':'mut'}">${e>0?'+':''}${(e*100).toFixed(1)}c</td>`;
+  let h=`<p class="${st.error?'n':'mut'}">${esc(st.error||st.note||'First check runs 2 minutes after start, then every 30 minutes.')}${st.last?' · '+new Date(st.last*1000).toLocaleTimeString():''}</p>`;
+  h+=(st.meetings||[]).length?`<p class="mut" style="font-size:12px">Futures path: ${st.meetings.map(m=>`${m.date}: ${m.delta_bp>0?'+':''}${m.delta_bp} bp`).join(' · ')}</p>`:'';
+  h+=Object.entries(by).slice(0,4).map(([d,rs])=>`<h4 style="margin:10px 0 4px">${d}</h4><table><thead><tr><th>Outcome</th><th class="r">Futures say</th><th class="r">Kalshi bid / ask</th><th class="r">Buy YES edge</th><th class="r">Buy NO edge</th></tr></thead><tbody>${rs.sort((a,b)=>Object.keys(FEDO).indexOf(a.outcome)-Object.keys(FEDO).indexOf(b.outcome)).map(r=>`<tr><td>${FEDO[r.outcome]||r.outcome}</td><td class="r">${(100*r.fair).toFixed(0)}%</td><td class="r">${Math.round(100*r.yes_bid)} / ${r.yes_ask?Math.round(100*r.yes_ask):'–'}c</td>${ec(r.yes_edge)}${ec(r.no_edge)}</tr>`).join('')}</tbody></table>`).join('');
+  h+=`<h4 style="margin:12px 0 4px">Paper picks (${j.min_edge_c}c+ edge after fees, next 3 meetings)</h4>`+(j.picks.length?`<table><thead><tr><th>Seen</th><th>Meeting</th><th>Buy</th><th class="r">Price</th><th class="r">Futures</th><th class="r">Edge</th><th>Status</th><th class="r">P&amp;L</th></tr></thead><tbody>${j.picks.map(p=>`<tr><td>${new Date(p.ts*1000).toLocaleString()}</td><td>${p.meeting}</td><td>${p.side.toUpperCase()} ${FEDO[p.outcome]||p.outcome}</td><td class="r">${Math.round(p.price*100)}c</td><td class="r">${Math.round(p.fair*100)}%</td><td class="r">${(p.edge*100).toFixed(1)}c</td><td>${p.status}</td><td class="r">${p.pnl==null?'':(p.pnl>0?'+':'')+p.pnl.toFixed(2)}</td></tr>`).join('')}</tbody></table>`:'<p class="mut">None yet.</p>')+
+  `<p class="mut" style="font-size:12px">Futures are ~10 minutes delayed (fine weeks ahead). The split between neighbouring 25 bp moves is the standard FedWatch simplification.</p>`;
+  B.innerHTML=h;B.classList.remove('mut')}catch(e){B.textContent=e.message}}
+async function fedNow(){try{toast('Checking…','ok');await api('/api/fed/scan',{method:'POST'});loadFed()}catch(e){toast(e.message,'err')}}
 const nf=x=>Math.round(x).toLocaleString();
 async function loadCat(){const B=$('#catBody');try{const j=await api('/api/catalog'),c=j.catalog,st=j.state;let h=st.running?`<p class="w">Reading Kalshi… ${esc(st.progress)}</p>`:st.error?`<p class="n">${esc(st.error)}</p>`:'';if(st.running)setTimeout(loadCat,5000);
   if(!c){B.innerHTML=h+'Not read yet - press "Re-read Kalshi".';return}

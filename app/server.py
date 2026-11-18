@@ -1237,6 +1237,22 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     def gapwatch_status():
         return gapwatch.status()
 
+    from .fedwatch import FedWatch
+    fed = FedWatch(lambda: cfg.data.get("fed") or {}, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+    if start_engine:
+        fed.start()
+
+    @app.get("/api/fed")
+    def fed_view():
+        return fed.status()
+
+    @app.post("/api/fed/scan")
+    def fed_scan_now():
+        try:
+            return fed.scan()
+        except Exception as e:
+            raise HTTPException(502, f"Fed scan failed: {e}"[:300])
+
     from .arb import ArbScanner
     arb = ArbScanner(lambda: cfg.data.get("arb") or {}, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
     if start_engine:

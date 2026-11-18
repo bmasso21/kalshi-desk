@@ -107,7 +107,10 @@ def main():
 
     # ---- the paper rule ----
     wdb = WarehouseDB(Path(tempfile.mkdtemp()) / "w.db")
-    gw = GW.GapWatch(lambda: {}, wdb, k, fv=g)
+    off = GW.GapWatch(lambda: {}, WarehouseDB(Path(tempfile.mkdtemp()) / "o.db"), k, fv=g)
+    off.check("KXGOLDH", CLOSE, 40, NOW)
+    check("the gold model rule is retired by default (no paper buys unless switched back on)", not off.db.query("SELECT 1 FROM gw_fv_picks"))
+    gw = GW.GapWatch(lambda: {"gold_fv_rule": True}, wdb, k, fv=g)
     gw.check("KXGOLDH", CLOSE, 40, NOW)
     fv = {(r["ticker"], r["side"]): r for r in wdb.query("SELECT * FROM gw_fv_picks")}
     want = set()

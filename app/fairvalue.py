@@ -288,6 +288,8 @@ class FairValue:
                 continue
             mt = match_fixture({"start_ts": start, "p1": c["home"], "p2": c["away"]}, kev)
             if not mt:
+                if len(out.setdefault("unmatched", [])) < 60:             # kept for diagnosis: which names failed to pair up
+                    out["unmatched"].append({"home": c["home"], "away": c["away"], "start": start})
                 continue
             out["matched"] += 1
             ev_t, t_home, t_away, _how = mt
@@ -372,6 +374,12 @@ class FairValue:
                     res.append({"sport": sport, "error": str(e)[:200]})
         self.db.put("fv_last_by_sport", last)
         self.db.put("fv_retry", retry)
+        for r in res:
+            if "unmatched" in r:
+                um = self.db.get("fv_unmatched") or {}
+                um[r["sport"]] = {"ts": time.time(), "games": r["games"], "matched": r["matched"], "unmatched": r["unmatched"],
+                                  "kalshi_names": sorted({m.get("yes_sub_title") or "" for ms in self.kalshi_events(self.sports()[r["sport"]]["series"]).values() for m in ms})[:400]}
+                self.db.put("fv_unmatched", um)
         self.db.execute("DELETE FROM fv_board2 WHERE commence_ts < ?", (time.time() - 6 * 3600,))
         if res:
             nm = lambda r: r["sport"].split("_")[-1].upper()
@@ -448,7 +456,7 @@ class FairValue:
                 "sports": self.sports(), "min_edge_c": round(100 * float(self.opt("fv_min_edge", 0.02)), 1),
                 "lean_edge_c": round(100 * float(self.opt("fv_lean_edge", 0.0)), 1),
                 "board": board, "picks": self.db.query("SELECT * FROM fv_picks2 ORDER BY ts DESC LIMIT 300"), "summary": self.summary(),
-                "calls": self.db.query("SELECT * FROM fv_calls ORDER BY ts DESC LIMIT 30")}
+                "calls": self.db.query("SELECT * FROM fv_calls ORDER BY ts DESC LIMIT 30"), "unmatched": self.db.get("fv_unmatched") or {}}
 
     # -------------------------------------------------------------------- loop --
     def due(self) -> bool:

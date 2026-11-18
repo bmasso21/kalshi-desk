@@ -257,12 +257,17 @@ def _toks(s: str) -> list[str]:
 def name_match(kalshi_name: str, participant: str) -> bool:
     """Every token of Kalshi's short team name ('Los Angeles L') is a prefix of a token in the full name
     ('Los Angeles Lakers'), in order."""
-    kt, pt = _toks(kalshi_name), _toks(participant)
+    import re
+    kt = _toks(re.sub(r"\([^)]*\)", " ", kalshi_name or ""))    # "Miami (FL)" -> "Miami": the other team and the date still have to match
+    pt = _toks(re.sub(r"\([^)]*\)", " ", participant or ""))
     if not kt or not pt:
         return False
+
+    def same(t, p):                                               # "St." is Saint or State in college names
+        return p.startswith(t) or (t == "st" and p in ("saint", "state")) or (t in ("saint", "state") and p == "st")
     j = 0
     for t in kt:
-        while j < len(pt) and not pt[j].startswith(t):
+        while j < len(pt) and not same(t, pt[j]):
             j += 1
         if j == len(pt):
             return False

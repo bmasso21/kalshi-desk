@@ -200,7 +200,7 @@ class ArbScanner:
             loose = [x for x in cands if not x[1]["locked"]][: int(self.opt("arb_max_yes_baskets", 15))]
             seen = set()
             for ev, c in locked + loose:
-                time.sleep(float(self.opt("arb_pause_sec", 0.5)))           # gentle on Kalshi: the collector shares the limit
+                time.sleep(float(self.opt("arb_pause_sec", 1.0)))           # gentle on Kalshi: the collector shares the limit
                 tickers = [l["ticker"] for l in c["legs"]]
                 try:
                     from .kalshi_client import book_from_orderbook
@@ -263,7 +263,7 @@ class ArbScanner:
                     self.scan()
                 except Exception as e:
                     self.state["error"] = str(e)[:300]
-            self._stop.wait(float(self.opt("arb_every_min", 60)) * 60)
+            self._stop.wait(float(self.opt("arb_every_min", 120)) * 60)
 
     def start(self):
         threading.Thread(target=self.loop, daemon=True, name="arb").start()
@@ -272,7 +272,7 @@ class ArbScanner:
         self._stop.set()
 
     def status(self) -> dict:
-        return {"state": self.state, "every_min": float(self.opt("arb_every_min", 60)),
+        return {"state": self.state, "every_min": float(self.opt("arb_every_min", 120)),
                 "open": self.db.query("SELECT * FROM arb_opps WHERE status='open' AND locked=1 ORDER BY profit_total DESC LIMIT 50"),
                 "open_unlocked": self.db.query("SELECT * FROM arb_opps WHERE status='open' AND locked=0 ORDER BY profit_total DESC LIMIT 30"),
                 "recent": self.db.query("SELECT * FROM arb_opps ORDER BY last_seen DESC LIMIT 50"),

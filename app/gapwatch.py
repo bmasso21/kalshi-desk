@@ -137,7 +137,8 @@ class GapWatch:
                                        ask, bid, lp, round(TAKER * ask * (1 - ask), 6)))
                 picks += cur.rowcount if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
         note = "" if level is not None else ("no contracts for this close" if not mk else "could not read the level (no tight quotes either side of 50c)")
-        if self.fv is not None and check_min in FV_CHECKS and series == getattr(self.fv, "series", None):
+        if self.fv is not None and self.opt("gold_fv_rule", False) and check_min in FV_CHECKS and series == getattr(self.fv, "series", None):
+            # retired 18 Nov 2026 (-25% on 51 paper buys: PAXG is too noisy a gold price); switch back on with gold_fv_rule
             try:
                 fvp = self.fv_check(close_ts, check_min, now, level)
                 note = (note + f" · fair value: {fvp} paper buys").strip(" ·")

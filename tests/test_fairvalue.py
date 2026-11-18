@@ -250,6 +250,10 @@ def main():
     k.__dict__.pop("markets")
     r = fv.poll("americanfootball_nfl")
     check("a manual pull never reuses cached odds (it fetches fresh)", len(http.calls) == c0 + 1, len(http.calls) - c0)
+    from app.sports import name_match
+    check("college names: St. = Saint or State, a (FL)-style qualifier is ignored",
+          name_match("St. John's", "St. John's Red Storm") and name_match("Saint Mary's", "St. Mary's Gaels") and name_match("Miami (FL)", "Miami Hurricanes")
+          and name_match("Kansas St.", "Kansas State Wildcats") and not name_match("Duke", "Kansas State Wildcats"))
     d = FV.DEFAULT_SPORTS["basketball_ncaab"]
     check("college basketball is scanned by default: game, spread and total, every 12 hours",
           d["series"] == "KXNCAAMBGAME" and d["markets"] == "h2h,spreads,totals" and d["series"].replace("GAME", "SPREAD") == "KXNCAAMBSPREAD", d)
