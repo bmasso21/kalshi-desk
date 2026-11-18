@@ -281,7 +281,7 @@ def baskets(conn, flt: dict | None = None) -> dict:
 
 
 # ---------------------------------------------------------------- scalp --
-EXTRA = ("scalp", "hourly")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
+EXTRA = ("scalp", "hourly", "goldfv")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
 SCALP_ENTRY_MIN = (2, 5, 10)         # minutes after the contract opens
 SCALP_STOPS = (None, 0.25, 0.50)     # sell if the price falls this fraction below what was paid; None = no stop
 SCALP_TARGETS = (0.05, 0.10, 0.20, 0.35, 0.60, None)   # take profit at +x%; None = hold to the end
@@ -662,7 +662,52 @@ def gap(conn, flt: dict | None = None, probes: list | None = None) -> dict:
     return out
 
 
-RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly}
+# ------------------------------------------------------------ gold fair value --
+PUBLIC = None                 # public production market-data client, set by the server (settlement values)
+GOLD_FUTURES = ("GCZ26.CMX", "GC=F")   # the contract whose offset to Pyth was measured; the continuous one as a fallback
+
+
+def goldfv(conn, flt: dict | None = None, session=None, client=None) -> dict:
+    """Hourly gold: a model price from gold itself against the prices Kalshi takers actually paid (see app/goldfv.py)."""
+    from . import goldfv as G
+    import requests
+    flt = {**(flt or {})}
+    flt["series"] = flt.get("series") or ["KXGOLDH"]
+    w, args = _where(flt)
+    rows = conn.execute(f"""SELECT m.ticker, m.close_ts c, m.result res, m.strike_type, m.floor_strike, m.series_ticker ser
+                            FROM wh_markets m WHERE {w} AND m.close_ts - m.open_ts BETWEEN 1800 AND ?""", args + [10 * 86400]).fetchall()
+    markets = [{"ticker": r["ticker"], "close": r["c"], "strike": _strike(r), "result": r["res"]} for r in rows]
+    markets = [m for m in markets if m["strike"] is not None]
+    if not markets:
+        return {"trades": 0, "note": "no settled hourly 'above X' gold contracts stored"}
+    trades = {}
+    for m in markets:
+        tr = conn.execute("SELECT ts, yes_price yp, taker_outcome_side tos, taker_book_side tbs FROM wh_trades WHERE ticker=? AND ts<=? ORDER BY ts",
+                          (m["ticker"], m["close"])).fetchall()
+        trades[m["ticker"]] = [(r["ts"], r["yp"], r["tos"] if r["tos"] in ("yes", "no") else ("yes" if r["tbs"] == "bid" else "no"))
+                               for r in tr if r["yp"] is not None]
+    lo, hi = min(m["close"] for m in markets) - 4 * 3600, max(m["close"] for m in markets) + 120
+    session = session or requests.Session()
+    client = client or PUBLIC
+    if client is None:
+        raise RuntimeError("no market-data client for Kalshi's settlement values")
+    settles = {}
+    for ser in flt["series"]:
+        settles.update(G.fetch_settles(client, ser, lo))
+    out, used = None, None
+    for sym in GOLD_FUTURES:
+        bars = G.fetch_futures(session, sym, lo, hi)
+        if len(bars) > 100:
+            out, used = G.core(markets, trades, G.Gold(bars), settles, _Acc), sym
+            break
+    if out is None:
+        return {"trades": 0, "note": "no 1-minute gold futures data for this period (Yahoo keeps about 30 days)"}
+    out["futures_symbol"] = used
+    out["settlements"] = len(settles)
+    return out
+
+
+RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly, "goldfv": goldfv}
 
 
 class Studies:

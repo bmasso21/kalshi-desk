@@ -62,6 +62,8 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         return wx_model["m"]
     bt = Backtester(wdb)
     from .studies import KINDS as STUDY_KINDS, Studies
+    from . import studies as studies_mod
+    studies_mod.PUBLIC = KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"])
     studies = Studies(wdb)
     studies.recover()
     from .auth import COOKIE, Auth

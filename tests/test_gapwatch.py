@@ -64,6 +64,12 @@ def main():
           close(picks["G-T3840"]["ask"], .92) and close(picks["G-T3870"]["ask"], .94) and close(picks["G-T3840"]["gap"], 15.0), (picks["G-T3840"]["ask"], picks["G-T3870"]["ask"]))
     check("the last trade is kept for the side bought, to measure how far the ask sits above it",
           close(picks["G-T3840"]["last"], .91) and close(picks["G-T3870"]["last"], 1 - .07), (picks["G-T3840"]["last"], picks["G-T3870"]["last"]))
+    k3 = FakeKalshi()
+    for b in k3.book:
+        b["last_price_dollars"] = "0.0000"
+    gw3 = GW.GapWatch(lambda: {}, WarehouseDB(Path(tempfile.mkdtemp()) / "x.db"), k3)
+    gw3.check("KXGOLDH", CLOSE, 30, CLOSE - 1800)
+    check("a contract that never traded (last price 0) has no last trade, not a 0c one", all(r["last"] is None for r in gw3.db.query("SELECT last FROM gw_picks")))
     gw.check("KXGOLDH", CLOSE, 30, CLOSE - 1790)
     check("a contract is recorded once per check time", len(wdb.query("SELECT 1 FROM gw_picks")) == 4)
     # due(): the 30-minute check runs once in its two-minute window

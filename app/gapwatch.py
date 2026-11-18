@@ -104,7 +104,8 @@ class GapWatch:
             yb, ya = fnum(m.get("yes_bid_dollars")), fnum(m.get("yes_ask_dollars"))
             if k is None or yb is None or ya is None or not (0 <= yb < ya <= 1):
                 continue
-            quotes.append((k, m, yb, ya, fnum(m.get("last_price_dollars"))))
+            last = fnum(m.get("last_price_dollars"))
+            quotes.append((k, m, yb, ya, last if last is not None and 0 < last < 1 else None))   # 0 = never traded
             if ya - yb <= 0.10:                                       # only tight quotes locate the level
                 rows.append((k, (yb + ya) / 2))
         level = level_from_quotes(rows)
