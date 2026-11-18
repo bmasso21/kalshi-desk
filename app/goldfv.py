@@ -183,3 +183,21 @@ def fetch_settles(client, series: str, since: float) -> dict:
             except ValueError:
                 pass
     return out
+
+
+def fetch_coinbase(session, product: str, start: float, end: float) -> dict:
+    """Coinbase Exchange 1-minute closes (public, no key), 300 minutes per request. Keyed by bar START like Yahoo's."""
+    bars = {}
+    t = int(start // 60 * 60)
+    while t < end:
+        t2 = int(min(end, t + 300 * 60))
+        iso = lambda x: dt.datetime.fromtimestamp(x, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r = session.get(f"https://api.exchange.coinbase.com/products/{product}/candles",
+                        params={"granularity": 60, "start": iso(t), "end": iso(t2)},
+                        headers={"User-Agent": "KalshiDesk"}, timeout=30)
+        r.raise_for_status()
+        for row in r.json() or []:                       # [time, low, high, open, close, volume]
+            bars[int(row[0])] = float(row[4])
+        t = t2
+        time.sleep(0.15)
+    return bars

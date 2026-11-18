@@ -326,10 +326,12 @@ class Warehouse:
         since = time.time() - days * 86400
         got = []
 
+        vmin = float(self._sample_opt(cat, "min_volume", 0, st) or 0)    # skip contracts nobody traded (hourly ladders list dozens)
+
         def pull(params):
-            for m in self.client.paginate("/markets", "markets", params, max_items=max(3000, per * 3)):
+            for m in self.client.paginate("/markets", "markets", params, max_items=max(3000, per * 3) * (8 if vmin else 1)):
                 ts = iso_ts(m.get("settlement_ts")) or iso_ts(m.get("close_time")) or 0
-                if ts >= since and (m.get("result") in ("yes", "no")):
+                if ts >= since and (m.get("result") in ("yes", "no")) and (not vmin or (f(m.get("volume_fp") or m.get("volume")) or 0) >= vmin):
                     got.append((ts, m))
         base = {"series_ticker": st, "status": "settled", "limit": 1000}
         try:                                    # ask only for the window (a series of 15-minute contracts has thousands of older ones)

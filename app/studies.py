@@ -665,10 +665,14 @@ def gap(conn, flt: dict | None = None, probes: list | None = None) -> dict:
 # ------------------------------------------------------------ gold fair value --
 PUBLIC = None                 # public production market-data client, set by the server (settlement values)
 GOLD_FUTURES = ("GCZ26.CMX", "GC=F")   # the contract whose offset to Pyth was measured; the continuous one as a fallback
+UNDERLYING = {"KXGOLDH": ("yahoo", GOLD_FUTURES),            # settles on Pyth 1OZGOLD/USD
+              "KXBTCD": ("coinbase", ("BTC-USD",)),          # settle on CF Benchmarks' real-time index (60-second average)
+              "KXETHD": ("coinbase", ("ETH-USD",))}
 
 
 def goldfv(conn, flt: dict | None = None, session=None, client=None) -> dict:
-    """Hourly gold: a model price from gold itself against the prices Kalshi takers actually paid (see app/goldfv.py)."""
+    """Hourly 'above X' contracts (gold, Bitcoin, Ethereum): a model price from the underlying itself against the prices
+    Kalshi takers actually paid (see app/goldfv.py). One series per run; the underlying's free price history is picked by series."""
     from . import goldfv as G
     import requests
     flt = {**(flt or {})}
@@ -679,7 +683,7 @@ def goldfv(conn, flt: dict | None = None, session=None, client=None) -> dict:
     markets = [{"ticker": r["ticker"], "close": r["c"], "strike": _strike(r), "result": r["res"]} for r in rows]
     markets = [m for m in markets if m["strike"] is not None]
     if not markets:
-        return {"trades": 0, "note": "no settled hourly 'above X' gold contracts stored"}
+        return {"trades": 0, "note": "no settled hourly 'above X' contracts stored for this series"}
     trades = {}
     for m in markets:
         tr = conn.execute("SELECT ts, yes_price yp, taker_outcome_side tos, taker_book_side tbs FROM wh_trades WHERE ticker=? AND ts<=? ORDER BY ts",
@@ -695,13 +699,14 @@ def goldfv(conn, flt: dict | None = None, session=None, client=None) -> dict:
     for ser in flt["series"]:
         settles.update(G.fetch_settles(client, ser, lo))
     out, used = None, None
-    for sym in GOLD_FUTURES:
-        bars = G.fetch_futures(session, sym, lo, hi)
+    src, syms = UNDERLYING.get(flt["series"][0], UNDERLYING["KXGOLDH"])
+    for sym in syms:
+        bars = G.fetch_futures(session, sym, lo, hi) if src == "yahoo" else G.fetch_coinbase(session, sym, lo, hi)
         if len(bars) > 100:
             out, used = G.core(markets, trades, G.Gold(bars), settles, _Acc), sym
             break
     if out is None:
-        return {"trades": 0, "note": "no 1-minute gold futures data for this period (Yahoo keeps about 30 days)"}
+        return {"trades": 0, "note": "no 1-minute price history for the underlying in this period"}
     out["futures_symbol"] = used
     out["settlements"] = len(settles)
     return out

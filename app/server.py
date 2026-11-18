@@ -429,7 +429,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                             if not isinstance(ov, dict):
                                 continue
                             o2 = {}
-                            for k, lo, hi in (("series_per_category", 1, 200), ("markets_per_series", 1, 12000), ("days", 1, 365), ("max_trades_per_market", 100, 200000)):
+                            for k, lo, hi in (("series_per_category", 1, 200), ("markets_per_series", 1, 12000), ("days", 1, 365), ("max_trades_per_market", 100, 200000), ("min_volume", 0, 10 ** 6)):
                                 if k in ov:
                                     try:
                                         o2[k] = max(lo, min(hi, int(float(ov[k]))))
@@ -1221,6 +1221,18 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     @app.get("/api/gapwatch")
     def gapwatch_status():
         return gapwatch.status()
+
+    from .catalog import Catalog
+    catalog = Catalog(wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+
+    @app.get("/api/catalog")
+    def catalog_view():
+        return catalog.latest()
+
+    @app.post("/api/catalog/refresh")
+    def catalog_refresh():
+        """Read every open Kalshi market (public data, about a minute in the background)."""
+        return {"started": catalog.start()}
 
     @app.get("/api/goldfv/live")
     def goldfv_live():
