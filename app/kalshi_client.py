@@ -76,7 +76,8 @@ class TokenBucket:
 
 # One request budget per host for every unauthenticated (public market data) client in the process: the scanners,
 # the catalogue and the fair-value tools all read Kalshi production, and Kalshi limits reads per caller, so separate
-# budgets used to add up past the limit (429 "too many requests"). 100 tokens/s at 10 per request = 10 reads/s.
+# budgets used to add up past the limit (429 "too many requests"). 60 tokens/s at 10 per request = 6 reads/s
+# (the data collector keeps its own, slower budget on top).
 _SHARED_READ: dict = {}
 _SHARED_LOCK = threading.Lock()
 RATE_LIMITS: dict = {}            # host -> deque of 429 timestamps (for the dashboard)
@@ -85,7 +86,7 @@ RATE_LIMITS: dict = {}            # host -> deque of 429 timestamps (for the das
 def shared_read_bucket(host: str) -> "TokenBucket":
     with _SHARED_LOCK:
         if host not in _SHARED_READ:
-            _SHARED_READ[host] = TokenBucket(rate=100, capacity=200)
+            _SHARED_READ[host] = TokenBucket(rate=60, capacity=120)
         return _SHARED_READ[host]
 
 

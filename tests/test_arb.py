@@ -51,16 +51,21 @@ def main():
     lad = {"event_ticker": "L", "series_ticker": "S", "mutually_exclusive": False, "markets": [
         mk("L-100", .38, .40, strike_type="greater", floor_strike=100), mk("L-110", .45, .47, strike_type="greater", floor_strike=110),
         mk("L-120", .10, .12, strike_type="greater", floor_strike=120)]}
+    for m in lad["markets"]:
+        m["ticker"] = "L-X-" + m["ticker"].split("-")[1]
     lc = [x for x in A.candidates(lad, {}) if x["kind"] == "ladder"]
-    check("ladder: a higher strike priced above a lower one -> YES low + NO high", len(lc) == 1 and lc[0]["legs"][0] == {"ticker": "L-100", "side": "yes", "price": 0.40}
-          and lc[0]["legs"][1]["ticker"] == "L-110" and close(lc[0]["legs"][1]["price"], 0.55), lc)
+    ppg = {"event_ticker": "P", "series_ticker": "S", "mutually_exclusive": False, "markets": [
+        mk("P-GREEN-20", .15, .17, strike_type="greater", floor_strike=20.3), mk("P-IRVING-24", .30, .32, strike_type="greater", floor_strike=24.0)]}
+    check("different underlyings in one event (each player's average) are never treated as a ladder", not A.candidates(ppg, {}))
+    check("ladder: a higher strike priced above a lower one -> YES low + NO high", len(lc) == 1 and lc[0]["legs"][0] == {"ticker": "L-X-100", "side": "yes", "price": 0.40}
+          and lc[0]["legs"][1]["ticker"] == "L-X-110" and close(lc[0]["legs"][1]["price"], 0.55), lc)
     # confirm at the order book: sizes cap the sets; a vanished price kills it
-    books = {"L-100": {"yes_asks": [(0.40, 30)], "no_asks": [(0.62, 5)]}, "L-110": {"yes_asks": [(0.47, 9)], "no_asks": [(0.55, 12)]}}
+    books = {"L-X-100": {"yes_asks": [(0.40, 30)], "no_asks": [(0.62, 5)]}, "L-X-110": {"yes_asks": [(0.47, 9)], "no_asks": [(0.55, 12)]}}
     ok = A.confirm(lc[0], books)
     per = 1 - 0.95 - 0.02 - 0.02
     tot = 12 * 0.05 - (A.fee(0.40, 12) + A.fee(0.55, 12))
     check("confirmed at live top of book: sets = smallest size, fees per order rounded up", ok and ok["sets"] == 12 and close(ok["profit_per_set"], round(per, 4)) and close(ok["profit_total"], round(tot, 2)), ok)
-    books["L-110"]["no_asks"] = [(0.61, 12)]
+    books["L-X-110"]["no_asks"] = [(0.61, 12)]
     check("if the live price no longer gives a profit, nothing is recorded", A.confirm(lc[0], books) is None)
 
     # ---- the scanner end to end ----
@@ -77,14 +82,14 @@ def main():
 
         def orderbooks(self, tickers):
             ob = {"G1-A": {"yes_dollars": [["0.58", "20"]], "no_dollars": [["0.40", "20"]]}, "G1-B": {"yes_dollars": [["0.47", "15"]], "no_dollars": [["0.51", "15"]]},
-                  "L-100": {"yes_dollars": [["0.38", "5"]], "no_dollars": [["0.60", "30"]]}, "L-110": {"yes_dollars": [["0.45", "12"]], "no_dollars": [["0.53", "9"]]}}
+                  "L-X-100": {"yes_dollars": [["0.38", "5"]], "no_dollars": [["0.60", "30"]]}, "L-X-110": {"yes_dollars": [["0.45", "12"]], "no_dollars": [["0.53", "9"]]}}
             return {t: ob[t] for t in tickers}
 
         def markets(self, status=None, tickers=None, max_items=None, **kw):
             return [{"ticker": t, "result": self.results.get(t, "")} for t in tickers]
     wdb = WarehouseDB(Path(tempfile.mkdtemp()) / "w.db")
     k = K()
-    sc = A.ArbScanner(lambda: {}, wdb, k)
+    sc = A.ArbScanner(lambda: {"arb_pause_sec": 0}, wdb, k)
     r = sc.scan()
     opps = {o["kind"]: o for o in wdb.query("SELECT * FROM arb_opps")}
     check("scan: both opportunities confirmed at the books and recorded with sizes", r["confirmed"] == 2 and set(opps) == {"no_basket", "ladder"}
@@ -92,7 +97,7 @@ def main():
     check("the scanner never touches order methods", not any(hasattr(k, a) for a in ("create_order", "cancel_order", "amend_order")))
     sc.scan()
     check("seen again -> counted, not duplicated", wdb.query("SELECT COUNT(*) n, MAX(seen) s FROM arb_opps")[0] == {"n": 2, "s": 2})
-    k.results = {"G1-A": "yes", "G1-B": "no", "L-100": "yes", "L-110": "no"}
+    k.results = {"G1-A": "yes", "G1-B": "no", "L-X-100": "yes", "L-X-110": "no"}
     sc.settle()
     st = {o["kind"]: o for o in wdb.query("SELECT * FROM arb_opps")}
     nb_cost = st["no_basket"]["cost"]

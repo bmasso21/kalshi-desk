@@ -84,8 +84,19 @@ def candidates(event: dict, fee_info: dict) -> list[dict]:
             fees = sum(fee(l["price"], 1, mult, ftype) for l in legs)
             if 1 - cost - fees > 0.0001:
                 out.append({"kind": "yes_basket", "legs": legs, "payout_min": 0.0, "locked": False})
-    lad = sorted(((fnum(m.get("floor_strike")), m) for m in ms if (m.get("strike_type") or "").lower() in ("greater", "greater_or_equal")
-                  and fnum(m.get("floor_strike")) is not None), key=lambda x: x[0])
+    # a ladder is ONE underlying at several strikes: the same ticker apart from its strike part and the same close.
+    # (An event can hold strikes for different things, e.g. each player's season average: those are not a ladder.)
+    groups = {}
+    for m in ms:
+        if (m.get("strike_type") or "").lower() in ("greater", "greater_or_equal") and fnum(m.get("floor_strike")) is not None:
+            groups.setdefault((m["ticker"].rsplit("-", 1)[0], m.get("close_time")), []).append((fnum(m.get("floor_strike")), m))
+    for g in groups.values():
+        out += _ladder(sorted(g, key=lambda x: x[0]), mult, ftype)
+    return out
+
+
+def _ladder(lad, mult, ftype) -> list[dict]:
+    out = []
     for i in range(len(lad)):
         lo_k, lo = lad[i]
         _, lo_ask = _quotes(lo)
@@ -141,6 +152,10 @@ class ArbScanner:
         self._stop = threading.Event()
         self._fees = (0.0, {})
         self.state = {"running": False, "last_scan": None, "error": None, "note": ""}
+        for r in wdb.query("SELECT id, legs FROM arb_opps WHERE kind='ladder'"):     # 3.21.0 paired different underlyings: drop those
+            lg = json.loads(r["legs"])
+            if len({l["ticker"].rsplit("-", 1)[0] for l in lg}) > 1:
+                wdb.execute("DELETE FROM arb_opps WHERE id=?", (r["id"],))
 
     def opt(self, k, default):
         v = (self._cfg() or {}).get(k)
@@ -167,8 +182,13 @@ class ArbScanner:
                 for c in candidates(ev, fi):
                     cands.append((ev, c))
             n_c = len(cands)
+            # locked kinds first, best listed profit first; YES baskets (never locked) get only a few checks
+            cands.sort(key=lambda x: (not x[1]["locked"], -(x[1]["payout_min"] - sum(l["price"] for l in x[1]["legs"]))))
+            locked = [x for x in cands if x[1]["locked"]][: int(self.opt("arb_max_confirm", 150))]
+            loose = [x for x in cands if not x[1]["locked"]][: int(self.opt("arb_max_yes_baskets", 15))]
             seen = set()
-            for ev, c in cands[: int(self.opt("arb_max_confirm", 300))]:
+            for ev, c in locked + loose:
+                time.sleep(float(self.opt("arb_pause_sec", 0.5)))           # gentle on Kalshi: the collector shares the limit
                 tickers = [l["ticker"] for l in c["legs"]]
                 try:
                     from .kalshi_client import book_from_orderbook
@@ -241,7 +261,8 @@ class ArbScanner:
 
     def status(self) -> dict:
         return {"state": self.state, "every_min": float(self.opt("arb_every_min", 60)),
-                "open": self.db.query("SELECT * FROM arb_opps WHERE status='open' ORDER BY profit_total DESC LIMIT 50"),
+                "open": self.db.query("SELECT * FROM arb_opps WHERE status='open' AND locked=1 ORDER BY profit_total DESC LIMIT 50"),
+                "open_unlocked": self.db.query("SELECT * FROM arb_opps WHERE status='open' AND locked=0 ORDER BY profit_total DESC LIMIT 30"),
                 "recent": self.db.query("SELECT * FROM arb_opps ORDER BY last_seen DESC LIMIT 50"),
                 "scans": self.db.query("SELECT * FROM arb_scans ORDER BY id DESC LIMIT 12"),
                 "totals": self.db.query("SELECT kind, COUNT(*) n, SUM(status='settled') settled, SUM(pnl_real) pnl_real, SUM(profit_per_set) locked_per_set "

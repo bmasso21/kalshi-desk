@@ -42,7 +42,7 @@ def main():
     b = KC.KalshiClient("https://api.example.test/trade-api/v2")
     c = KC.KalshiClient("https://other.example.test/trade-api/v2")
     check("public readers of the same host share one request budget", a.read_bucket is b.read_bucket and a.read_bucket is not c.read_bucket)
-    check("the shared budget is 10 reads a second", a.read_bucket.rate == 100 and a.read_bucket.capacity == 200)
+    check("the shared budget is 6 reads a second", a.read_bucket.rate == 60 and a.read_bucket.capacity == 120)
     sleeps = []
     KC.time.sleep = lambda s: sleeps.append(s)
     a.session = Ses([429, 429, 200])
