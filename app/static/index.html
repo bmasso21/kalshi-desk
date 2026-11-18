@@ -85,7 +85,7 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
 <div id="sub"></div>
 <main>
 <!-- HOME -->
-<section id="t-home"><div id="homeBox"><div class="card mut">Loading…</div></div></section>
+<section id="t-home"><div id="boardBox"></div><div id="homeBox"><div class="card mut">Loading…</div></div></section>
 <!-- SCANNER -->
 <section id="t-scanner" class="hide">
   <div class="card row"><button class="b pri" onclick="api('/api/scan',{method:'POST'}).then(()=>toast('Scan queued'))">Scan now</button>
@@ -215,12 +215,41 @@ function go(top,sub){TOP=top;const subs=TABS[top];sub=sub||SUBSEL[top]||subs[0][
   document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x.dataset.t===top));
   $('#sub').innerHTML=subs.length>1?subs.map(([k,l])=>`<button class="${k===sub?'on':''}" onclick="go('${top}','${k}')">${l}</button>`).join(''):'';
   const [sec,grp]=sub.split(':');document.querySelectorAll('main>section').forEach(x=>x.classList.toggle('hide',x.id!=='t-'+sec));
-  const LOAD={home:loadHome,scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:()=>{loadRewards();loadMM()},portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,weather:loadWeather,research:()=>{loadResearch();loadGW();loadGL();loadCat()},fairvalue:loadFV};
+  const LOAD={home:()=>{loadBoard();loadHome()},scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:()=>{loadRewards();loadMM()},portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,weather:loadWeather,research:()=>{loadResearch();loadGW();loadGL();loadCat()},fairvalue:loadFV};
   if(sec==='settings'){SGRP=grp;if(!SET_LOADED){SET_LOADED=true;loadSettings()}else showGrp()}else{SET_LOADED=false;LOAD[sec]()}
   window.scrollTo(0,0)}
 function showGrp(){document.querySelectorAll('#settingsBox [data-g]').forEach(e=>e.classList.toggle('hide',e.dataset.g!==SGRP));const sb=$('#saveBar');if(sb)sb.classList.toggle('hide',SGRP==='alerts'||SGRP==='maint')}
 document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>go(b.dataset.t));
 function paperRows(reps,withStop){return reps.map(rp=>{const v=rp.models.queue,st=rp.verdict.status;return `<tr${rp.status==='running'?'':' class="mut"'}><td><b>#${rp.run_id}</b> ${esc(rp.name)}${rp.status==='running'?'':' <span class="tag">'+esc(rp.status)+'</span>'}</td><td><b class="${{pass:'y',ahead:'y',fail:'n',behind:'n'}[st]}">${st.toUpperCase()}</b>${rp.verdict.enough_data?'':' <span class="mut" style="font-size:11px">early</span>'}</td><td class="r ${sgn(v.trading_pnl_exit)}"><b>${money(v.trading_pnl_exit)}</b></td><td class="r">${v.fills}</td><td class="r">${rp.days}</td>${withStop?`<td>${rp.status==='running'?`<button class="b" onclick="api('/api/mm/shadow/stop?run=${rp.run_id}',{method:'POST'}).then(loadMM)">Stop</button>`:esc(rp.status)}</td>`:''}</tr>`}).join('')}
+let boardTimer=null;
+const STC={qualified:'y',review:'w',collecting:'mut',failing:'n'};
+async function loadBoard(){const B=$('#boardBox');clearTimeout(boardTimer);try{
+  const [sb,fv,gw,rs,cat]=await Promise.all([api('/api/scoreboard'),api('/api/fairvalue').catch(()=>null),api('/api/gapwatch').catch(()=>null),api('/api/research').catch(()=>null),api('/api/catalog').catch(()=>null)]);
+  const al=sb.autolive,ago=t=>{if(!t)return 'never';const m=Math.round((Date.now()/1000-t)/60);return m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago'};
+  const chip=(cl,label,val)=>`<span class="chip ${cl}">${label} <b>${val}</b></span>`;
+  let h=`<div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Strategies</h3><span class="mut" style="font-size:12px">bar to go live: ${sb.bar.min_trades}+ settled paper trades, ${sb.bar.min_events}+ separate games/hours, profit after fees in both halves, t ≥ ${sb.bar.min_t}</span></div>`;
+  h+=`<div class="tw"><table style="margin-top:8px"><thead><tr><th>Strategy</th><th>Status</th><th class="r">Trades</th><th class="r">Won</th><th class="r">P&amp;L</th><th class="r">Return</th><th class="r">t</th><th>Open</th></tr></thead><tbody>`;
+  h+=sb.strategies.map(x=>{const c=x.score,v=x.verdict,bad=v.rules.filter(r=>!r.ok).map(r=>r.detail).join(' · ');
+    return `<tr title="${esc(x.description||'')}"><td><b>${esc(x.name)}</b><div class="mut" style="font-size:11px">${esc(x.market)}</div></td><td class="${STC[v.status]||''}"><b>${v.status.toUpperCase()}</b>${v.progress_pct!=null&&v.status==='collecting'?` <span class="mut">${v.progress_pct}%</span>`:''}<div class="mut" style="font-size:11px;max-width:360px">${esc(bad||'all rules met')}</div></td>
+    <td class="r">${c.trades??0}</td><td class="r">${c.wins!=null?c.wins+'/'+c.trades:'–'}</td><td class="r ${c.pnl>0?'y':c.pnl<0?'n':''}">${c.pnl==null?'–':(c.pnl>0?'+':'')+'$'+(+c.pnl).toFixed(2)}</td><td class="r">${c.return_pct==null?'–':c.return_pct+'%'}</td><td class="r">${c.t??'–'}</td><td>${x.open??''}</td></tr>`}).join('');
+  h+=`</tbody></table></div><p class="mut" style="font-size:12px;margin:6px 0 0">All paper: real asks and fees, settled on Kalshi's results. ${sb.qualified.length?'<b class="y">'+sb.qualified.length+' qualified.</b>':'None qualified yet.'}</p></div>`;
+  // health
+  const wh=rs&&rs.warehouse,fs=fv&&fv.state,gs=gw&&gw.state,u=fv&&fv.usage;
+  h+=`<div class="card"><h3 style="margin-top:0">Scanners and data</h3>`+
+    chip(fs&&fs.error?'bad':'on','Sports odds',fs?`${ago(fs.last_poll)} · ${u?u.left:'?'} credits left`:'?')+
+    chip(gs&&gs.error?'bad':'on','Gold watch',gs?ago(gs.last_check):'?')+
+    chip(wh&&wh.error?'bad':(wh&&wh.running?'warn':'on'),'Data collector',wh?(wh.running?'running: '+esc(wh.progress||wh.phase):'last pass '+ago(wh.last_sync)):'?')+
+    chip('off','Kalshi catalogue',cat&&cat.catalog?`${(cat.catalog.open_markets||0).toLocaleString()} open markets · ${ago(cat.catalog.ts)}`:'not read')+
+    ((fs&&fs.error)||(gs&&gs.error)||(wh&&wh.error)?`<p class="n" style="font-size:12px;margin:4px 0 0">${esc([fs&&fs.error,gs&&gs.error,wh&&wh.error].filter(Boolean).join(' · '))}</p>`:'')+`</div>`;
+  // owner's limits
+  h+=`<div class="card"><h3 style="margin-top:0">Automatic live trading <span class="mut" style="font-weight:400;font-size:12px">· your limits for strategies that qualify</span></h3>
+   <p>${chip(al.enabled?'warn':'off','Status',al.enabled?'ON (within the caps below)':'off')}${chip('off','Executor',al.executor_built?'built':'not built yet')}</p>
+   <div class="row" style="gap:10px;flex-wrap:wrap">${[['total_cap','Total cap'],['per_strategy_cap','Per strategy'],['per_trade_max','Per trade'],['daily_loss_stop','Stop after daily loss of']].map(([k,l])=>`<label style="font-size:12px">${l}<br>$<input id="al_${k}" type="number" min="0" step="1" style="width:90px" value="${al[k]}"></label>`).join('')}
+   <label style="font-size:12px"><br><input id="al_enabled" type="checkbox" ${al.enabled?'checked':''}> turn on</label><button class="b pri" onclick="saveAL()">Save</button></div>
+   <p class="mut" style="font-size:12px;margin:6px 0 0">${esc(al.note)} Live trading also requires you to switch the app to production yourself. Turning this on or raising a limit asks you to confirm.</p></div>`;
+  B.innerHTML=h;if(TOP==='home')boardTimer=setTimeout(loadBoard,60000)}catch(e){B.innerHTML=`<div class="card n">${esc(e.message)}</div>`}}
+async function saveAL(){const b={enabled:$('#al_enabled').checked};for(const k of ['total_cap','per_strategy_cap','per_trade_max','daily_loss_stop'])b[k]=+$('#al_'+k).value||0;
+  try{await api('/api/autolive',{method:'POST',body:b});toast('Saved','ok');loadBoard()}catch(e){toast(e.message,'err');loadBoard()}}
 const PAPER_HEAD=`<th>Run</th><th>Verdict</th><th class="r" title="Trading result only: strict fills, inventory valued at what selling now would fetch. Rewards excluded.">Trading P&amp;L</th><th class="r">Fills</th><th class="r">Days</th>`;
 async function loadHome(quiet){try{const [s,c,p,r,b,al,mm,ex]=await Promise.all([api('/api/status'),api('/api/config'),api('/api/portfolio').catch(()=>({})),api('/api/rewards').catch(()=>({})),api('/api/breakers').catch(()=>({})),api('/api/alerts').catch(()=>({alerts:[]})),api('/api/mm').catch(()=>({})),api('/api/exits').catch(()=>({rules:[]}))]);
   CFG=c.config;const C=CFG;let h='';

@@ -1234,6 +1234,63 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         """Read every open Kalshi market (public data, about a minute in the background)."""
         return {"started": catalog.start()}
 
+    from . import scoreboard as sbm
+    autolive_confirms: dict = {}
+
+    def _autolive() -> dict:
+        return {**sbm.AUTOLIVE_DEFAULT, **(cfg.data.get("autolive") or {})}
+
+    @app.get("/api/scoreboard")
+    def scoreboard_view():
+        """Every paper strategy against the qualifying bar (read-only)."""
+        al = _autolive()
+        reps = mm_cache["r"] or []
+        out = sbm.board(wdb, al.get("bar"), reps)
+        out["autolive"] = {**al, "executor_built": False,
+                           "note": "Qualifying strategies are flagged here. The live executor that trades them inside your cap is not built yet; "
+                                   "nothing trades real money from this page."}
+        return out
+
+    @app.post("/api/autolive")
+    async def autolive_set(request: Request):
+        """The owner's limits for strategies that pass the bar. Turning it on or raising any limit needs a confirmation."""
+        b = await request.json()
+        cur = _autolive()
+        new = dict(cur)
+        errors = []
+        for k in ("total_cap", "per_strategy_cap", "per_trade_max", "daily_loss_stop"):
+            if k in b:
+                try:
+                    v = round(float(b[k]), 2)
+                    if not 0 <= v <= 100000:
+                        raise ValueError
+                    new[k] = v
+                except (TypeError, ValueError):
+                    errors.append(f"{k} must be a dollar amount from 0 to 100000")
+        if "enabled" in b:
+            new["enabled"] = bool(b["enabled"])
+        if new["enabled"] and new["total_cap"] <= 0:
+            errors.append("set a total cap above $0 before turning it on")
+        if new["enabled"] and (new["per_strategy_cap"] > new["total_cap"] or new["per_trade_max"] > new["per_strategy_cap"] > 0):
+            errors.append("per-strategy cap must not exceed the total cap, nor the per-trade maximum the per-strategy cap")
+        if errors:
+            raise HTTPException(400, "; ".join(errors))
+        riskier = (new["enabled"] and not cur["enabled"]) or any(new[k] > cur[k] for k in ("total_cap", "per_strategy_cap", "per_trade_max", "daily_loss_stop"))
+        if riskier:
+            tok = b.get("confirm_token")
+            if not tok or tok not in autolive_confirms or time.time() - autolive_confirms.pop(tok) > 60:
+                t = secrets.token_hex(8)
+                autolive_confirms[t] = time.time()
+                return JSONResponse({"needs_confirm": True, "confirm_token": t,
+                                     "message": f"REAL MONEY LIMITS. Automatic live trading of qualified strategies: {'ON' if new['enabled'] else 'off'}, "
+                                                f"total cap ${new['total_cap']:.2f}, per strategy ${new['per_strategy_cap']:.2f}, per trade ${new['per_trade_max']:.2f}, "
+                                                f"daily loss stop ${new['daily_loss_stop']:.2f}. It only ever trades on PRODUCTION, which you switch to yourself. Confirm within 60 seconds."},
+                                    status_code=409)
+        cfg.data["autolive"] = {k: new[k] for k in sbm.AUTOLIVE_DEFAULT} | ({"bar": cur["bar"]} if cur.get("bar") else {})
+        cfg.save()
+        db.audit("autolive", json.dumps(cfg.data["autolive"]))
+        return {"ok": True, "autolive": _autolive()}
+
     @app.get("/api/goldfv/live")
     def goldfv_live():
         """Every strike of the next hourly gold close: the model's fair chance from live gold vs Kalshi's real bid/ask (read-only)."""
