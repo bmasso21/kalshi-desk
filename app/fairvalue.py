@@ -48,6 +48,8 @@ DEFAULT_SPORTS = {
     "americanfootball_ncaaf": {"series": "KXNCAAFGAME", "markets": "h2h,spreads,totals", "hours": 12},
     "basketball_nba": {"series": "KXNBAGAME", "markets": "h2h", "hours": 24},
     "icehockey_nhl": {"series": "KXNHLGAME", "markets": "h2h", "hours": 24},
+    # the busiest market on Kalshi (game + spread + total): hundreds of games a day, one call covers them all (3 credits)
+    "basketball_ncaab": {"series": "KXNCAAMBGAME", "markets": "h2h,spreads,totals", "hours": 12},
 }
 
 

@@ -250,6 +250,9 @@ def main():
     k.__dict__.pop("markets")
     r = fv.poll("americanfootball_nfl")
     check("a manual pull never reuses cached odds (it fetches fresh)", len(http.calls) == c0 + 1, len(http.calls) - c0)
+    d = FV.DEFAULT_SPORTS["basketball_ncaab"]
+    check("college basketball is scanned by default: game, spread and total, every 12 hours",
+          d["series"] == "KXNCAAMBGAME" and d["markets"] == "h2h,spreads,totals" and d["series"].replace("GAME", "SPREAD") == "KXNCAAMBSPREAD", d)
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 
