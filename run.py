@@ -12,6 +12,13 @@ from app.db import DB
 from app.server import create_app
 
 if __name__ == "__main__":
+    # a requested move of the data warehouse runs first, before anything opens the database
+    try:
+        from app.relocate import relocate
+        _c = Config()
+        relocate(Path(__file__).resolve().parent, _c.path, int(_c.data.get("port", 8765)))
+    except Exception as _e:
+        print(f"data move skipped: {_e}")
     cfg = Config()
     app = create_app(cfg, DB())
     url = f"http://127.0.0.1:{cfg.data['port']}"

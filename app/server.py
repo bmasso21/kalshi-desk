@@ -30,7 +30,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     eng = Engine(cfg, db)
     from .backtest import STRATEGIES, Backtester
     from .warehouse import Warehouse, WarehouseDB
-    wdb = WarehouseDB(cfg.path.parent / "warehouse.db")
+    wdb = WarehouseDB(Path(cfg.data.get("warehouse_dir") or cfg.path.parent) / "warehouse.db")   # warehouse_dir: set by a data move
     eng.warehouse = Warehouse(eng, wdb)
     eng.feed.listeners.append(eng.warehouse.on_feed)
     from .weather import WxCollector, WxModel, WxStore
