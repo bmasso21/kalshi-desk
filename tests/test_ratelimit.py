@@ -45,10 +45,11 @@ def main():
     check("the shared budget is 4 reads a second", a.read_bucket.rate == 40 and a.read_bucket.capacity == 80)
     sleeps = []
     KC.time.sleep = lambda s: sleeps.append(s)
+    a.read_bucket = KC.TokenBucket(rate=1e9, capacity=1e9)       # isolate the 429 waits from budget waits
     a.session = Ses([429, 429, 200])
     r = a.request("GET", "/markets")
     check("429: waits as long as Kalshi asks (Retry-After), then succeeds", r == {"ok": True} and a.session.n == 3
-          and len(sleeps) >= 2 and all(1.0 <= s <= 1.26 for s in sleeps[-2:]), sleeps)
+          and len(sleeps) >= 2 and all(1.0 <= s <= 1.26 for s in sleeps[-2:]), [round(x, 2) for x in sleeps[:12]])
     check("429s are counted for the dashboard", KC.rate_limit_stats().get("api.example.test", 0) >= 2)
     sleeps.clear()
 
@@ -65,7 +66,7 @@ def main():
         ok = e.status == 429 if hasattr(e, "status") else True
     waits = [round(s) for s in sleeps]
     check("without Retry-After: backs off 0.5, 1, 2, 4, 8, 16 s (about 31 s in all) before giving up", ok and a.session.n == 7 and len(sleeps) == 6
-          and sum(sleeps) >= 31 and sleeps[-1] >= 16, sleeps)
+          and sum(sleeps) >= 31 and sleeps[-1] >= 16, [round(x, 2) for x in sleeps[:12]])
     sleeps.clear()
     acct = KC.KalshiClient("https://api.example.test/trade-api/v2")
     acct.key_id, acct.private_key = "k", object()          # looks authenticated; signing is stubbed below
@@ -77,7 +78,7 @@ def main():
     except KC.KalshiError:
         pass
     check("the account client (screens, quoter) gives up quickly on 429s: at most 3 short waits of up to 2 s",
-          len(sleeps) <= 3 and all(s <= 2.26 for s in sleeps) and sum(sleeps) < 6, sleeps)
+          len(sleeps) <= 3 and all(s <= 2.26 for s in sleeps) and sum(sleeps) < 6, [round(x, 2) for x in sleeps[:12]])
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 
