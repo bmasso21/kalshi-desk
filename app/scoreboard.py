@@ -97,6 +97,15 @@ def sources(wdb) -> list[dict]:
                 "market": "Hourly gold (KXGOLDH)",
                 "rows": [{"pnl": r["pnl"], "cost": r["ask"] + r["fee"], "cluster": r["close_ts"], "ts": r["close_ts"]} for r in ff.values() if r["status"] == "settled"],
                 "open": sum(1 for r in ff.values() if r["status"] == "open")})
+    ar = q("SELECT kind, event, cost, pnl_real, settled_ts, status, locked FROM arb_opps")
+    for kinds, key, label, desc in ((("no_basket", "ladder"), "arb_locked", "Arbitrage: locked (NO baskets, ladders)",
+                                     "Kalshi priced against itself: every outcome pays at least the cost after fees, confirmed at live order-book prices"),
+                                    (("yes_basket",), "arb_yes", "Arbitrage: YES baskets (only if one outcome must win)",
+                                     "All outcomes' YES under $1 after fees; safe only when the event is exhaustive")):
+        rs = [r for r in ar if r["kind"] in kinds]
+        out.append({"key": key, "name": label, "description": desc, "market": "Every open Kalshi event",
+                    "rows": [{"pnl": r["pnl_real"], "cost": r["cost"], "cluster": r["event"], "ts": r["settled_ts"]} for r in rs if r["status"] == "settled" and r["pnl_real"] is not None],
+                    "open": sum(1 for r in rs if r["status"] in ("open", "gone"))})
     return out
 
 

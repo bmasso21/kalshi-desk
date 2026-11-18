@@ -193,7 +193,8 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     def status():
         c = eng.client
         fs = eng.feed.status()
-        out = {"env": cfg.env, "authenticated": c.authenticated, "scan": eng.scan_state,
+        from .kalshi_client import rate_limit_stats
+        out = {"env": cfg.env, "authenticated": c.authenticated, "scan": eng.scan_state, "rate_limited_1h": rate_limit_stats(),
                "kill_switch": cfg.risk["kill_switch"], "auto": cfg.auto["enabled"],
                "feed": {k: fs[k] for k in ("mode", "connected", "reason", "error", "markets_watched",
                                            "books_synced", "since", "last_msg")}}
@@ -1221,6 +1222,23 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     @app.get("/api/gapwatch")
     def gapwatch_status():
         return gapwatch.status()
+
+    from .arb import ArbScanner
+    arb = ArbScanner(lambda: cfg.data.get("arb") or {}, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+    if start_engine:
+        arb.start()
+
+    @app.get("/api/arb")
+    def arb_view():
+        return arb.status()
+
+    @app.post("/api/arb/scan")
+    def arb_scan_now():
+        """Scan every open event now (public data, a few minutes, in the background)."""
+        if arb.state["running"]:
+            return {"started": False}
+        threading.Thread(target=arb.scan, daemon=True, name="arb-now").start()
+        return {"started": True}
 
     from .catalog import Catalog
     catalog = Catalog(wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))

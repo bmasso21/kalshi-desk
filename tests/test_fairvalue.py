@@ -212,6 +212,44 @@ def main():
     cfg["theodds_key"] = "k" * 32
     r = fv.poll("americanfootball_nfl")
     check("an API error is reported with the key removed", r["error"] and "401" in r["error"] and "kkkk" not in r["error"] and "kkkk" not in str(fv.status()["calls"]), r["error"])
+    # ---- a failed pull (e.g. Kalshi "too many requests") is retried soon, and a retry reuses odds already paid for ----
+    http.status, http.body = 200, [ev3]
+    fv.db.put("fv_last_by_sport", {})
+    fv.db.put("fv_retry", {})
+    real_markets = k.markets
+    boom = {"n": 1}
+
+    def flaky(*a, **kw):
+        if boom["n"]:
+            boom["n"] -= 1
+            raise RuntimeError("Kalshi 429: too many requests")
+        return real_markets(*a, **kw)
+    k.__dict__["markets"] = flaky
+    u0, c0 = fv.usage()["used"], len(http.calls)
+    r = fv.poll(force=False)
+    rt = fv.db.get("fv_retry").get("americanfootball_nfl")
+    check("a Kalshi failure schedules a retry in 15 minutes instead of waiting a full cycle (no credits spent: it failed first)",
+          rt and rt["n"] == 1 and 14 * 60 < rt["at"] - time.time() <= 15 * 60 and r["results"][0].get("retry_in_min") == 15
+          and fv.usage()["used"] == u0 and "retrying in 15 min" in fv.state["note"], (rt, r))
+    check("before the retry time nothing runs", not fv.due() and fv.poll(force=False)["results"] == [])
+    fv.db.put("fv_retry", {"americanfootball_nfl": {**rt, "at": time.time() - 1}})
+    fv._odds_cache["americanfootball_nfl"] = (time.time() - 60, [ev3])
+    check("at the retry time it is due again", fv.due())
+    r = fv.poll(force=False)
+    check("the retry reuses the odds fetched a minute ago: no new call, no credits", "error" not in r["results"][0] and len(http.calls) == c0 and fv.usage()["used"] == u0
+          and "americanfootball_nfl" not in fv.db.get("fv_retry"), r["results"][0])
+    boom["n"] = 99
+    fv.db.put("fv_retry", {})
+    fv.db.put("fv_last_by_sport", {})
+    for _ in range(4):
+        rr = fv.db.get("fv_retry").get("americanfootball_nfl")
+        if rr:
+            fv.db.put("fv_retry", {"americanfootball_nfl": {**rr, "at": time.time() - 1}})
+        fv.poll(force=False)
+    check("after 15, 30 and 60 minute retries it goes back to its normal interval", not fv.db.get("fv_retry") and not fv.due())
+    k.__dict__.pop("markets")
+    r = fv.poll("americanfootball_nfl")
+    check("a manual pull never reuses cached odds (it fetches fresh)", len(http.calls) == c0 + 1, len(http.calls) - c0)
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 

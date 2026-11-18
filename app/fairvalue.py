@@ -140,6 +140,10 @@ def fnum(v):
         return None
 
 
+RETRY_AFTER_MIN = (15, 30, 60)       # a sport whose pull failed is tried again after these waits, then left to its interval
+RETRY_REUSE_SEC = 45 * 60           # odds fetched this recently are reused on a retry (credits are not spent twice)
+
+
 class FairValue:
     def __init__(self, cfg_getter, wdb, kalshi_client, session=None, base=None):
         self._cfg = cfg_getter              # -> the "sports" config section, read fresh every time
@@ -151,6 +155,7 @@ class FairValue:
         self.lock = threading.Lock()
         self._stop = threading.Event()
         self.state = {"running": False, "last_poll": wdb.get("fv_last_poll"), "error": None, "note": wdb.get("fv_note") or ""}
+        self._odds_cache: dict = {}         # sport -> (fetched_at, events)
         wdb.execute("DELETE FROM fv_picks2 WHERE tier='lean' AND price < ?", (float(self.opt("fv_lean_min_price", 0.30)) - 1e-9,))   # recorded before that rule
 
     # ---------------------------------------------------------------- settings --
@@ -269,6 +274,7 @@ class FairValue:
                 out["skipped"] = "no Kalshi game in the next two days (no credits spent)"
                 return out
             events = self.fetch(sport, ",".join(mk))
+            self._odds_cache[sport] = (time.time(), events)           # a retry after a Kalshi failure reuses these: no second charge
         out["games"] = len(events)
         sp_ev = self.kalshi_events(series.replace("GAME", "SPREAD")) if "spreads" in mk and "GAME" in series else {}
         to_ev = self.kalshi_events(series.replace("GAME", "TOTAL")) if "totals" in mk and "GAME" in series else {}
@@ -332,26 +338,42 @@ class FairValue:
         force=False pulls only the sports whose own interval has passed."""
         res, err = [], None
         last = self.db.get("fv_last_by_sport") or {}
+        retry = self.db.get("fv_retry") or {}
+        now = time.time()
         for sport, spec in self.sports().items():
             if only and sport != only:
                 continue
-            if not force and time.time() - float(last.get(sport) or 0) < spec["hours"] * 3600:
-                continue
+            rt = retry.get(sport)
+            if not force:
+                if rt and now < rt["at"]:
+                    continue                                           # a retry is scheduled; wait for it
+                if not rt and now - float(last.get(sport) or 0) < spec["hours"] * 3600:
+                    continue
+            cached = self._odds_cache.get(sport)
+            events = cached[1] if rt and cached and now - cached[0] < RETRY_REUSE_SEC else None    # only a retry reuses odds
             try:
-                res.append(self.scan_sport(sport, spec))
+                res.append(self.scan_sport(sport, spec, events))
                 last[sport] = time.time()
+                retry.pop(sport, None)
             except BudgetExceeded as e:
                 err = str(e)
                 break
             except Exception as e:
                 err = f"{sport}: {e}"[:300]
-                res.append({"sport": sport, "error": str(e)[:200]})
-                last[sport] = time.time()                              # do not hammer a failing call
+                n = (rt or {}).get("n", 0) + 1
+                if n <= len(RETRY_AFTER_MIN):                          # e.g. Kalshi said "too many requests": try again soon
+                    retry[sport] = {"n": n, "at": time.time() + RETRY_AFTER_MIN[n - 1] * 60, "error": str(e)[:200]}
+                    res.append({"sport": sport, "error": str(e)[:200], "retry_in_min": RETRY_AFTER_MIN[n - 1]})
+                else:                                                  # still failing: back to its normal interval
+                    retry.pop(sport, None)
+                    last[sport] = time.time()
+                    res.append({"sport": sport, "error": str(e)[:200]})
         self.db.put("fv_last_by_sport", last)
+        self.db.put("fv_retry", retry)
         self.db.execute("DELETE FROM fv_board2 WHERE commence_ts < ?", (time.time() - 6 * 3600,))
         if res:
             nm = lambda r: r["sport"].split("_")[-1].upper()
-            note = "; ".join(f"{nm(r)}: failed" if "error" in r else f"{nm(r)}: skipped, {r['skipped']}" if r.get("skipped") else
+            note = "; ".join((f"{nm(r)}: failed, retrying in {r['retry_in_min']} min" if r.get("retry_in_min") else f"{nm(r)}: failed") if "error" in r else f"{nm(r)}: skipped, {r['skipped']}" if r.get("skipped") else
                              f"{nm(r)}: {r['matched']}/{r['games']} games matched" + (f", {r['spread_lines']} spread and {r['total_lines']} total lines" if r["spread_lines"] or r["total_lines"] else "")
                              + (f", {r['picks']} edge pick(s)" if r["picks"] else "") + (f", {r['leans']} lean(s)" if r["leans"] else "") for r in res)
             self.state.update(last_poll=time.time(), note=note)
@@ -431,7 +453,10 @@ class FairValue:
         if not self.configured or not self.opt("fv_enabled", True):
             return False
         last = self.db.get("fv_last_by_sport") or {}
-        return any(time.time() - float(last.get(s) or 0) >= spec["hours"] * 3600 for s, spec in self.sports().items())
+        retry = self.db.get("fv_retry") or {}
+        now = time.time()
+        return any((now >= retry[s]["at"]) if s in retry else (now - float(last.get(s) or 0) >= spec["hours"] * 3600)
+                   for s, spec in self.sports().items())
 
     def loop(self):
         self._stop.wait(90)

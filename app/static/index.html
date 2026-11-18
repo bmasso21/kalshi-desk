@@ -174,6 +174,8 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mu
   <div id="btDetail"></div>
   <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Short contracts: which entry and exit worked? <span class="mut" style="font-weight:400;font-size:12px">· replay of past trades, places no orders</span></h3>
     <span><select id="scKind" onchange="scKindChange()" title="Contract length"><option value="scalp">15-minute (enter after the open)</option><option value="hourly">Hourly (enter before the close)</option></select> <input id="scSer" style="width:330px" value="KXBTC15M,KXGOLD15M,KXWTI15M,KXNATGAS15M,KXINX15M,KXSILVER15M,KXCOPPER15M,KX10YRRATE15M" title="Series, comma separated"> <button class="b pri" onclick="runScalp()">Run</button> <button class="b" onclick="loadScalp()">Refresh</button></span></div><div id="scBody" class="mut" style="margin-top:6px">Not loaded.</div></div>
+  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Arbitrage scan <span class="mut" style="font-weight:400;font-size:12px">· Kalshi priced against itself, confirmed at live order-book prices; places no orders</span></h3>
+    <span><button class="b" onclick="arbNow()">Scan now</button> <button class="b" onclick="loadArb()">Refresh</button></span></div><div id="arbBody" class="mut" style="margin-top:6px">Not loaded.</div></div>
   <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Everything on Kalshi <span class="mut" style="font-weight:400;font-size:12px">· every open market by category and series, busiest first (public data)</span></h3>
     <span><button class="b" onclick="catRefresh()">Re-read Kalshi</button> <button class="b" onclick="loadCat()">Refresh</button></span></div><div id="catBody" class="mut" style="margin-top:6px">Not loaded.</div></div>
   <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Gold fair value (live) <span class="mut" style="font-weight:400;font-size:12px">· check a trade before you place it by hand; model price from live gold vs Kalshi's real asks</span></h3>
@@ -215,7 +217,7 @@ function go(top,sub){TOP=top;const subs=TABS[top];sub=sub||SUBSEL[top]||subs[0][
   document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x.dataset.t===top));
   $('#sub').innerHTML=subs.length>1?subs.map(([k,l])=>`<button class="${k===sub?'on':''}" onclick="go('${top}','${k}')">${l}</button>`).join(''):'';
   const [sec,grp]=sub.split(':');document.querySelectorAll('main>section').forEach(x=>x.classList.toggle('hide',x.id!=='t-'+sec));
-  const LOAD={home:()=>{loadBoard();loadHome()},scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:()=>{loadRewards();loadMM()},portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,weather:loadWeather,research:()=>{loadResearch();loadGW();loadGL();loadCat()},fairvalue:loadFV};
+  const LOAD={home:()=>{loadBoard();loadHome()},scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:()=>{loadRewards();loadMM()},portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,weather:loadWeather,research:()=>{loadResearch();loadGW();loadGL();loadCat();loadArb()},fairvalue:loadFV};
   if(sec==='settings'){SGRP=grp;if(!SET_LOADED){SET_LOADED=true;loadSettings()}else showGrp()}else{SET_LOADED=false;LOAD[sec]()}
   window.scrollTo(0,0)}
 function showGrp(){document.querySelectorAll('#settingsBox [data-g]').forEach(e=>e.classList.toggle('hide',e.dataset.g!==SGRP));const sb=$('#saveBar');if(sb)sb.classList.toggle('hide',SGRP==='alerts'||SGRP==='maint')}
@@ -224,7 +226,7 @@ function paperRows(reps,withStop){return reps.map(rp=>{const v=rp.models.queue,s
 let boardTimer=null;
 const STC={qualified:'y',review:'w',collecting:'mut',failing:'n'};
 async function loadBoard(){const B=$('#boardBox');clearTimeout(boardTimer);try{
-  const [sb,fv,gw,rs,cat]=await Promise.all([api('/api/scoreboard'),api('/api/fairvalue').catch(()=>null),api('/api/gapwatch').catch(()=>null),api('/api/research').catch(()=>null),api('/api/catalog').catch(()=>null)]);
+  const [sb,fv,gw,rs,cat,stt]=await Promise.all([api('/api/scoreboard'),api('/api/fairvalue').catch(()=>null),api('/api/gapwatch').catch(()=>null),api('/api/research').catch(()=>null),api('/api/catalog').catch(()=>null),api('/api/status').catch(()=>null)]);
   const al=sb.autolive,ago=t=>{if(!t)return 'never';const m=Math.round((Date.now()/1000-t)/60);return m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago'};
   const chip=(cl,label,val)=>`<span class="chip ${cl}">${label} <b>${val}</b></span>`;
   let h=`<div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Strategies</h3><span class="mut" style="font-size:12px">bar to go live: ${sb.bar.min_trades}+ settled paper trades, ${sb.bar.min_events}+ separate games/hours, profit after fees in both halves, t ≥ ${sb.bar.min_t}</span></div>`;
@@ -239,6 +241,7 @@ async function loadBoard(){const B=$('#boardBox');clearTimeout(boardTimer);try{
     chip(fs&&fs.error?'bad':'on','Sports odds',fs?`${ago(fs.last_poll)} · ${u?u.left:'?'} credits left`:'?')+
     chip(gs&&gs.error?'bad':'on','Gold watch',gs?ago(gs.last_check):'?')+
     chip(wh&&wh.error?'bad':(wh&&wh.running?'warn':'on'),'Data collector',wh?(wh.running?'running: '+esc(wh.progress||wh.phase):'last pass '+ago(wh.last_sync)):'?')+
+    (()=>{const n=stt&&stt.rate_limited_1h?Object.values(stt.rate_limited_1h).reduce((a,b)=>a+b,0):0;return chip(n>20?'bad':n?'warn':'on','Kalshi "too many requests"',n+' in the last hour')})()+
     chip('off','Kalshi catalogue',cat&&cat.catalog?`${(cat.catalog.open_markets||0).toLocaleString()} open markets · ${ago(cat.catalog.ts)}`:'not read')+
     ((fs&&fs.error)||(gs&&gs.error)||(wh&&wh.error)?`<p class="n" style="font-size:12px;margin:4px 0 0">${esc([fs&&fs.error,gs&&gs.error,wh&&wh.error].filter(Boolean).join(' · '))}</p>`:'')+`</div>`;
   // owner's limits
@@ -549,6 +552,14 @@ async function loadClv(){try{const j=await api('/api/clv?days='+$('#clvDays').va
 // edge studies (3.8)
 async function runStudies(){try{const cat=$('#stCat').value;const r=await api('/api/studies/run',{method:'POST',body:cat?{categories:[cat]}:{}});toast(r.started.length?'Studies started (a few minutes)':'Already running','ok');setTimeout(loadStudies,2500)}catch(e){toast(e.message,'err')}}
 function stCell(x){if(!x||x.ret_c==null)return '<td class="r mut">–</td>';const sig=x.t!=null&&Math.abs(x.t)>=2;return `<td class="r ${sig?(x.ret_c>0?'y':'n'):'mut'}" title="${x.events} events · standard error ${x.se_c??'–'}c">${x.ret_c>0?'+':''}${x.ret_c.toFixed(2)}c <span style="font-size:11px">(t ${x.t??'–'})</span></td>`}
+const ARBK={no_basket:'NO on every outcome',ladder:'Ladder (YES low + NO high)',yes_basket:'YES on every outcome (check)'};
+async function loadArb(){const B=$('#arbBody');try{const j=await api('/api/arb'),st=j.state;let h=`<p class="${st.error?'n':'mut'}">${st.running?'Scanning…':''} ${esc(st.error||st.note||'No scan yet (first one runs 5 minutes after start, then every '+j.every_min+' min).')}${st.last_scan?' · last '+new Date(st.last_scan*1000).toLocaleTimeString():''}</p>`;
+  if(st.running)setTimeout(loadArb,15000);
+  const legs=o=>JSON.parse(o.legs).map(l=>`${l.side.toUpperCase()} ${esc(l.ticker)} @ ${Math.round(l.price*100)}c ×${Math.floor(l.size||0)}`).join('<br>');
+  h+=j.open.length?`<table><thead><tr><th>Type</th><th>Event</th><th>Legs (live ask × size)</th><th class="r">Sets</th><th class="r">Profit / set</th><th class="r">Profit, all sets</th><th>Seen</th></tr></thead><tbody>${j.open.map(o=>`<tr><td>${ARBK[o.kind]||o.kind}${o.locked?'':' <span class="w">not locked</span>'}</td><td>${esc(o.title||o.event)}</td><td style="font-size:12px">${legs(o)}</td><td class="r">${o.sets}</td><td class="r y">${(o.profit_per_set*100).toFixed(1)}c</td><td class="r y">$${(+o.profit_total).toFixed(2)}</td><td>${o.seen}× since ${new Date(o.first_seen*1000).toLocaleString()}</td></tr>`).join('')}</tbody></table>`:'<p>No open opportunities right now.</p>';
+  h+=`<p class="mut" style="font-size:12px">${j.totals.map(t=>`${ARBK[t.kind]||t.kind}: ${t.n} found, ${t.settled||0} settled${t.settled?`, real result $${(+t.pnl_real).toFixed(2)} per set summed`:''}`).join(' · ')||'Nothing found yet.'} After each event settles, the real payout is checked against what was assumed.</p>`;
+  B.innerHTML=h;B.classList.remove('mut')}catch(e){B.textContent=e.message}}
+async function arbNow(){try{const r=await api('/api/arb/scan',{method:'POST'});toast(r.started?'Scanning every open event (a few minutes)':'Already scanning','ok');setTimeout(loadArb,2000)}catch(e){toast(e.message,'err')}}
 const nf=x=>Math.round(x).toLocaleString();
 async function loadCat(){const B=$('#catBody');try{const j=await api('/api/catalog'),c=j.catalog,st=j.state;let h=st.running?`<p class="w">Reading Kalshi… ${esc(st.progress)}</p>`:st.error?`<p class="n">${esc(st.error)}</p>`:'';if(st.running)setTimeout(loadCat,5000);
   if(!c){B.innerHTML=h+'Not read yet - press "Re-read Kalshi".';return}

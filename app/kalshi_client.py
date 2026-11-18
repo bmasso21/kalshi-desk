@@ -11,6 +11,7 @@ Built against Kalshi's OpenAPI spec v3.35.0 (Nov 2026):
 from __future__ import annotations
 
 import base64
+import random
 import threading
 import time
 import uuid
@@ -73,6 +74,34 @@ class TokenBucket:
             time.sleep(wait)
 
 
+# One request budget per host for every unauthenticated (public market data) client in the process: the scanners,
+# the catalogue and the fair-value tools all read Kalshi production, and Kalshi limits reads per caller, so separate
+# budgets used to add up past the limit (429 "too many requests"). 100 tokens/s at 10 per request = 10 reads/s.
+_SHARED_READ: dict = {}
+_SHARED_LOCK = threading.Lock()
+RATE_LIMITS: dict = {}            # host -> deque of 429 timestamps (for the dashboard)
+
+
+def shared_read_bucket(host: str) -> "TokenBucket":
+    with _SHARED_LOCK:
+        if host not in _SHARED_READ:
+            _SHARED_READ[host] = TokenBucket(rate=100, capacity=200)
+        return _SHARED_READ[host]
+
+
+def rate_limit_stats(window: float = 3600) -> dict:
+    now = time.time()
+    return {h: sum(1 for t in q if now - t <= window) for h, q in RATE_LIMITS.items()}
+
+
+def _retry_after(resp) -> float | None:
+    try:
+        v = float(resp.headers.get("Retry-After"))
+        return min(max(v, 0.0), 30.0)
+    except (TypeError, ValueError):
+        return None
+
+
 # ----------------------------------------------------------------- prices --
 def d(x) -> Decimal:
     return Decimal(str(x)) if x is not None and x != "" else Decimal(0)
@@ -96,7 +125,9 @@ class KalshiClient:
         self.private_key = load_private_key(private_key_path) if private_key_path else None
         self.timeout = timeout
         self.session = requests.Session()
-        self.read_bucket = TokenBucket(rate=200, capacity=600)
+        self.host = urlparse(self.base_url).netloc
+        # public readers share one budget per host; an authenticated (account) client keeps its own
+        self.read_bucket = TokenBucket(rate=200, capacity=600) if key_id else shared_read_bucket(self.host)
         self.write_bucket = TokenBucket(rate=100, capacity=100)
         self.net_retries = 0
 
@@ -118,7 +149,7 @@ class KalshiClient:
         return h
 
     def request(self, method: str, path: str, params: dict | None = None, body: dict | None = None,
-                auth: bool = False, retries: int = 5) -> dict:
+                auth: bool = False, retries: int = 7) -> dict:
         if auth and not self.authenticated:
             raise KalshiError(401, {"message": "No API key configured for this environment"})
         is_write = method.upper() in ("POST", "PUT", "DELETE")
@@ -139,10 +170,18 @@ class KalshiClient:
                     delay *= 2
                     continue
                 raise
-            if resp.status_code == 429 and attempt < retries - 1:
-                time.sleep(delay)
-                delay *= 2
-                continue
+            if resp.status_code == 429:
+                import collections
+                q = RATE_LIMITS.setdefault(self.host, collections.deque(maxlen=5000))
+                q.append(time.time())
+                if attempt < retries - 1:
+                    # a 429 means Kalshi refused the request (nothing was done), so even an order can be resent.
+                    # Wait as long as Kalshi asks, else back off 0.5, 1, 2, 4, 8, 16 s with a little jitter.
+                    ra = _retry_after(resp)
+                    w = ra if ra is not None else max(0.5, delay * 2)
+                    time.sleep(w + random.uniform(0, 0.25))
+                    delay = max(delay * 2, 0.25)
+                    continue
             if resp.status_code >= 500 and not is_write and attempt < retries - 1:
                 time.sleep(delay)
                 delay *= 2
