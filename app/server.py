@@ -46,8 +46,10 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     fairvalue = FairValue(lambda: cfg.data.get("sports") or {}, wdb,
                           KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
     from .gapwatch import GapWatch
+    from .goldlive import GoldLive
+    goldlive = GoldLive(KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
     gapwatch = GapWatch(lambda: cfg.data.get("gapwatch") or {}, wdb,
-                        KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+                        KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]), fv=goldlive)
     eng.weather = WxCollector(eng, wx_store)
     from .maintenance import Maintenance
     maint = Maintenance(eng, wdb)
@@ -1219,6 +1221,14 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     @app.get("/api/gapwatch")
     def gapwatch_status():
         return gapwatch.status()
+
+    @app.get("/api/goldfv/live")
+    def goldfv_live():
+        """Every strike of the next hourly gold close: the model's fair chance from live gold vs Kalshi's real bid/ask (read-only)."""
+        try:
+            return goldlive.board()
+        except Exception as e:
+            raise HTTPException(502, f"live gold price unavailable: {e}"[:300])
 
     @app.post("/api/gapwatch/check")
     def gapwatch_check():

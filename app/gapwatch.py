@@ -17,13 +17,21 @@ import time
 from .sports import ensure_schema
 
 TAKER = 0.07
-CHECKS = (40, 30, 20, 15, 10, 5)            # minutes before the close at which the ladder is read
+CHECKS = (50, 40, 30, 20, 15, 10, 5)        # minutes before the close at which the ladder is read
+FV_CHECKS = (50, 40, 30)                    # the fair-value paper rule: 30-60 minutes left (the backtest's only lead)
+FV_MIN_EDGE, FV_LO, FV_HI = 0.02, 0.20, 0.80  # model edge after the fee; prices where the model was calibrated
 BUCKETS = ((10, 15, "$10-15"), (15, 25, "$15-25"), (25, 1e9, "$25+"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS gw_picks (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, series TEXT, ticker TEXT, close_ts REAL, check_min INTEGER,
     strike REAL, level REAL, gap REAL, side TEXT, ask REAL, bid REAL, last REAL, fee REAL,
+    status TEXT DEFAULT 'open', result TEXT, pnl REAL, settled_ts REAL,
+    UNIQUE(ticker, side, check_min)
+);
+CREATE TABLE IF NOT EXISTS gw_fv_picks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, ticker TEXT, close_ts REAL, check_min INTEGER, strike REAL, gold REAL,
+    ladder REAL, fair REAL, side TEXT, ask REAL, edge REAL, fee REAL,
     status TEXT DEFAULT 'open', result TEXT, pnl REAL, settled_ts REAL,
     UNIQUE(ticker, side, check_min)
 );
@@ -72,13 +80,14 @@ def bucket(g: float) -> str | None:
 
 
 class GapWatch:
-    def __init__(self, cfg_getter, wdb, kalshi_client):
+    def __init__(self, cfg_getter, wdb, kalshi_client, fv=None):
         self._cfg = cfg_getter              # -> the "gapwatch" config section
         self.db = wdb
         self.k = kalshi_client              # public (unauthenticated) production client: market data only
         ensure_schema(wdb, SCHEMA)
         self._stop = threading.Event()
         self.done: set = set()
+        self.fv = fv                        # GoldLive (model price from live gold) or None
         self.state = {"running": False, "last_check": None, "error": None, "note": ""}
 
     def opt(self, k, default):
@@ -128,14 +137,38 @@ class GapWatch:
                                        ask, bid, lp, round(TAKER * ask * (1 - ask), 6)))
                 picks += cur.rowcount if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
         note = "" if level is not None else ("no contracts for this close" if not mk else "could not read the level (no tight quotes either side of 50c)")
+        if self.fv is not None and check_min in FV_CHECKS and series == getattr(self.fv, "series", None):
+            try:
+                fvp = self.fv_check(close_ts, check_min, now, level)
+                note = (note + f" · fair value: {fvp} paper buys").strip(" ·")
+            except Exception as e:
+                note = (note + f" · fair value failed: {e}"[:200]).strip(" ·")
         self.db.execute("INSERT INTO gw_checks(ts, series, close_ts, check_min, strikes, level, picks, note) VALUES(?,?,?,?,?,?,?,?)",
                         (now, series, close_ts, check_min, len(quotes), round(level, 3) if level is not None else None, picks, note))
         return {"strikes": len(quotes), "level": level, "picks": picks, "note": note}
 
+    def fv_check(self, close_ts: float, check_min: int, now: float, ladder=None) -> int:
+        """Paper buy of every side the live model rates at least FV_MIN_EDGE under fair, priced FV_LO..FV_HI, at the real ask."""
+        b = self.fv.board(close_ts, now)
+        n = 0
+        for r in b.get("rows") or []:
+            for side in ("yes", "no"):
+                e, ask = r.get(f"{side}_edge"), r.get(f"{side}_ask")
+                if e is None or ask is None or e < FV_MIN_EDGE or not FV_LO <= ask <= FV_HI:
+                    continue
+                fair = r["fair_yes"] if side == "yes" else 1 - r["fair_yes"]
+                cur = self.db.execute("INSERT OR IGNORE INTO gw_fv_picks(ts, ticker, close_ts, check_min, strike, gold, ladder, fair, side, ask, edge, fee) "
+                                      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                                      (now, r["ticker"], close_ts, check_min, r["strike"], b.get("gold"), round(ladder, 3) if ladder is not None else None,
+                                       round(fair, 4), side, ask, e, round(TAKER * ask * (1 - ask), 6)))
+                n += cur.rowcount if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
+        return n
+
     # -------------------------------------------------------------- settling --
     def settle(self, now: float | None = None) -> int:
         now = now or time.time()
-        rows = self.db.query("SELECT DISTINCT ticker FROM gw_picks WHERE status='open' AND close_ts < ?", (now - 120,))
+        rows = self.db.query("SELECT DISTINCT ticker FROM gw_picks WHERE status='open' AND close_ts < ? UNION "
+                             "SELECT DISTINCT ticker FROM gw_fv_picks WHERE status='open' AND close_ts < ?", (now - 120, now - 120))
         n = 0
         tick = [r["ticker"] for r in rows]
         for i in range(0, len(tick), 50):
@@ -143,10 +176,11 @@ class GapWatch:
                 res = (m.get("result") or "").lower()
                 if res not in ("yes", "no"):
                     continue
-                for p in self.db.query("SELECT id, side, ask, fee FROM gw_picks WHERE ticker=? AND status='open'", (m.get("ticker"),)):
-                    pnl = (1.0 if p["side"] == res else 0.0) - p["ask"] - p["fee"]
-                    self.db.execute("UPDATE gw_picks SET status='settled', result=?, pnl=?, settled_ts=? WHERE id=?", (res, round(pnl, 6), now, p["id"]))
-                    n += 1
+                for tbl in ("gw_picks", "gw_fv_picks"):
+                    for p in self.db.query(f"SELECT id, side, ask, fee FROM {tbl} WHERE ticker=? AND status='open'", (m.get("ticker"),)):
+                        pnl = (1.0 if p["side"] == res else 0.0) - p["ask"] - p["fee"]
+                        self.db.execute(f"UPDATE {tbl} SET status='settled', result=?, pnl=?, settled_ts=? WHERE id=?", (res, round(pnl, 6), now, p["id"]))
+                        n += 1
         return n
 
     # ------------------------------------------------------------------ loop --
@@ -204,7 +238,7 @@ class GapWatch:
             pnl = sum(r["pnl"] for r in rs)
             cost = sum(r["ask"] for r in rs)
             hours = len({r["close_ts"] for r in rs})
-            slip = [r["ask"] - r["last"] for r in rs if r["last"] is not None]
+            slip = [r["ask"] - r["last"] for r in rs if r.get("last") is not None]
             return {"n": len(rs), "hours": hours, "wins": sum(1 for r in rs if r["pnl"] > 0), "pnl": round(pnl, 2), "staked": round(cost, 2),
                     "return_pct": round(100 * pnl / cost, 2) if cost else None, "avg_ask_c": round(100 * cost / len(rs), 1),
                     "ask_over_last_c": round(100 * sum(slip) / len(slip), 2) if slip else None}
@@ -216,10 +250,18 @@ class GapWatch:
                "by_bucket": {lab: block([r for r in rows if bucket(r["gap"]) == lab]) for _, _, lab in BUCKETS},
                "by_check": {m: block([r for r in rows if r["check_min"] == m and r["gap"] >= 15]) for m in CHECKS},
                "open": self.db.query("SELECT COUNT(*) n FROM gw_picks WHERE status='open'")[0]["n"]}
+        fv = self.db.query("SELECT * FROM gw_fv_picks WHERE status='settled'")
+        ffirst = {}
+        for r in sorted(fv, key=lambda r: -r["check_min"]):
+            ffirst.setdefault((r["ticker"], r["side"]), r)
+        out["fv_rule_first_touch"] = block(list(ffirst.values()))
+        out["fv_by_check"] = {m: block([r for r in fv if r["check_min"] == m]) for m in FV_CHECKS}
+        out["fv_open"] = self.db.query("SELECT COUNT(*) n FROM gw_fv_picks WHERE status='open'")[0]["n"]
         return out
 
     def status(self) -> dict:
         return {"enabled": self.enabled, "series": self.series(), "checks": list(CHECKS), "min_gap": float(self.opt("min_gap", 10)), "state": self.state,
                 "summary": self.summary(),
                 "recent": self.db.query("SELECT * FROM gw_picks ORDER BY id DESC LIMIT 40"),
+                "fv_recent": self.db.query("SELECT * FROM gw_fv_picks ORDER BY id DESC LIMIT 40"),
                 "checks_log": self.db.query("SELECT * FROM gw_checks ORDER BY id DESC LIMIT 24")}
