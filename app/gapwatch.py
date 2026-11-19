@@ -96,7 +96,7 @@ class GapWatch:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.opt("enabled", True))
+        return bool(self.opt("enabled", False))          # retired 19 Nov 2026 (failed its paper test); gapwatch.enabled = true brings it back
 
     def series(self) -> list[str]:
         s = self.opt("series", ["KXGOLDH"])

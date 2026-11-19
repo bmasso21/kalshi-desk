@@ -122,7 +122,8 @@ def sources(wdb) -> list[dict]:
     return out
 
 
-RETIRED = {"gold_fv": "retired 18 Nov: -25% on 51 paper buys (the free live gold price is too noisy)"}
+RETIRED = {"gold_fv": "retired 18 Nov: -25% on 51 paper buys (the free live gold price is too noisy)",
+           "gold_cushion15": "retired 19 Nov: 339 of 353 won yet lost $5.14 (the rare miss costs more than the many small wins pay)"}
 
 
 def board(wdb, bar: dict | None = None, mm_reports: list | None = None) -> dict:

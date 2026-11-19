@@ -67,7 +67,7 @@ def main():
     j = r.json()
     st = {x["key"]: x for x in j["strategies"]}
     check("scoreboard lists every paper strategy with its verdict", r.status_code == 200 and {"sports_edge", "sports_lean", "gold_cushion15", "gold_fv"} <= set(st)
-          and st["gold_cushion15"]["score"]["trades"] == 2 and st["gold_cushion15"]["open"] == 1 and st["gold_cushion15"]["verdict"]["status"] == "collecting", r.text[:300])
+          and st["gold_cushion15"]["score"]["trades"] == 2 and st["gold_cushion15"]["open"] == 1 and st["gold_cushion15"]["verdict"]["status"] == "retired", r.text[:300])   # retired 19 Nov 2026; its trades stay on the board
     check("automatic live trading starts OFF with $0 limits, and the page says the executor is not built",
           j["autolive"]["enabled"] is False and j["autolive"]["total_cap"] == 0 and j["autolive"]["executor_built"] is False)
     r = c.post("/api/autolive", headers=HD, json={"enabled": True})
