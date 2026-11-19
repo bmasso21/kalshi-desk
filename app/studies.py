@@ -281,7 +281,7 @@ def baskets(conn, flt: dict | None = None) -> dict:
 
 
 # ---------------------------------------------------------------- scalp --
-EXTRA = ("scalp", "hourly", "goldfv")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
+EXTRA = ("scalp", "hourly", "goldfv", "gasfv")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
 SCALP_ENTRY_MIN = (2, 5, 10)         # minutes after the contract opens
 SCALP_STOPS = (None, 0.25, 0.50)     # sell if the price falls this fraction below what was paid; None = no stop
 SCALP_TARGETS = (0.05, 0.10, 0.20, 0.35, 0.60, None)   # take profit at +x%; None = hold to the end
@@ -712,7 +712,42 @@ def goldfv(conn, flt: dict | None = None, session=None, client=None) -> dict:
     return out
 
 
-RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly, "goldfv": goldfv}
+GAS_SERIES = ("KXAAAGASD", "KXAAAGASW", "KXAAAGASM")
+
+
+def gasfv(conn, flt: dict | None = None, client=None) -> dict:
+    """AAA gas ladders: a model price from the AAA figures already published against the prices takers actually paid
+    (see app/gasfv.py). AAA's daily history comes from the settlement values of ALL three gas series."""
+    from . import gasfv as GS
+    from . import goldfv as G
+    flt = {**(flt or {})}
+    flt["series"] = flt.get("series") or list(GAS_SERIES)
+    w, args = _where(flt)
+    rows = conn.execute(f"SELECT m.ticker, m.close_ts c, m.result res, m.strike_type, m.floor_strike FROM wh_markets m WHERE {w}", args).fetchall()
+    markets = [{"ticker": r["ticker"], "close": r["c"], "strike": _strike(r), "result": r["res"]} for r in rows if r["c"]]
+    markets = [m for m in markets if m["strike"] is not None]
+    if not markets:
+        return {"trades": 0, "note": "no settled gas contracts stored: add KXAAAGASD, KXAAAGASW, KXAAAGASM to the data collector and sync"}
+    trades = {}
+    for m in markets:
+        tr = conn.execute("SELECT ts, yes_price yp, taker_outcome_side tos, taker_book_side tbs FROM wh_trades WHERE ticker=? AND ts<=? ORDER BY ts",
+                          (m["ticker"], m["close"])).fetchall()
+        trades[m["ticker"]] = [(r["ts"], r["yp"], r["tos"] if r["tos"] in ("yes", "no") else ("yes" if r["tbs"] == "bid" else "no"))
+                               for r in tr if r["yp"] is not None]
+    client = client or PUBLIC
+    if client is None:
+        raise RuntimeError("no market-data client for Kalshi's settlement values")
+    since = min(m["close"] for m in markets) - (GS.ERR_WIN + 20) * 86400
+    vals = {}
+    for ser in GAS_SERIES:
+        for c, v in G.fetch_settles(client, ser, since).items():
+            vals[GS.value_date(c)] = v
+    out = GS.core(markets, trades, GS.Gas(vals), _Acc)
+    out["series"] = flt["series"]
+    return out
+
+
+RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly, "goldfv": goldfv, "gasfv": gasfv}
 
 
 class Studies:
