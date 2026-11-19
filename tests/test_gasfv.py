@@ -83,6 +83,10 @@ def main():
     s2 = next(x for x in nt["strategy_first_trade"] if x["min_edge_c"] == 2)
     check("the rule takes the FIRST qualifying trade per contract and side, return = payout - price - fee",
           s2["all"]["entries"] == 2 and close(s2["all"]["ret_c"], 100 * ((1 - 0.6 - fee) + (1 - 0.7 - 0.07 * 0.7 * 0.3)) / 2, 0.01), s2)
+    sp = {(x["by"], x["group"]): x["all"]["entries"] for x in nt["rule_split"]["rows"]}
+    check("the 5c rule's result is broken down by contract type, side, days left, price and entry time (noon ET here)",
+          sp.get(("contract", "G")) == 2 and sp.get(("side", "yes")) == 1 and sp.get(("side", "no")) == 1 and sp.get(("days_left", "1 day")) == 2
+          and sp.get(("price", "50c+")) == 2 and sp.get(("entry_time_et", "noon-6pm")) == 2, sp)
     check("both contracts settle on the same day -> one event for the statistics", s2["all"]["events"] == 1, s2["all"])
     check("AAA summary: typical daily move 1c", close(r["aaa"]["typical_daily_move_c"], 1.0, 1e-6) and r["aaa"]["days"] == 30, r["aaa"])
     check("too little AAA history -> a note, not a guess", GS.core(markets, trades, GS.Gas({L: 3.8}), ST._Acc)["trades"] == 0)

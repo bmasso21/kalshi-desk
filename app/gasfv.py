@@ -30,6 +30,7 @@ MAX_GAP = 3               # a missing day or two is bridged; more and the trade 
 SIGMA_FLOOR = 0.002       # $: AAA figures are published to a tenth of a cent
 DAY_BUCKETS = ((1, 2, "1 day"), (2, 3, "2 days"), (3, 5, "3-4 days"), (5, 11, "5-10 days"), (11, 10 ** 6, "11+ days"))
 MODELS = ("no_trend", "trend")
+SPLIT_AT = 0.05           # the rule threshold whose result is broken down by contract type, side, days left, price, time of day
 
 
 def _nth_sunday(year: int, month: int, n: int) -> dt.date:
@@ -110,7 +111,7 @@ def core(markets: list, trades: dict, gas: Gas, Acc) -> dict:
     if not closes or len(gas.v) < MIN_ERRS + TREND_N + 2:
         return {"trades": 0, "note": "too little AAA history stored yet (it is rebuilt from settled gas contracts)", "aaa_days": len(gas.v)}
     mid = closes[len(closes) // 2]
-    res = {k: {"by_edge": {}, "by_days": {}, "strat": {}, "calib": {}, "used": 0} for k in MODELS}
+    res = {k: {"by_edge": {}, "by_days": {}, "strat": {}, "calib": {}, "split": {}, "used": 0} for k in MODELS}
     skipped = 0
     for m in sorted(markets, key=lambda m: m["close"]):
         if m["result"] not in ("yes", "no") or m["strike"] is None:
@@ -154,12 +155,20 @@ def core(markets: list, trades: dict, gas: Gas, Acc) -> dict:
                 c2[2] += p_yes
                 for th in THRESHOLDS:                          # the rule: the FIRST trade per contract and side clearing the bar
                     if edge >= th and (th, side) not in first[k]:
-                        first[k][(th, side)] = (ret, price)
+                        first[k][(th, side)] = (ret, price, h, ts)
         for k in MODELS:
-            for (th, side), (ret, price) in first[k].items():
+            for (th, side), (ret, price, h, ts) in first[k].items():
                 a = res[k]["strat"].setdefault(th, [Acc(), Acc(), Acc()])
                 a[half].add(g, ret, price)
                 a[2].add(g, ret, price)
+                if th == SPLIT_AT:                              # where does the rule's result come from?
+                    hr = et(ts).hour
+                    for dim, lab in (("contract", str(m["ticker"]).split("-")[0]), ("side", side), ("days_left", _bucket(h, DAY_BUCKETS)),
+                                     ("price", "under 20c" if price < 0.20 else "20-50c" if price < 0.50 else "50c+"),
+                                     ("entry_time_et", "before 8am" if hr < 8 else "8am-noon" if hr < 12 else "noon-6pm" if hr < 18 else "after 6pm")):
+                        a = res[k]["split"].setdefault((dim, lab), [Acc(), Acc(), Acc()])
+                        a[half].add(g, ret, price)
+                        a[2].add(g, ret, price)
 
     def row(a):
         return {"all": a[2].out(), "first_half": a[0].out(), "second_half": a[1].out()}
@@ -178,6 +187,8 @@ def core(markets: list, trades: dict, gas: Gas, Acc) -> dict:
                   "by_edge": sorted(({"edge": e, **row(v)} for e, v in r["by_edge"].items()), key=lambda x: oe[x["edge"]]),
                   "edge2_by_days_left": sorted(({"days": d, **row(v)} for d, v in r["by_days"].items()), key=lambda x: od[x["days"]]),
                   "strategy_first_trade": [{"min_edge_c": int(th * 100), **row(r["strat"][th])} for th in THRESHOLDS if th in r["strat"]],
+                  "rule_split": {"min_edge_c": int(SPLIT_AT * 100),
+                                 "rows": [{"by": d, "group": lab, **row(v)} for (d, lab), v in sorted(r["split"].items())]},
                   "calibration": [{"model_pct": f"{10 * b}-{10 * b + 10}%", "n": v[0], "model_avg_pct": round(100 * v[2] / v[0], 1),
                                    "actual_yes_pct": round(100 * v[1] / v[0], 1)} for b, v in sorted(r["calib"].items())]}
     return out
