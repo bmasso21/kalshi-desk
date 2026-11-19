@@ -5,7 +5,6 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -16,7 +15,6 @@ from app.goldfv import phi  # noqa: E402
 from app.warehouse import WarehouseDB  # noqa: E402
 
 OK, FAIL = [], []
-ET = ZoneInfo("America/New_York")
 
 
 def check(name, cond, extra=""):
@@ -28,8 +26,9 @@ def close(a, b, tol=1e-6):
     return a is not None and abs(a - b) <= tol
 
 
-def et(y, m, d, hh=0, mm=0):
-    return dt.datetime(y, m, d, hh, mm, tzinfo=ET).timestamp()
+def et(y, m, d, hh=0, mm=0, off=5):
+    """An Eastern wall-clock moment as a timestamp (off = hours behind UTC: 5 in winter, 4 in summer)."""
+    return (dt.datetime(y, m, d, hh, mm, tzinfo=dt.timezone.utc) + dt.timedelta(hours=off)).timestamp()
 
 
 def main():
@@ -40,6 +39,11 @@ def main():
     check("a day's figure is public from 8 a.m. ET; before that only yesterday's",
           GS.known_date(et(2026, 11, 17, 9)) == D(2026, 11, 17) and GS.known_date(et(2026, 11, 17, 7, 59)) == D(2026, 11, 16))
 
+    check("Eastern time by rule, no time-zone database: summer is UTC-4, winter UTC-5, switching at 2 a.m. on the right Sundays",
+          GS.et(et(2026, 7, 4, 12, off=4)).hour == 12 and GS.et(et(2026, 1, 15, 12)).hour == 12
+          and GS.et(et(2026, 3, 8, 1, 59)).hour == 1 and GS.et(et(2026, 3, 8, 3, 0, off=4)).hour == 3
+          and GS.et(et(2026, 11, 1, 1, 30, off=4)).hour == 1 and GS.et(et(2026, 11, 1, 3)).hour == 3
+          and GS.value_date(et(2026, 7, 3, 23, 59, off=4)) == D(2026, 7, 4))
     # 30 days rising exactly 1c a day: Oct 19 = 3.50 ... Nov 17 = 3.79
     days = [D(2026, 10, 19) + dt.timedelta(days=i) for i in range(30)]
     g = GS.Gas({d: 3.50 + 0.01 * i for i, d in enumerate(days)})
@@ -102,8 +106,8 @@ def main():
             if params["series_ticker"] != "KXAAAGASD":
                 return
             for d, v in zz.v.items():                                # each day's figure, on the contract that closed the evening before
-                c = dt.datetime(d.year, d.month, d.day, tzinfo=ET) - dt.timedelta(minutes=1)
-                yield {"close_time": c.astimezone(dt.timezone.utc).isoformat(), "expiration_value": str(v)}
+                c = et(d.year, d.month, d.day, off=4 if d < dt.date(2026, 11, 1) else 5) - 60
+                yield {"close_time": dt.datetime.fromtimestamp(c, dt.timezone.utc).isoformat(), "expiration_value": str(v)}
     conn = sqlite3.connect(str(Path(tmp) / "w.db"))
     conn.row_factory = sqlite3.Row
     fc = FakeClient()

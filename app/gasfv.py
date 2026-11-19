@@ -19,12 +19,9 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-from zoneinfo import ZoneInfo
-
 from .goldfv import EDGE_BUCKETS, THRESHOLDS, _bucket, phi
 
 TAKER = 0.07
-ET = ZoneInfo("America/New_York")
 KNOWN_HOUR = 8            # a day's AAA figure counts as public from 8:00 ET that day
 TREND_N = 3               # daily changes averaged for the trend
 ERR_WIN = 45              # days of past misses used to size the uncertainty
@@ -35,14 +32,28 @@ DAY_BUCKETS = ((1, 2, "1 day"), (2, 3, "2 days"), (3, 5, "3-4 days"), (5, 11, "5
 MODELS = ("no_trend", "trend")
 
 
+def _nth_sunday(year: int, month: int, n: int) -> dt.date:
+    d = dt.date(year, month, 1)
+    return d + dt.timedelta(days=(6 - d.weekday()) % 7 + 7 * (n - 1))
+
+
+def et(ts: float) -> dt.datetime:
+    """US Eastern wall-clock time, worked out by the rule (second Sunday of March to first Sunday of November is
+    daylight time) so it needs no time-zone database (Windows ships none with Python)."""
+    u = dt.datetime.fromtimestamp(ts, dt.timezone.utc).replace(tzinfo=None)
+    start = dt.datetime.combine(_nth_sunday(u.year, 3, 2), dt.time(7))       # 2:00 EST = 07:00 UTC
+    end = dt.datetime.combine(_nth_sunday(u.year, 11, 1), dt.time(6))        # 2:00 EDT = 06:00 UTC
+    return u - dt.timedelta(hours=4 if start <= u < end else 5)
+
+
 def value_date(close_ts: float) -> dt.date:
     """The day whose AAA figure settles a contract: contracts close at 11:59 p.m. ET the evening before."""
-    return dt.datetime.fromtimestamp(close_ts + 60, ET).date()
+    return et(close_ts + 60).date()
 
 
 def known_date(ts: float) -> dt.date:
     """The newest day whose AAA figure is public at ts."""
-    d = dt.datetime.fromtimestamp(ts, ET)
+    d = et(ts)
     return d.date() if d.hour >= KNOWN_HOUR else d.date() - dt.timedelta(days=1)
 
 
