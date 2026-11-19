@@ -102,6 +102,14 @@ def sources(wdb) -> list[dict]:
                 "market": "Fed decisions (KXFEDDECISION)",
                 "rows": [{"pnl": r["pnl"], "cost": r["price"] + r["fee"], "cluster": r["event"], "ts": r["settled_ts"]} for r in fd if r["status"] == "settled" and r["pnl"] is not None],
                 "open": sum(1 for r in fd if r["status"] == "open")})
+    gp = q("SELECT side, day, close_ts, price, fee, pnl, status FROM gas_picks")
+    for sd, label in (("no", "Gas daily: NO 5c+ under trend model"), ("yes", "Gas daily: YES 5c+ under trend model")):
+        rs = [r for r in gp if r["side"] == sd]
+        out.append({"key": f"gas_{sd}", "name": label, "market": "Daily gas price (KXAAAGASD)",
+                    "description": "Tomorrow's AAA figure from the last 3 days' trend; bought 8am-6pm ET at the real ask, 20-95c. "
+                                   "The backtest paid on NO only, possibly just a falling season: the two sides are scored apart",
+                    "rows": [{"pnl": r["pnl"], "cost": r["price"] + r["fee"], "cluster": r["day"], "ts": r["close_ts"]} for r in rs if r["status"] == "settled" and r["pnl"] is not None],
+                    "open": sum(1 for r in rs if r["status"] == "open")})
     ar = q("SELECT kind, event, cost, pnl_real, settled_ts, status, locked FROM arb_opps")
     for kinds, key, label, desc in ((("no_basket", "ladder"), "arb_locked", "Arbitrage: locked (NO baskets, ladders)",
                                      "Kalshi priced against itself: every outcome pays at least the cost after fees, confirmed at live order-book prices"),

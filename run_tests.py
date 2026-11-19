@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-SUITES = ["tests/test_e2e.py", "tests/test_ws.py", "tests/test_alerts.py", "tests/test_research.py", "tests/test_clv.py", "tests/test_auth.py", "tests/test_weather.py", "tests/test_sports.py", "tests/test_mm.py", "tests/test_breakers.py", "tests/test_scaling.py", "tests/test_studies.py", "tests/test_history.py", "tests/test_fairvalue.py", "tests/test_gapwatch.py", "tests/test_goldfv.py", "tests/test_gasfv.py", "tests/test_goldlive.py", "tests/test_catalog.py", "tests/test_scoreboard.py", "tests/test_ratelimit.py", "tests/test_arb.py", "tests/test_relocate.py", "tests/test_fedwatch.py"]
+SUITES = ["tests/test_e2e.py", "tests/test_ws.py", "tests/test_alerts.py", "tests/test_research.py", "tests/test_clv.py", "tests/test_auth.py", "tests/test_weather.py", "tests/test_sports.py", "tests/test_mm.py", "tests/test_breakers.py", "tests/test_scaling.py", "tests/test_studies.py", "tests/test_history.py", "tests/test_fairvalue.py", "tests/test_gapwatch.py", "tests/test_goldfv.py", "tests/test_gasfv.py", "tests/test_gaswatch.py", "tests/test_goldlive.py", "tests/test_catalog.py", "tests/test_scoreboard.py", "tests/test_ratelimit.py", "tests/test_arb.py", "tests/test_relocate.py", "tests/test_fedwatch.py"]
 
 failed = []
 for s in SUITES:

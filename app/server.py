@@ -1253,6 +1253,22 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         except Exception as e:
             raise HTTPException(502, f"Fed scan failed: {e}"[:300])
 
+    from .gaswatch import GasWatch
+    gasw = GasWatch(lambda: cfg.data.get("gas") or {}, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+    if start_engine:
+        gasw.start()
+
+    @app.get("/api/gas")
+    def gas_view():
+        return gasw.status()
+
+    @app.post("/api/gas/scan")
+    def gas_scan_now():
+        try:
+            return gasw.scan()
+        except Exception as e:
+            raise HTTPException(502, f"Gas check failed: {e}"[:300])
+
     from .arb import ArbScanner
     arb = ArbScanner(lambda: cfg.data.get("arb") or {}, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
     if start_engine:
