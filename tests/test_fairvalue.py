@@ -254,6 +254,13 @@ def main():
     check("college names: St. = Saint or State, a (FL)-style qualifier is ignored",
           name_match("St. John's", "St. John's Red Storm") and name_match("Saint Mary's", "St. Mary's Gaels") and name_match("Miami (FL)", "Miami Hurricanes")
           and name_match("Kansas St.", "Kansas State Wildcats") and not name_match("Duke", "Kansas State Wildcats"))
+    check("accents and sportsbook shorthand match Kalshi's names (Montréal, San José St, Loyola (Chi), SE Missouri St, Fort Wayne, South Carolina Upstate, St. Thomas (MN))",
+          name_match("Montreal", "Montréal Canadiens") and name_match("San Jose St.", "San José St Spartans") and name_match("Loyola Chicago", "Loyola (Chi) Ramblers")
+          and name_match("Southeast Missouri St.", "SE Missouri St Redhawks") and name_match("Purdue Fort Wayne", "Fort Wayne Mastodons")
+          and name_match("USC Upstate", "South Carolina Upstate Spartans") and name_match("St. Thomas", "St. Thomas (MN) Tommies")
+          and name_match("Wichita St.", "Wichita St Shockers") and name_match("Purdue Fort Wayne", "Purdue Fort Wayne Mastodons")
+          and not name_match("Loyola Maryland", "Loyola (Chi) Ramblers") and not name_match("South Carolina", "South Carolina Upstate Spartans")
+          and not name_match("USC Upstate", "USC Trojans"))
     d = FV.DEFAULT_SPORTS["basketball_ncaab"]
     check("college basketball is scanned by default: game, spread and total, every 12 hours",
           d["series"] == "KXNCAAMBGAME" and d["markets"] == "h2h,spreads,totals" and d["series"].replace("GAME", "SPREAD") == "KXNCAAMBSPREAD", d)

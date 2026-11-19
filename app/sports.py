@@ -251,7 +251,22 @@ def _iso(s):
 
 def _toks(s: str) -> list[str]:
     import re
-    return [t for t in re.split(r"[^a-z0-9]+", (s or "").lower()) if t]
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()     # Montréal -> Montreal, San José -> San Jose
+    return [t for t in re.split(r"[^a-z0-9]+", s.lower()) if t]
+
+
+# sportsbook wording -> Kalshi's wording, for the names prefix-matching cannot bridge
+BOOK_ALIASES = ((r"\(chi\)", "Chicago"), (r"^se\b", "Southeast"), (r"^south carolina upstate\b", "USC Upstate"),
+                (r"^(?:ipfw|fort wayne)\b", "Purdue Fort Wayne"))
+
+
+def _book_name(s: str) -> str:
+    import re
+    s = (s or "").strip()
+    for pat, rep in BOOK_ALIASES:
+        s = re.sub(pat, rep, s, flags=re.I)
+    return s
 
 
 def name_match(kalshi_name: str, participant: str) -> bool:
@@ -259,7 +274,7 @@ def name_match(kalshi_name: str, participant: str) -> bool:
     ('Los Angeles Lakers'), in order."""
     import re
     kt = _toks(re.sub(r"\([^)]*\)", " ", kalshi_name or ""))    # "Miami (FL)" -> "Miami": the other team and the date still have to match
-    pt = _toks(re.sub(r"\([^)]*\)", " ", participant or ""))
+    pt = _toks(re.sub(r"\([^)]*\)", " ", _book_name(participant)))
     if not kt or not pt:
         return False
 
