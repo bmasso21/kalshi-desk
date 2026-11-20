@@ -1270,6 +1270,38 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         except Exception as e:
             raise HTTPException(502, f"Gas check failed: {e}"[:300])
 
+    from .mentions import MentionsPaper
+    mentions = MentionsPaper(lambda: cfg.data.get("mentions") or {}, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+    if start_engine:
+        mentions.start()
+
+    @app.get("/api/mentions")
+    def mentions_view():
+        return mentions.status()
+
+    @app.post("/api/mentions/scan")
+    def mentions_scan_now():
+        try:
+            return mentions.scan()
+        except Exception as e:
+            raise HTTPException(502, f"Mentions check failed: {e}"[:300])
+
+    from .polywatch import PolyWatch
+    polyw = PolyWatch(lambda: cfg.data.get("poly") or {}, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+    if start_engine:
+        polyw.start()
+
+    @app.get("/api/poly")
+    def poly_view():
+        return polyw.status()
+
+    @app.post("/api/poly/scan")
+    def poly_scan_now():
+        try:
+            return polyw.scan()
+        except Exception as e:
+            raise HTTPException(502, f"Polymarket check failed: {e}"[:300])
+
     from .arb import ArbScanner
     arb = ArbScanner(lambda: cfg.data.get("arb") or {}, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
     if start_engine:
