@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from mock_kalshi import create_mock  # noqa: E402
-from app.kalshi_client import d  # noqa: E402
+from app.kalshi_client import KalshiError, d  # noqa: E402
 
 PORT = 8911
 OK, FAIL = [], []
@@ -375,6 +375,37 @@ def run(keytype: str):
     # daily loss limit
     cfg.update({"quoter": {"enabled": True}})
     eng.daily_pnl()  # snapshot start equity
+    # the balance is read from Kalshi at most once every 5 seconds (it was the one call Kalshi kept refusing)
+    eng._bal = None
+    real_balance, n_calls = eng.client.balance, [0]
+
+    def counted():
+        n_calls[0] += 1
+        return real_balance()
+    eng.client.balance = counted
+    b1 = eng.balance(5)
+    eng.equity(5); eng.balance(5); eng.daily_pnl(5); eng.check_loss_limit()
+    check("one balance reading serves the frequent callers (loss-limit check, screens) for 5 seconds", n_calls[0] == 1, n_calls[0])
+    eng._bal = (eng._bal[0], eng._bal[1] - 6, eng._bal[2])          # 6 seconds later
+    eng.balance(5)
+    check("...then a fresh one is read", n_calls[0] == 2, n_calls[0])
+    eng.equity()
+    check("callers that did not ask for a reused reading (limit scaling, breakers) always get a fresh one", n_calls[0] == 3, n_calls[0])
+
+    def refused():
+        raise KalshiError(429, {"message": "rate limited after retries"})
+    eng.client.balance = refused
+    eng._bal = (eng._bal[0], eng._bal[1] - 30, eng._bal[2])         # 30 seconds old and Kalshi refuses a fresh one
+    check("if Kalshi refuses a fresh reading, one under a minute old still serves (the loss check keeps working)", eng.balance()["balance"] == b1["balance"])
+    eng._bal = (eng._bal[0], eng._bal[1] - 61, eng._bal[2])
+    try:
+        eng.balance()
+        stale_ok = True
+    except KalshiError:
+        stale_ok = False
+    check("...but never one older than a minute: then the refusal is reported", not stale_ok)
+    eng.client.balance = real_balance
+    eng._bal = None
     mock.state.S["balance"] -= 3000  # -$30
     eng.check_loss_limit()
     check("daily loss limit trips kill switch", cfg.risk["kill_switch"] and not cfg.quoter["enabled"]

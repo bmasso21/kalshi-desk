@@ -88,7 +88,9 @@ RATE_LIMITS: dict = {}            # host -> deque of 429 timestamps (for the das
 def shared_read_bucket(host: str) -> "TokenBucket":
     with _SHARED_LOCK:
         if host not in _SHARED_READ:
-            _SHARED_READ[host] = TokenBucket(rate=40, capacity=40)      # no burst: after a restart every scanner starts at once
+            # 2.5 reads a second, no burst. At 4 a second Kalshi still refused calls whenever the big scans overlapped
+            # (the breakdown showed /markets, /events, /series and trade reads all refused in the hour after a restart)
+            _SHARED_READ[host] = TokenBucket(rate=25, capacity=25)
         return _SHARED_READ[host]
 
 

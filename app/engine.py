@@ -154,15 +154,39 @@ class Engine:
             self.spend_cache = {"ts": time.time(), "data": data}
         return data
 
-    def equity(self) -> Decimal:
-        b = self.client.balance()
+    BALANCE_MAX_AGE = 5.0          # seconds one balance reading is reused
+    BALANCE_STALE_OK = 60.0        # if Kalshi refuses a fresh reading (429 / network), one this recent still serves
+
+    def balance(self, max_age: float | None = None) -> dict:
+        """The account balance. max_age = how old a reading the caller accepts (0 = ask Kalshi now, the default).
+        The callers that ask many times a minute - the loss-limit check on every quoter cycle and the screens - accept one
+        a few seconds old: asked for separately they tripped Kalshi's limit on this one call (every refused call on the
+        demo host was GET /portfolio/balance). Rare callers (limit scaling, breakers) still read it fresh.
+        A reading belongs to one client: switching environment drops it."""
+        max_age = 0.0 if max_age is None else max_age
+        c = self.client
+        hit = getattr(self, "_bal", None)
+        now = time.time()
+        if hit and hit[0] is c and now - hit[1] <= max_age:
+            return hit[2]
+        try:
+            b = c.balance()
+        except Exception:
+            if hit and hit[0] is c and now - hit[1] <= self.BALANCE_STALE_OK:
+                return hit[2]
+            raise
+        self._bal = (c, now, b)
+        return b
+
+    def equity(self, max_age: float = 0.0) -> Decimal:
+        b = self.balance(max_age)
         return (d(b.get("balance")) + d(b.get("portfolio_value"))) / 100
 
-    def daily_pnl(self) -> dict | None:
+    def daily_pnl(self, max_age: float = 0.0) -> dict | None:
         """Equity change since the first check today, net of deposits and withdrawals."""
         if not self.client.authenticated:
             return None
-        eq = self.equity()
+        eq = self.equity(max_age)
         day = risk.today_key()
         row = self.db.query("SELECT start_equity, ts FROM day_equity WHERE env=? AND day=?", (self.cfg.env, day))
         if not row:
@@ -183,7 +207,7 @@ class Engine:
         lim = d(self.cfg.risk.get("max_daily_loss") or 0)
         if lim <= 0 or self.cfg.risk.get("kill_switch") or not self.client.authenticated:
             return
-        p = self.daily_pnl()
+        p = self.daily_pnl(self.BALANCE_MAX_AGE)
         if p and -p["pnl"] >= lim:
             self.trip_kill(f"Daily loss limit hit: down ${-p['pnl']:.2f} today (limit ${lim:.2f})")
 

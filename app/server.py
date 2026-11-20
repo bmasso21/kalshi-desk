@@ -1083,7 +1083,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
             return {"authenticated": False}
         credits = eng.client.credit_history(min_ts=int(time.time()) - days * 86400)
         sp = eng.spent_today(max_age=0)
-        pnl = eng.daily_pnl()
+        pnl = eng.daily_pnl(eng.BALANCE_MAX_AGE)
         q_orders = db.query("SELECT COUNT(*) n FROM orders_log WHERE env=? AND source='quoter' AND ts>=?",
                             (cfg.env, risk.start_of_today()))[0]["n"]
         return {"authenticated": True, "credits": credits,
@@ -1173,7 +1173,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         c = eng.client
         if not c.authenticated:
             return {"authenticated": False}
-        bal = c.balance()
+        bal = eng.balance(eng.BALANCE_MAX_AGE)
         pos = eng.positions(max_age=0)
         tickers = [p["ticker"] for p in pos["market_positions"]]
         mk = {}

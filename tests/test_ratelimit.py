@@ -42,7 +42,7 @@ def main():
     b = KC.KalshiClient("https://api.example.test/trade-api/v2")
     c = KC.KalshiClient("https://other.example.test/trade-api/v2")
     check("public readers of the same host share one request budget", a.read_bucket is b.read_bucket and a.read_bucket is not c.read_bucket)
-    check("the shared budget is 4 reads a second", a.read_bucket.rate == 40 and a.read_bucket.capacity == 40)
+    check("the shared budget is 2.5 reads a second with no burst", a.read_bucket.rate == 25 and a.read_bucket.capacity == 25)
     sleeps = []
     KC.time.sleep = lambda s: sleeps.append(s)
     a.read_bucket = KC.TokenBucket(rate=1e9, capacity=1e9)       # isolate the 429 waits from budget waits
