@@ -85,6 +85,71 @@ def main():
         pass
     check("the account client (screens, quoter) gives up quickly on 429s: at most 3 short waits of up to 2 s",
           len(sleeps) <= 3 and all(s <= 2.26 for s in sleeps) and sum(sleeps) < 6, [round(x, 2) for x in sleeps[:12]])
+
+    # ---- signed market-data reads (GET only) ----
+    import tempfile
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    kp = Path(tempfile.mkdtemp()) / "test-only.pem"                 # a throwaway key made for this test
+    kp.write_bytes(Ed25519PrivateKey.generate().private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+
+    class Rec:
+        def __init__(self, codes):
+            self.codes, self.seen = list(codes), []
+
+        def request(self, method, url, headers=None, **kw):
+            self.seen.append((method, url, dict(headers or {})))
+            c = self.codes.pop(0)
+            return Resp(c, {"Retry-After": "1"} if c == 429 else {})
+    H = "https://signed.example.test/trade-api/v2"
+    p1, p2 = KC.KalshiClient(H), KC.KalshiClient("https://unsigned.example.test/trade-api/v2")
+    p1.session, p2.session = Rec([200, 200]), Rec([200])
+    p1.request("GET", "/markets")
+    check("without a signer a keyless read carries no key", "KALSHI-ACCESS-KEY" not in p1.session.seen[0][2])
+    check("a signer whose key cannot be loaded changes nothing", KC.set_read_signer(H, "kid", str(kp) + ".missing") is False
+          and "signed.example.test" not in KC.read_signer_status()["signed_hosts"])
+    check("signer set for one host", KC.set_read_signer(H, "kid-1", str(kp)) is True and KC.read_signer_status()["signed_hosts"] == ["signed.example.test"])
+    p1.request("GET", "/markets", {"limit": 5})
+    p2.request("GET", "/markets")
+    h1 = p1.session.seen[1][2]
+    check("keyless reads of that host are now signed with the account key; other hosts are not",
+          h1.get("KALSHI-ACCESS-KEY") == "kid-1" and h1.get("KALSHI-ACCESS-SIGNATURE") and "KALSHI-ACCESS-KEY" not in p2.session.seen[0][2], h1)
+    check("signed reads draw on their own budget of 6 a second, well under Kalshi's 20, leaving room for the account client (12)",
+          KC.SIGNED_READ == (60, 60) and (KC.SIGNED_READ[0] + KC.ACCOUNT_READ[0]) / 10 <= 18)
+    blocked = 0
+    for call in (lambda: p1.create_order(ticker="X", side="yes", action="buy", count=1, yes_price_dollars="0.50") if hasattr(p1, "create_order") else p1.request("POST", "/portfolio/events/orders", body={}, auth=True),
+                 lambda: p1.request("POST", "/portfolio/events/orders", body={}, auth=True),
+                 lambda: p1.request("DELETE", "/portfolio/events/orders/abc", auth=True),
+                 lambda: p1.balance()):
+        try:
+            call()
+        except KC.KalshiError as e:
+            blocked += e.status == 401
+        except TypeError:
+            blocked += 1
+    check("the signer never makes a keyless client able to trade or read the account: orders, cancels and balance are refused before sending",
+          blocked == 4 and len(p1.session.seen) == 2 and not p1.authenticated, (blocked, len(p1.session.seen)))
+    p1.session = Rec([200, 200, 200, 200])
+    for path in ("/portfolio/fills", "/account/limits", "/markets/trades", "/events"):
+        p1.request("GET", path)
+    sg = ["KALSHI-ACCESS-KEY" in x[2] for x in p1.session.seen]
+    check("only market-data paths are signed: a keyless client's GET to /portfolio or /account goes out without the key (and Kalshi refuses it)",
+          sg == [False, False, True, True], sg)
+    p1.session = Rec([200])
+    p1.request("POST", "/anything", body={})
+    check("a non-GET call is never signed with the read signer", "KALSHI-ACCESS-KEY" not in p1.session.seen[0][2])
+    p1.session = Rec([401, 200, 200])
+    p1.request("GET", "/markets")
+    p1.request("GET", "/markets")
+    check("if Kalshi refuses the key on a read, signing switches off for that host and the read goes through unsigned, as before",
+          "KALSHI-ACCESS-KEY" in p1.session.seen[0][2] and "KALSHI-ACCESS-KEY" not in p1.session.seen[1][2] and "KALSHI-ACCESS-KEY" not in p1.session.seen[2][2]
+          and "signed.example.test" in KC.read_signer_status()["off"], KC.read_signer_status())
+    KC.set_read_signer(H, "kid-1", str(kp))
+    p1.session = Rec([429, 200])
+    p1.request("GET", "/events")
+    check("a refused signed read is counted as 'signed', apart from public and account",
+          KC.rate_limit_detail().get("signed.example.test", {}).get("signed GET /events") == 1, KC.rate_limit_detail())
+    KC.clear_read_signer(H)
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 

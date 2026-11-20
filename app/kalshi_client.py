@@ -94,6 +94,47 @@ def shared_read_bucket(host: str) -> "TokenBucket":
         return _SHARED_READ[host]
 
 
+# Signed market-data reads (approved by the owner, Nov 20 2026). Kalshi's limit on calls WITHOUT a key is undocumented
+# and refused hundreds of calls in the hour after every restart; calls signed with the account key draw on the
+# documented budget instead (basic tier: 200 tokens/s, 10 per read). When a signer is set for a host, keyless clients
+# of that host sign their GET requests with it - GET only: such a client still cannot place, change or cancel
+# anything (those calls need a client built with its own key and are refused before they are sent).
+SIGNED_PATHS = ("markets", "events", "series", "exchange", "historical")   # market data only
+SIGNED_READ = (60, 60)           # tokens/s, burst -> 6 reads/s, shared by every keyless reader of the host
+_READ_SIGNER: dict = {}          # host -> {"key_id", "key", "bucket", "since"}
+SIGNER_NOTE: dict = {}           # host -> why signing was switched off (key refused)
+
+
+def set_read_signer(base_url: str, key_id: str, private_key_path: str) -> bool:
+    """Sign keyless market-data reads of this host with the given account key. False (and unsigned as before) if the
+    key cannot be loaded."""
+    host = urlparse(base_url.rstrip("/")).netloc
+    try:
+        key = load_private_key(private_key_path) if key_id and private_key_path else None
+    except Exception as e:
+        SIGNER_NOTE[host] = f"key not loaded: {type(e).__name__}"
+        key = None
+    with _SHARED_LOCK:
+        if not key:
+            _READ_SIGNER.pop(host, None)
+            return False
+        _READ_SIGNER[host] = {"key_id": key_id, "key": key, "bucket": TokenBucket(rate=SIGNED_READ[0], capacity=SIGNED_READ[1]),
+                              "since": time.time()}
+        SIGNER_NOTE.pop(host, None)
+    return True
+
+
+def clear_read_signer(base_url_or_host: str, why: str = "") -> None:
+    host = urlparse(base_url_or_host).netloc or base_url_or_host
+    with _SHARED_LOCK:
+        if _READ_SIGNER.pop(host, None) is not None and why:
+            SIGNER_NOTE[host] = why
+
+
+def read_signer_status() -> dict:
+    return {"signed_hosts": sorted(_READ_SIGNER), "off": dict(SIGNER_NOTE)}
+
+
 RATE_DETAIL: dict = {}            # host -> deque of (ts, "GET /markets", "account" | "public"): WHICH calls were refused
 
 
@@ -161,15 +202,28 @@ class KalshiClient:
         return bool(self.key_id and self.private_key)
 
     # -- core ---------------------------------------------------------------
-    def _headers(self, method: str, path: str) -> dict:
+    def _signer(self, method: str):
+        """The host's read signer, for a keyless client making a GET; otherwise None."""
+        if self.authenticated or method.upper() != "GET":
+            return None
+        return _READ_SIGNER.get(self.host)
+
+    @staticmethod
+    def _market_data(path: str) -> bool:
+        """Only market-data paths are ever signed with the read signer - never /portfolio or /account."""
+        seg = [x for x in path.split("?")[0].split("/") if x]
+        return bool(seg) and seg[0] in SIGNED_PATHS
+
+    def _headers(self, method: str, path: str, signer: dict | None = None) -> dict:
         h = {"Accept": "application/json"}
-        if self.authenticated:
+        kid, key = (self.key_id, self.private_key) if self.authenticated else (signer["key_id"], signer["key"]) if signer else (None, None)
+        if kid and key:
             ts = str(int(time.time() * 1000))
             signed_path = self.path_prefix + path.split("?")[0]
             h.update({
-                "KALSHI-ACCESS-KEY": self.key_id,
+                "KALSHI-ACCESS-KEY": kid,
                 "KALSHI-ACCESS-TIMESTAMP": ts,
-                "KALSHI-ACCESS-SIGNATURE": sign(self.private_key, ts + method.upper() + signed_path),
+                "KALSHI-ACCESS-SIGNATURE": sign(key, ts + method.upper() + signed_path),
             })
         return h
 
@@ -184,10 +238,19 @@ class KalshiClient:
         # (the order may have reached Kalshi), so POST/PUT are never retried on network errors.
         retry_net = method.upper() in ("GET", "DELETE")
         for attempt in range(retries):
-            (self.write_bucket if is_write else self.read_bucket).take(10)
+            signer = self._signer(method) if self._market_data(path) else None
+            if is_write:
+                self.write_bucket.take(10)
+            else:
+                # a client with its own slower budget (the collector, the quoter's scanner) keeps it as well
+                if signer is None or self.read_bucket is not _SHARED_READ.get(self.host):
+                    self.read_bucket.take(10)
+                if signer is not None:
+                    signer["bucket"].take(10)
             try:
                 resp = self.session.request(method, self.base_url + path, params=params, json=body,
-                                            headers=self._headers(method, path), timeout=self.timeout)
+                                            headers=self._headers(method, path, signer) if signer else self._headers(method, path),
+                                            timeout=self.timeout)
             except (requests.ConnectionError, requests.Timeout) as e:
                 if retry_net and attempt < retries - 1:
                     self.net_retries += 1
@@ -195,13 +258,17 @@ class KalshiClient:
                     delay *= 2
                     continue
                 raise
+            if signer is not None and resp.status_code in (401, 403):
+                # the key was refused for a plain market-data read: stop signing for this host and read without it, as before
+                clear_read_signer(self.host, f"key refused ({resp.status_code}) on GET {path.split('?')[0][:40]}")
+                continue
             if resp.status_code == 429:
                 import collections
                 q = RATE_LIMITS.setdefault(self.host, collections.deque(maxlen=5000))
                 q.append(time.time())
                 seg = [x for x in path.split("?")[0].split("/") if x][:2]          # "/markets/TICKER/orderbook" -> "markets/*"
                 what = f"{method.upper()} /{seg[0] if seg else ''}" + ("/" + (seg[1] if seg[0] == "portfolio" else "*") if len(seg) > 1 else "")
-                RATE_DETAIL.setdefault(self.host, collections.deque(maxlen=5000)).append((time.time(), what, "account" if self.authenticated else "public"))
+                RATE_DETAIL.setdefault(self.host, collections.deque(maxlen=5000)).append((time.time(), what, "account" if self.authenticated else "signed" if signer else "public"))
                 if attempt < retries - 1:
                     # a 429 means Kalshi refused the request (nothing was done), so even an order can be resent.
                     # Background readers of public data (no key) can afford to wait: as long as Kalshi asks, else 0.5,

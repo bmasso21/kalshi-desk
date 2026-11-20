@@ -28,6 +28,11 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     cfg = cfg or Config()
     db = db or DB()
     eng = Engine(cfg, db)
+    from . import kalshi_client as _kc
+    # Production market-data reads are signed with the production key (owner's approval, Nov 20 2026): GET only, so the
+    # paper trackers and the collector draw on the account's documented read budget. Off: "prod_sign_reads": false.
+    if cfg.data.get("prod_sign_reads", True) and not cfg.data.get("warehouse", {}).get("base_url_override"):
+        _kc.set_read_signer(BASE_URLS["prod"], cfg.data.get("prod_key_id") or "", cfg.data.get("prod_private_key_path") or "")
     from .backtest import STRATEGIES, Backtester
     from .warehouse import Warehouse, WarehouseDB
     wdb = WarehouseDB(Path(cfg.data.get("warehouse_dir") or cfg.path.parent) / "warehouse.db")   # warehouse_dir: set by a data move
@@ -197,7 +202,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         fs = eng.feed.status()
         from .kalshi_client import rate_limit_detail, rate_limit_stats
         out = {"env": cfg.env, "authenticated": c.authenticated, "scan": eng.scan_state, "rate_limited_1h": rate_limit_stats(),
-               "rate_limited_calls_1h": rate_limit_detail(),
+               "rate_limited_calls_1h": rate_limit_detail(), "signed_reads": _kc.read_signer_status(),
                "kill_switch": cfg.risk["kill_switch"], "auto": cfg.auto["enabled"],
                "feed": {k: fs[k] for k in ("mode", "connected", "reason", "error", "markets_watched",
                                            "books_synced", "since", "last_msg")}}
