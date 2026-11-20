@@ -29,6 +29,7 @@ WINDOW_LO_H, WINDOW_HI_H = 1, 24
 PRICE_LO, PRICE_HI = 0.03, 0.97
 MAX_NEW_PER_SCAN = 300
 MAX_SETTLE_PER_PASS = 80
+MAX_SERIES = 150                   # Mentions series looked at per scan (one request each)
 EPS = 1e-9
 
 SCHEMA = """
@@ -94,6 +95,7 @@ class MentionsPaper:
         ensure_schema(wdb, SCHEMA)
         self._stop = threading.Event()
         self._fees: dict = {}
+        self._series = (0.0, [])
         self.state = {"running": False, "last": None, "error": None, "note": ""}
 
     def opt(self, k, default):
@@ -104,19 +106,23 @@ class MentionsPaper:
     def scan(self, now: float | None = None) -> dict:
         now = now or time.time()
         have = {r["ticker"] for r in self.db.query("SELECT DISTINCT ticker FROM men_orders")}
-        new = {}
-        for m in self.k.paginate("/markets", "markets", {"status": "open", "limit": 1000, "mve_filter": "exclude",
-                                                       "min_close_ts": int(now + WINDOW_LO_H * 3600),
-                                                       "max_close_ts": int(now + WINDOW_HI_H * 3600)}, max_items=60000):
-            t = m.get("ticker")
-            c = _ts(m.get("close_time"))
-            if not t or t in have or t in new or not is_mention(t) or (m.get("market_type") or "binary") != "binary" or c is None:
-                continue
-            if not now + WINDOW_LO_H * 3600 <= c <= now + WINDOW_HI_H * 3600:
-                continue
-            new[t] = (m, c)
+        new, seen = {}, 0
+        # One call lists every open event of the Mentions category's series with its markets; walking ALL markets closing
+        # in a day (thousands of crypto and currency ladders) never reached them and cost dozens of requests an hour.
+        for ser in self.series(now):
+            for e in self.k.paginate("/events", "events", {"series_ticker": ser, "status": "open", "with_nested_markets": "true", "limit": 200}, max_items=400):
+                for m in e.get("markets") or []:
+                    t = m.get("ticker")
+                    c = _ts(m.get("close_time"))
+                    seen += 1
+                    if not t or t in have or t in new or (m.get("market_type") or "binary") != "binary" or c is None:
+                        continue
+                    if (m.get("status") or "active") not in ("active", "open") or not now + WINDOW_LO_H * 3600 <= c <= now + WINDOW_HI_H * 3600:
+                        continue
+                    new[t] = ({**m, "event_ticker": m.get("event_ticker") or e.get("event_ticker")}, c)
             if len(new) >= MAX_NEW_PER_SCAN:
                 break
+        self.state["markets_seen"] = seen
         placed = 0
         size = float(self.opt("mentions_size", SIZE))
         books = self.k.orderbooks(list(new)) if new else {}
@@ -134,9 +140,19 @@ class MentionsPaper:
                                       (now, t, m.get("event_ticker"), t.split("-")[0], side, round(p, 4), q, size, c, c - WINDOW_LO_H * 3600))
                 placed += cur.rowcount if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
         done = self.settle(now)
-        self.state.update(last=now, error=None, note=f"{len(new)} new Mentions markets closing in {WINDOW_LO_H}-{WINDOW_HI_H} h, "
+        self.state.update(last=now, error=None, note=f"{self.state.get('series', 0)} Mentions series, {seen} open markets looked at; {len(new)} new ones closing in {WINDOW_LO_H}-{WINDOW_HI_H} h, "
                                                      f"{placed} resting bids placed on paper, {done} settled")
         return {"markets": len(new), "placed": placed, "settled": done}
+
+    def series(self, now: float) -> list[str]:
+        """Tickers of the Mentions category's series that have traded lately, busiest first; re-read every 6 hours."""
+        if now - self._series[0] > 6 * 3600 or not self._series[1]:
+            ss = self.k.series_list("Mentions") or []
+            vol = lambda s: fnum(s.get("volume_fp") or s.get("volume")) or 0.0
+            ss = sorted((s for s in ss if s.get("ticker")), key=lambda s: -vol(s))
+            self._series = (now, [s["ticker"] for s in ss if vol(s) > 0][:MAX_SERIES] or [s["ticker"] for s in ss][:MAX_SERIES])
+        self.state["series"] = len(self._series[1])
+        return self._series[1]
 
     # ------------------------------------------------------------ settling --
     def _fee_info(self, series: str) -> dict:
@@ -208,10 +224,10 @@ class MentionsPaper:
 
     def status(self) -> dict:
         q = self.db.query
-        tot = q("SELECT COUNT(*) n, SUM(status='resting') resting, SUM(status='unfilled') unfilled, SUM(status='filled') filled, "
+        tot = q("SELECT COUNT(*) n, COALESCE(SUM(status='resting'), 0) resting, COALESCE(SUM(status='unfilled'), 0) unfilled, COALESCE(SUM(status='filled'), 0) filled, "
                 "COALESCE(SUM(CASE WHEN status='filled' THEN filled END), 0) contracts, COALESCE(SUM(pnl), 0) pnl, "
                 "COALESCE(SUM(CASE WHEN status='filled' THEN filled * price END), 0) staked, COALESCE(SUM(fee), 0) fees, "
-                "SUM(status='filled' AND pnl > 0) won, COUNT(DISTINCT CASE WHEN status='filled' THEN event END) events FROM men_orders")[0]
+                "COALESCE(SUM(status='filled' AND pnl > 0), 0) won, COUNT(DISTINCT CASE WHEN status='filled' THEN event END) events FROM men_orders")[0]
         by = q("SELECT side, CASE WHEN price < 0.10 THEN 'under 10c' WHEN price < 0.40 THEN '10-39c' WHEN price < 0.70 THEN '40-69c' ELSE '70c+' END band, "
                "COUNT(*) orders, SUM(status='filled') filled, COALESCE(SUM(pnl), 0) pnl, COALESCE(SUM(CASE WHEN status='filled' THEN filled * price END), 0) staked "
                "FROM men_orders WHERE status IN ('filled', 'unfilled') GROUP BY side, band ORDER BY side, MIN(price)")

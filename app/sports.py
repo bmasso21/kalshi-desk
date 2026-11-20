@@ -252,12 +252,14 @@ def _iso(s):
 def _toks(s: str) -> list[str]:
     import re
     import unicodedata
-    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()     # Montréal -> Montreal, San José -> San Jose
+    s = (s or "").replace("\u2019", "'").replace("\u02bb", "'").replace("'", "")          # Hawai'i -> Hawaii, St. John's -> St. Johns
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()           # Montréal -> Montreal, San José -> San Jose
     return [t for t in re.split(r"[^a-z0-9]+", s.lower()) if t]
 
 
 # sportsbook wording -> Kalshi's wording, for the names prefix-matching cannot bridge
-BOOK_ALIASES = ((r"\(chi\)", "Chicago"), (r"^se\b", "Southeast"), (r"^south carolina upstate\b", "USC Upstate"),
+BOOK_ALIASES = ((r"\(chi\)", "Chicago"), (r"^se louisiana\b", "Southeastern Louisiana"), (r"^ul monroe\b", "Louisiana-Monroe"),
+                (r"^ul lafayette\b", "Louisiana"), (r"^se\b", "Southeast"), (r"^south carolina upstate\b", "USC Upstate"),
                 (r"^(?:ipfw|fort wayne)\b", "Purdue Fort Wayne"), (r"^gw\b", "George Washington"),
                 (r"^(?:tenn-martin|ut martin|tennessee martin)\b", "Tennessee-Martin"), (r"^csu\b", "Cal State"),
                 (r"^umkc\b", "Kansas City"), (r"^mt\.?\s+st\b", "Mount St"))

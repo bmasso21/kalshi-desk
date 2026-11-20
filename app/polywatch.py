@@ -137,7 +137,7 @@ class PolyWatch:
 
     def poly_events(self, sport: str) -> list[dict]:
         out = []
-        for off in range(0, 400, 100):
+        for off in range(0, 800, 100):
             r = self.http.get(GAMMA, params={"tag_slug": sport, "closed": "false", "limit": 100, "offset": off},
                               headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=25)
             r.raise_for_status()
@@ -151,11 +151,15 @@ class PolyWatch:
         now = now or time.time()
         min_edge = float(self.opt("poly_min_edge", MIN_EDGE))
         games = paired = picks = 0
-        errs = []
+        errs, diag = [], {}
         self.db.execute("DELETE FROM poly_board WHERE start_ts<?", (now,))
         for sport, series in SPORTS.items():
             try:
-                pgs = [g for g in poly_games(self.poly_events(sport), sport) if now + MIN_LEAD_SEC < g["start"] <= now + HORIZON_H * 3600]
+                evs = self.poly_events(sport)
+                allg = poly_games(evs, sport)
+                pgs = [g for g in allg if now + MIN_LEAD_SEC < g["start"] <= now + HORIZON_H * 3600]
+                diag[sport] = {"polymarket_events": len(evs), "game_markets": len(allg), "in_window": len(pgs), "paired": 0,
+                               "sample_slugs": [e.get("slug") for e in evs[:3]]}
                 if not pgs:
                     continue
                 kg = kalshi_games(list(self.k.paginate("/events", "events", {"series_ticker": series, "status": "open", "with_nested_markets": "true",
@@ -169,6 +173,7 @@ class PolyWatch:
                 if not mt:
                     continue
                 paired += 1
+                diag[sport]["paired"] += 1
                 ev, ma, mb = mt
                 tight = g["ask"] - g["bid"] <= MAX_POLY_SPREAD + 1e-9
                 name = f"{g['teams'][0]} vs {g['teams'][1]}"
@@ -184,7 +189,7 @@ class PolyWatch:
                                               (now, m["ticker"], ev, sport, name, team, g["start"], round(mid, 4), ka, round(TAKER * ka * (1 - ka), 6), round(edge, 4)))
                         picks += cur.rowcount if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
         self.settle(now)
-        self.state.update(last=now, error="; ".join(errs) or None, games=games, paired=paired,
+        self.state.update(last=now, error="; ".join(errs) or None, games=games, paired=paired, by_sport=diag,
                           note=f"{games} Polymarket games starting within {HORIZON_H} h, {paired} paired with Kalshi, {picks} new paper buy(s)")
         return {"games": games, "paired": paired, "picks": picks}
 

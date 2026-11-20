@@ -268,6 +268,10 @@ def main():
           and name_match("University at Albany", "Albany Great Danes") and not name_match("Saint Mary's", "Mt. St. Mary's Mountaineers")
           and not name_match("Colorado St.", "CSU Northridge Matadors") and not name_match("Missouri St.", "SE Missouri St Redhawks")
           and name_match("Citadel", "The Citadel Bulldogs") and name_match("Los Angeles L", "Los Angeles Lakers") and name_match("New York R", "New York Rangers"))
+    check("apostrophes and more shorthand: Hawaii / Hawai'i, UL Monroe, SE Louisiana",
+          name_match("Hawai'i", "Hawaii Rainbow Warriors") and name_match("Hawai\u02bbi", "Hawaii Rainbow Warriors") and name_match("Louisiana-Monroe", "UL Monroe Warhawks")
+          and name_match("Southeastern Louisiana", "SE Louisiana Lions") and name_match("St. John's", "St. John's Red Storm") and name_match("Saint Joseph's", "St. Josephs Hawks")
+          and not name_match("Southeast Missouri St.", "SE Louisiana Lions"))
     from app.sports import match_fixture
     T0 = 1795219200.0                                           # 2026-11-20 20:00 ET
     evs = {"KXNCAAMBGAME-26NOV20UGAGT": [{"ticker": "KXNCAAMBGAME-26NOV20UGAGT-UGA", "yes_sub_title": "Georgia"},

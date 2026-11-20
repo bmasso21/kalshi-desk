@@ -58,17 +58,25 @@ def main():
 
         def paginate(self, path, key, params, max_items=None):
             self.calls.append(path)
-            if path == "/markets":
-                assert params["status"] == "open" and params["max_close_ts"] - params["min_close_ts"] == 23 * 3600 and params["min_close_ts"] >= int(NOW + 3600)
-                yield {"ticker": "KXNVDAMENTION-26NOV20-AI", "event_ticker": "KXNVDAMENTION-26NOV20", "close_time": iso(C1), "market_type": "binary"}
-                yield {"ticker": "KXNVDAMENTION-26NOV20-CHINA", "event_ticker": "KXNVDAMENTION-26NOV20", "close_time": iso(C1), "market_type": "binary"}
-                yield {"ticker": "KXNBAGAME-26NOV20-LAL", "event_ticker": "KXNBAGAME-26NOV20", "close_time": iso(C1), "market_type": "binary"}
+            if path == "/events":
+                assert params["status"] == "open" and params["with_nested_markets"] == "true" and params["series_ticker"] in ("KXNVDAMENTION", "KXQUIETMENTION")
+                if params["series_ticker"] == "KXNVDAMENTION":
+                    yield {"event_ticker": "KXNVDAMENTION-26NOV20", "markets": [
+                        {"ticker": "KXNVDAMENTION-26NOV20-AI", "close_time": iso(C1), "market_type": "binary", "status": "active"},
+                        {"ticker": "KXNVDAMENTION-26NOV20-CHINA", "close_time": iso(C1), "market_type": "binary", "status": "active"},
+                        {"ticker": "KXNVDAMENTION-26NOV20-LATER", "close_time": iso(NOW + 30 * 3600), "market_type": "binary", "status": "active"},
+                        {"ticker": "KXNVDAMENTION-26NOV20-SOON", "close_time": iso(NOW + 1800), "market_type": "binary", "status": "active"}]}
             elif path == "/markets/trades":
                 for x in self.trades.get(params["ticker"], []):
                     yield x
 
+        def series_list(self, category=None):
+            assert category == "Mentions"
+            self.calls.append("/series")
+            return [{"ticker": "KXQUIETMENTION", "volume": 0}, {"ticker": "KXNVDAMENTION", "volume": 5000}]
+
         def orderbooks(self, tickers):
-            assert all(M.is_mention(t) for t in tickers)
+            assert set(tickers) <= {"KXNVDAMENTION-26NOV20-AI", "KXNVDAMENTION-26NOV20-CHINA"}, tickers   # only markets closing in 1-24 h
             return {"KXNVDAMENTION-26NOV20-AI": {"yes_dollars": [["0.3000", "50"], ["0.2900", "10"]], "no_dollars": [["0.6500", "20"]]},
                     "KXNVDAMENTION-26NOV20-CHINA": {"yes_dollars": [["0.0100", "900"]], "no_dollars": []}}
 
@@ -83,7 +91,9 @@ def main():
     mp = M.MentionsPaper(lambda: {}, wdb, k)
     r = mp.scan(NOW)
     o = {(x["ticker"].rsplit("-", 1)[-1], x["side"]): x for x in wdb.query("SELECT * FROM men_orders")}
-    check("one resting bid per side at the best bid, behind the size already showing; other series and prices under 3c are left alone",
+    check("the Mentions series come from Kalshi's own category list (only those that have traded), re-read at most every 6 hours",
+          k.calls.count("/series") == 1 and k.calls.count("/events") == 1 and mp.state["series"] == 1, k.calls)
+    check("one resting bid per side at the best bid, behind the size already showing; markets closing too soon or too late and prices under 3c are left alone",
           set(o) == {("AI", "yes"), ("AI", "no")} and close(o[("AI", "yes")]["price"], .30) and o[("AI", "yes")]["queue_ahead"] == 50
           and close(o[("AI", "no")]["price"], .65) and o[("AI", "no")]["queue_ahead"] == 20 and r["placed"] == 2, (r, sorted(o)))
     check("unfilled size is cancelled one hour before the close", close(o[("AI", "yes")]["cancel_ts"], C1 - 3600))
@@ -104,6 +114,8 @@ def main():
     check("filled contracts are held to settlement: 10 x (1 - 0.30) less the maker fee (rounded up to the cent)",
           close(o["yes"]["fee"], 0.04) and close(o["yes"]["pnl"], 10 * 0.70 - 0.04), (o["yes"]["fee"], o["yes"]["pnl"]))
     s = mp.status()
+    empty = M.MentionsPaper(lambda: {}, WarehouseDB(Path(tempfile.mkdtemp()) / "e.db"), k).status()["totals"]
+    check("with nothing placed yet the totals are zeros, never blanks", empty["resting"] == 0 and empty["filled"] == 0 and empty["unfilled"] == 0 and empty["won"] == 0, empty)
     check("status: filled / unfilled / resting counts and the result", s["totals"]["filled"] == 1 and s["totals"]["unfilled"] == 1 and close(s["totals"]["pnl"], 6.96)
           and close(s["totals"]["staked"], 3.0) and s["totals"]["events"] == 1, s["totals"])
     row = {x["key"]: x for x in SB.board(wdb)["strategies"]}["mentions_maker"]

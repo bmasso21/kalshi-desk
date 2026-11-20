@@ -940,13 +940,17 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         finally:
             mm_cache["busy"] = None
 
+    _mm_lock = threading.Lock()
+
     def _mm_refresh(wait: float = 2.0):
-        th = mm_cache["busy"]
-        if th is None:
-            th = threading.Thread(target=_mm_build, daemon=True, name="mm-report")
-            mm_cache["busy"] = th
-            th.start()
-        th.join(timeout=wait)                       # fast builds are returned fresh; slow ones finish in the background
+        with _mm_lock:                              # two requests at once: the second used to find the thread created but
+            th = mm_cache["busy"]                   # not yet started and crashed joining it ("cannot join thread before it is started")
+            if th is None:
+                th = threading.Thread(target=_mm_build, daemon=True, name="mm-report")
+                th.start()
+                mm_cache["busy"] = th
+        if th.is_alive():
+            th.join(timeout=wait)                       # fast builds are returned fresh; slow ones finish in the background
 
     @app.get("/api/mm")
     def mm_status():
