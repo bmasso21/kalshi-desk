@@ -195,8 +195,9 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     def status():
         c = eng.client
         fs = eng.feed.status()
-        from .kalshi_client import rate_limit_stats
+        from .kalshi_client import rate_limit_detail, rate_limit_stats
         out = {"env": cfg.env, "authenticated": c.authenticated, "scan": eng.scan_state, "rate_limited_1h": rate_limit_stats(),
+               "rate_limited_calls_1h": rate_limit_detail(),
                "kill_switch": cfg.risk["kill_switch"], "auto": cfg.auto["enabled"],
                "feed": {k: fs[k] for k in ("mode", "connected", "reason", "error", "markets_watched",
                                            "books_synced", "since", "last_msg")}}

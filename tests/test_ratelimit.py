@@ -42,7 +42,7 @@ def main():
     b = KC.KalshiClient("https://api.example.test/trade-api/v2")
     c = KC.KalshiClient("https://other.example.test/trade-api/v2")
     check("public readers of the same host share one request budget", a.read_bucket is b.read_bucket and a.read_bucket is not c.read_bucket)
-    check("the shared budget is 4 reads a second", a.read_bucket.rate == 40 and a.read_bucket.capacity == 80)
+    check("the shared budget is 4 reads a second", a.read_bucket.rate == 40 and a.read_bucket.capacity == 40)
     sleeps = []
     KC.time.sleep = lambda s: sleeps.append(s)
     a.read_bucket = KC.TokenBucket(rate=1e9, capacity=1e9)       # isolate the 429 waits from budget waits
@@ -51,6 +51,8 @@ def main():
     check("429: waits as long as Kalshi asks (Retry-After), then succeeds", r == {"ok": True} and a.session.n == 3
           and len(sleeps) >= 2 and all(1.0 <= s <= 1.26 for s in sleeps[-2:]), [round(x, 2) for x in sleeps[:12]])
     check("429s are counted for the dashboard", KC.rate_limit_stats().get("api.example.test", 0) >= 2)
+    det = KC.rate_limit_detail().get("api.example.test", {})
+    check("...and which calls were refused is kept (who, method, first path part)", det and all(k.split()[0] in ("public", "account") and k.split()[1] in ("GET", "POST", "DELETE", "PUT") and k.split()[2].startswith("/") for k in det), det)
     sleeps.clear()
 
     class NoRA(Ses):

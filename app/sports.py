@@ -258,7 +258,10 @@ def _toks(s: str) -> list[str]:
 
 # sportsbook wording -> Kalshi's wording, for the names prefix-matching cannot bridge
 BOOK_ALIASES = ((r"\(chi\)", "Chicago"), (r"^se\b", "Southeast"), (r"^south carolina upstate\b", "USC Upstate"),
-                (r"^(?:ipfw|fort wayne)\b", "Purdue Fort Wayne"))
+                (r"^(?:ipfw|fort wayne)\b", "Purdue Fort Wayne"), (r"^gw\b", "George Washington"),
+                (r"^(?:tenn-martin|ut martin|tennessee martin)\b", "Tennessee-Martin"), (r"^csu\b", "Cal State"),
+                (r"^umkc\b", "Kansas City"), (r"^mt\.?\s+st\b", "Mount St"))
+KALSHI_PREFIX = r"^university (?:at|of)\s+"          # Kalshi: "University at Albany"; sportsbooks: "Albany Great Danes"
 
 
 def _book_name(s: str) -> str:
@@ -273,13 +276,19 @@ def name_match(kalshi_name: str, participant: str) -> bool:
     """Every token of Kalshi's short team name ('Los Angeles L') is a prefix of a token in the full name
     ('Los Angeles Lakers'), in order."""
     import re
-    kt = _toks(re.sub(r"\([^)]*\)", " ", kalshi_name or ""))    # "Miami (FL)" -> "Miami": the other team and the date still have to match
+    kt = _toks(re.sub(r"\([^)]*\)", " ", re.sub(KALSHI_PREFIX, "", (kalshi_name or "").strip(), flags=re.I)))    # "Miami (FL)" -> "Miami": the other team and the date still have to match
     pt = _toks(re.sub(r"\([^)]*\)", " ", _book_name(participant)))
     if not kt or not pt:
         return False
 
     def same(t, p):                                               # "St." is Saint or State in college names
         return p.startswith(t) or (t == "st" and p in ("saint", "state")) or (t in ("saint", "state") and p == "st")
+    if kt[0] == "the":
+        kt = kt[1:]
+    if pt[0] == "the":
+        pt = pt[1:]
+    if not kt or not pt or not same(kt[0], pt[0]):                # names must START the same: "Saint Mary's" is not
+        return False                                              # "Mount St. Mary's", "Missouri St." is not "Southeast Missouri St."
     j = 0
     for t in kt:
         while j < len(pt) and not same(t, pt[j]):
@@ -312,13 +321,18 @@ def match_fixture(fx: dict, events: dict) -> tuple | None:
             continue
         m1 = m2 = None
         how = ""
-        for m in ms:
-            code = (m["ticker"].rsplit("-", 1)[-1]).upper()
-            sub = m.get("yes_sub_title") or ""
-            if a1 and code == a1 or name_match(sub, fx["p1"]):
-                m1 = m1 or m
-            elif a2 and code == a2 or name_match(sub, fx["p2"]):
-                m2 = m2 or m
+
+        def fits(m, abbr, name):
+            return bool(abbr and (m["ticker"].rsplit("-", 1)[-1]).upper() == abbr) or name_match(m.get("yes_sub_title") or "", name)
+        # try both ways round and keep the one where EACH side fits its own team: with "Georgia" and "Georgia Tech" in one
+        # game, "Georgia" also fits "Georgia Tech Yellow Jackets", so taking the first fit per market paired them wrongly
+        for x, y in ((ms[0], ms[1]), (ms[1], ms[0])):
+            if fits(x, a1, fx["p1"]) and fits(y, a2, fx["p2"]):
+                straight = fits(y, a1, fx["p1"]) and fits(x, a2, fx["p2"])           # also fits the other way: ambiguous
+                if not straight or m1 is None:
+                    m1, m2 = x, y
+                if not straight:
+                    break
         if m1 and m2 and m1 is not m2:
             how = "abbr" if a1 and a2 and codes in (a1 + a2, a2 + a1) else "name"
             score = (0 if d == et_date else 1, 0 if how == "abbr" else 1)

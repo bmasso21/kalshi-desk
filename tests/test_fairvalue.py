@@ -261,6 +261,21 @@ def main():
           and name_match("Wichita St.", "Wichita St Shockers") and name_match("Purdue Fort Wayne", "Purdue Fort Wayne Mastodons")
           and not name_match("Loyola Maryland", "Loyola (Chi) Ramblers") and not name_match("South Carolina", "South Carolina Upstate Spartans")
           and not name_match("USC Upstate", "USC Trojans"))
+    check("more sportsbook shorthand: GW, Tenn-Martin, CSU Northridge, UMKC, Mt. St. Mary's, and Kalshi's 'University at Albany'",
+          name_match("George Washington", "GW Revolutionaries") and name_match("Tennessee-Martin", "Tenn-Martin Skyhawks")
+          and name_match("Cal State Northridge", "CSU Northridge Matadors") and name_match("Cal State Bakersfield", "CSU Bakersfield Roadrunners")
+          and name_match("Kansas City", "UMKC Kangaroos") and name_match("Mount St. Mary's", "Mt. St. Mary's Mountaineers")
+          and name_match("University at Albany", "Albany Great Danes") and not name_match("Saint Mary's", "Mt. St. Mary's Mountaineers")
+          and not name_match("Colorado St.", "CSU Northridge Matadors") and not name_match("Missouri St.", "SE Missouri St Redhawks")
+          and name_match("Citadel", "The Citadel Bulldogs") and name_match("Los Angeles L", "Los Angeles Lakers") and name_match("New York R", "New York Rangers"))
+    from app.sports import match_fixture
+    T0 = 1795219200.0                                           # 2026-11-20 20:00 ET
+    evs = {"KXNCAAMBGAME-26NOV20UGAGT": [{"ticker": "KXNCAAMBGAME-26NOV20UGAGT-UGA", "yes_sub_title": "Georgia"},
+                                         {"ticker": "KXNCAAMBGAME-26NOV20UGAGT-GT", "yes_sub_title": "Georgia Tech"}]}
+    mt = match_fixture({"start_ts": T0, "p1": "Georgia Tech Yellow Jackets", "p2": "Georgia Bulldogs"}, evs)
+    mt2 = match_fixture({"start_ts": T0, "p1": "Georgia Bulldogs", "p2": "Georgia Tech Yellow Jackets"}, evs)
+    check("two teams sharing a first word (Georgia at Georgia Tech) pair up the right way round, whichever is home",
+          mt and mt[1].endswith("-GT") and mt[2].endswith("-UGA") and mt2 and mt2[1].endswith("-UGA") and mt2[2].endswith("-GT"), (mt, mt2))
     d = FV.DEFAULT_SPORTS["basketball_ncaab"]
     check("college basketball is scanned by default: game, spread and total, every 12 hours",
           d["series"] == "KXNCAAMBGAME" and d["markets"] == "h2h,spreads,totals" and d["series"].replace("GAME", "SPREAD") == "KXNCAAMBSPREAD", d)

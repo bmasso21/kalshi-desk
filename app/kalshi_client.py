@@ -88,13 +88,30 @@ RATE_LIMITS: dict = {}            # host -> deque of 429 timestamps (for the das
 def shared_read_bucket(host: str) -> "TokenBucket":
     with _SHARED_LOCK:
         if host not in _SHARED_READ:
-            _SHARED_READ[host] = TokenBucket(rate=40, capacity=80)
+            _SHARED_READ[host] = TokenBucket(rate=40, capacity=40)      # no burst: after a restart every scanner starts at once
         return _SHARED_READ[host]
+
+
+RATE_DETAIL: dict = {}            # host -> deque of (ts, "GET /markets", "account" | "public"): WHICH calls were refused
 
 
 def rate_limit_stats(window: float = 3600) -> dict:
     now = time.time()
     return {h: sum(1 for t in q if now - t <= window) for h, q in RATE_LIMITS.items()}
+
+
+def rate_limit_detail(window: float = 3600) -> dict:
+    """{host: {"account GET /portfolio/orders": n, ...}} for the last hour, most refused first."""
+    now = time.time()
+    out = {}
+    for h, q in RATE_DETAIL.items():
+        c = {}
+        for t, what, who in list(q):
+            if now - t <= window:
+                c[f"{who} {what}"] = c.get(f"{who} {what}", 0) + 1
+        if c:
+            out[h] = dict(sorted(c.items(), key=lambda kv: -kv[1])[:12])
+    return out
 
 
 def _retry_after(resp) -> float | None:
@@ -180,6 +197,9 @@ class KalshiClient:
                 import collections
                 q = RATE_LIMITS.setdefault(self.host, collections.deque(maxlen=5000))
                 q.append(time.time())
+                seg = [x for x in path.split("?")[0].split("/") if x][:2]          # "/markets/TICKER/orderbook" -> "markets/*"
+                what = f"{method.upper()} /{seg[0] if seg else ''}" + ("/" + (seg[1] if seg[0] == "portfolio" else "*") if len(seg) > 1 else "")
+                RATE_DETAIL.setdefault(self.host, collections.deque(maxlen=5000)).append((time.time(), what, "account" if self.authenticated else "public"))
                 if attempt < retries - 1:
                     # a 429 means Kalshi refused the request (nothing was done), so even an order can be resent.
                     # Background readers of public data (no key) can afford to wait: as long as Kalshi asks, else 0.5,
