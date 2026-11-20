@@ -102,7 +102,7 @@ def main():
     check("unfilled size is cancelled one hour before the close", close(o[("AI", "yes")]["cancel_ts"], C1 - 3600))
     mp.scan(NOW + 600)
     check("a market is quoted once", len(wdb.query("SELECT * FROM men_orders")) == 2)
-    check("later scans that day look only at the series with open markets", k.calls.count("/series") == 1 and k.calls.count("/events") == 3, k.calls)
+    check("later scans in the next hours look only at the series with open markets", k.calls.count("/series") == 1 and k.calls.count("/events") == 3, k.calls)
     check("nothing settles (and no trades are read) before the market closes", mp.settle(C1 - 10) == 0 and "/markets/trades" not in k.calls)
 
     def kt(ts, yp, n, side):
@@ -125,6 +125,12 @@ def main():
     row = {x["key"]: x for x in SB.board(wdb)["strategies"]}["mentions_maker"]
     check("filled orders appear on the scoreboard, one event per speech", row["score"]["trades"] == 1 and row["score"]["events"] == 1 and close(row["score"]["pnl"], 6.96, 0.01), row["score"])
     check("the client it is given has no order methods", not any(hasattr(k, a) for a in ("create_order", "cancel_order")))
+    n_ser = k.calls.count("/series")
+    mp.scan(NOW + 3 * 3600)
+    same = k.calls.count("/series") == n_ser
+    mp.scan(NOW + 4 * 3600 + 60)
+    check("every series is walked again after 4 hours, not before (speech markets are often listed the day they end)",
+          same and k.calls.count("/series") == n_ser + 1, k.calls)
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 

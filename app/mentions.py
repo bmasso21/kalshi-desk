@@ -29,7 +29,8 @@ WINDOW_LO_H, WINDOW_HI_H = 1, 24
 PRICE_LO, PRICE_HI = 0.03, 0.97
 MAX_NEW_PER_SCAN = 300
 MAX_SETTLE_PER_PASS = 80
-MAX_SERIES = 800                   # Mentions series walked in the daily discovery (one request each)
+MAX_SERIES = 800                   # Mentions series walked in each discovery (one request each)
+WALK_H = 4                         # hours between full walks: speech markets are often listed only hours ahead
 EPS = 1e-9
 
 SCHEMA = """
@@ -102,7 +103,7 @@ class MentionsPaper:
         ensure_schema(wdb, SCHEMA)
         self._stop = threading.Event()
         self._fees: dict = {}
-        self._series = (0.0, [], False)            # (when listed, tickers, True while the full daily walk is pending)
+        self._series = (0.0, [], False)            # (when listed, tickers, True while a full walk is pending)
         self.state = {"running": False, "last": None, "error": None, "note": ""}
 
     def opt(self, k, default):
@@ -159,10 +160,11 @@ class MentionsPaper:
         return {"markets": len(new), "placed": placed, "settled": done}
 
     def series(self, now: float) -> list[str]:
-        """The Mentions series to look at. Once a day EVERY series of the category is walked (about 500 requests) and
-        the ones with open markets are kept; the hourly scans in between look only at those. (Picking the busiest by
+        """The Mentions series to look at. Every WALK_H hours EVERY series of the category is walked (about 500 requests)
+        and the ones with open markets are kept; the hourly scans in between look only at those. (A daily walk missed
+        series whose markets are listed the same day they end.) (Picking the busiest by
         lifetime volume missed most of the live ones: the big names had no open event at all.)"""
-        if now - self._series[0] > 24 * 3600 or not self._series[1]:
+        if now - self._series[0] > float(self.opt("mentions_walk_h", WALK_H)) * 3600 or not self._series[1]:
             ss = [s["ticker"] for s in (self.k.series_list("Mentions") or []) if s.get("ticker")]
             self._series = (now, ss[:MAX_SERIES], True)
         self.state["series"] = len(self._series[1])
