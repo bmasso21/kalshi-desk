@@ -91,14 +91,18 @@ def main():
     mp = M.MentionsPaper(lambda: {}, wdb, k)
     r = mp.scan(NOW)
     o = {(x["ticker"].rsplit("-", 1)[-1], x["side"]): x for x in wdb.query("SELECT * FROM men_orders")}
-    check("the Mentions series come from Kalshi's own category list (only those that have traded), re-read at most every 6 hours",
-          k.calls.count("/series") == 1 and k.calls.count("/events") == 1 and mp.state["series"] == 1, k.calls)
+    check("first scan of the day walks EVERY Mentions series once and keeps the ones with open markets",
+          k.calls.count("/series") == 1 and k.calls.count("/events") == 2 and mp._series[1] == ["KXNVDAMENTION"] and mp.state["open_series"] == 1, (k.calls, mp._series))
+    check("a market's end is the earlier of its expected expiration and its scheduled close",
+          M.end_time({"close_time": iso(NOW + 9 * 86400), "expected_expiration_time": iso(NOW + 5 * 3600)}) == NOW + 5 * 3600 and M.end_time({}) is None)
+    check("the soonest-ending markets are reported for diagnosis", mp.state["soonest"][0]["ends_in_h"] == 0.5, mp.state["soonest"])
     check("one resting bid per side at the best bid, behind the size already showing; markets closing too soon or too late and prices under 3c are left alone",
           set(o) == {("AI", "yes"), ("AI", "no")} and close(o[("AI", "yes")]["price"], .30) and o[("AI", "yes")]["queue_ahead"] == 50
           and close(o[("AI", "no")]["price"], .65) and o[("AI", "no")]["queue_ahead"] == 20 and r["placed"] == 2, (r, sorted(o)))
     check("unfilled size is cancelled one hour before the close", close(o[("AI", "yes")]["cancel_ts"], C1 - 3600))
     mp.scan(NOW + 600)
     check("a market is quoted once", len(wdb.query("SELECT * FROM men_orders")) == 2)
+    check("later scans that day look only at the series with open markets", k.calls.count("/series") == 1 and k.calls.count("/events") == 3, k.calls)
     check("nothing settles (and no trades are read) before the market closes", mp.settle(C1 - 10) == 0 and "/markets/trades" not in k.calls)
 
     def kt(ts, yp, n, side):

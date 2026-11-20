@@ -1279,6 +1279,20 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     if start_engine:
         mentions.start()
 
+    @app.get("/api/kalshi/limits")
+    def kalshi_limits():
+        """What Kalshi says this account's rate limits and per-call token costs are (read-only account calls)."""
+        c = eng.client
+        if not c.authenticated:
+            raise HTTPException(409, "no API key for this environment")
+        out = {"env": cfg.env}
+        for name, path in (("limits", "/account/limits"), ("endpoint_costs", "/account/endpoint_costs")):
+            try:
+                out[name] = c.request("GET", path, auth=True)
+            except Exception as e:
+                out[name] = {"error": str(e)[:200]}
+        return out
+
     @app.get("/api/mentions")
     def mentions_view():
         return mentions.status()

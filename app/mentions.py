@@ -29,7 +29,7 @@ WINDOW_LO_H, WINDOW_HI_H = 1, 24
 PRICE_LO, PRICE_HI = 0.03, 0.97
 MAX_NEW_PER_SCAN = 300
 MAX_SETTLE_PER_PASS = 80
-MAX_SERIES = 150                   # Mentions series looked at per scan (one request each)
+MAX_SERIES = 800                   # Mentions series walked in the daily discovery (one request each)
 EPS = 1e-9
 
 SCHEMA = """
@@ -52,6 +52,13 @@ def _ts(s):
         return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() if s else None
     except ValueError:
         return None
+
+
+def end_time(m: dict):
+    """When a market is expected to be decided: the earlier of its expected expiration and its scheduled close (Mentions
+    markets keep a late scheduled close and shut early once the speech is over)."""
+    xs = [x for x in (_ts(m.get("expected_expiration_time")), _ts(m.get("close_time"))) if x]
+    return min(xs) if xs else None
 
 
 def is_mention(ticker: str) -> bool:
@@ -95,7 +102,7 @@ class MentionsPaper:
         ensure_schema(wdb, SCHEMA)
         self._stop = threading.Event()
         self._fees: dict = {}
-        self._series = (0.0, [])
+        self._series = (0.0, [], False)            # (when listed, tickers, True while the full daily walk is pending)
         self.state = {"running": False, "last": None, "error": None, "note": ""}
 
     def opt(self, k, default):
@@ -106,15 +113,18 @@ class MentionsPaper:
     def scan(self, now: float | None = None) -> dict:
         now = now or time.time()
         have = {r["ticker"] for r in self.db.query("SELECT DISTINCT ticker FROM men_orders")}
-        new, seen = {}, 0
-        # One call lists every open event of the Mentions category's series with its markets; walking ALL markets closing
-        # in a day (thousands of crypto and currency ladders) never reached them and cost dozens of requests an hour.
+        new, seen, ends, live = {}, 0, [], set()
+        # One call per Mentions series lists its open events with their markets; walking ALL markets closing in a day
+        # (thousands of crypto and currency ladders) never reached them and cost dozens of requests an hour.
         for ser in self.series(now):
             for e in self.k.paginate("/events", "events", {"series_ticker": ser, "status": "open", "with_nested_markets": "true", "limit": 200}, max_items=400):
                 for m in e.get("markets") or []:
                     t = m.get("ticker")
-                    c = _ts(m.get("close_time"))
+                    c = end_time(m)
                     seen += 1
+                    live.add(ser)
+                    if c is not None and c > now:
+                        ends.append((c, t))
                     if not t or t in have or t in new or (m.get("market_type") or "binary") != "binary" or c is None:
                         continue
                     if (m.get("status") or "active") not in ("active", "open") or not now + WINDOW_LO_H * 3600 <= c <= now + WINDOW_HI_H * 3600:
@@ -122,7 +132,11 @@ class MentionsPaper:
                     new[t] = ({**m, "event_ticker": m.get("event_ticker") or e.get("event_ticker")}, c)
             if len(new) >= MAX_NEW_PER_SCAN:
                 break
+        if self._series[2]:                                     # that was the full walk of every series: remember which have open markets
+            self._series = (self._series[0], sorted(live) or self._series[1], False)
         self.state["markets_seen"] = seen
+        self.state["open_series"] = len(live)
+        self.state["soonest"] = [{"ticker": t, "ends_in_h": round((c - now) / 3600, 1)} for c, t in sorted(ends)[:5]]
         placed = 0
         size = float(self.opt("mentions_size", SIZE))
         books = self.k.orderbooks(list(new)) if new else {}
@@ -140,17 +154,17 @@ class MentionsPaper:
                                       (now, t, m.get("event_ticker"), t.split("-")[0], side, round(p, 4), q, size, c, c - WINDOW_LO_H * 3600))
                 placed += cur.rowcount if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
         done = self.settle(now)
-        self.state.update(last=now, error=None, note=f"{self.state.get('series', 0)} Mentions series, {seen} open markets looked at; {len(new)} new ones closing in {WINDOW_LO_H}-{WINDOW_HI_H} h, "
+        self.state.update(last=now, error=None, note=f"{len(live)} Mentions series with open markets ({seen} markets); {len(new)} new ones ending in {WINDOW_LO_H}-{WINDOW_HI_H} h, "
                                                      f"{placed} resting bids placed on paper, {done} settled")
         return {"markets": len(new), "placed": placed, "settled": done}
 
     def series(self, now: float) -> list[str]:
-        """Tickers of the Mentions category's series that have traded lately, busiest first; re-read every 6 hours."""
-        if now - self._series[0] > 6 * 3600 or not self._series[1]:
-            ss = self.k.series_list("Mentions") or []
-            vol = lambda s: fnum(s.get("volume_fp") or s.get("volume")) or 0.0
-            ss = sorted((s for s in ss if s.get("ticker")), key=lambda s: -vol(s))
-            self._series = (now, [s["ticker"] for s in ss if vol(s) > 0][:MAX_SERIES] or [s["ticker"] for s in ss][:MAX_SERIES])
+        """The Mentions series to look at. Once a day EVERY series of the category is walked (about 500 requests) and
+        the ones with open markets are kept; the hourly scans in between look only at those. (Picking the busiest by
+        lifetime volume missed most of the live ones: the big names had no open event at all.)"""
+        if now - self._series[0] > 24 * 3600 or not self._series[1]:
+            ss = [s["ticker"] for s in (self.k.series_list("Mentions") or []) if s.get("ticker")]
+            self._series = (now, ss[:MAX_SERIES], True)
         self.state["series"] = len(self._series[1])
         return self._series[1]
 
