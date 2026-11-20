@@ -71,6 +71,10 @@ def main():
     acct = KC.KalshiClient("https://api.example.test/trade-api/v2")
     acct.key_id, acct.private_key = "k", object()          # looks authenticated; signing is stubbed below
     acct._headers = lambda m, p: {}
+    check("the account client stays under Kalshi's basic limits (20 reads/s, 10 writes/s) with no burst above one second's worth",
+          (lambda k: k.read_bucket.rate == 120 and k.read_bucket.capacity <= k.read_bucket.rate and k.read_bucket.rate / 10 < 20
+           and k.write_bucket.rate == 80 and k.write_bucket.capacity <= k.write_bucket.rate and k.write_bucket.rate / 10 < 10
+           and k.read_bucket is not KC.shared_read_bucket(k.host))(KC.KalshiClient("https://api.example.test/trade-api/v2", "key-id", None)))
     acct.read_bucket = KC.TokenBucket(rate=1e9, capacity=1e9)       # an account client has its own budget (made so at creation)
     acct.session = NoRA([429] * 7)
     try:

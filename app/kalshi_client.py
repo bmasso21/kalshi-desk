@@ -78,6 +78,8 @@ class TokenBucket:
 # the catalogue and the fair-value tools all read Kalshi production, and Kalshi limits reads per caller, so separate
 # budgets used to add up past the limit (429 "too many requests"). 40 tokens/s at 10 per request = 4 reads/s
 # (the data collector keeps its own, slower budget on top).
+ACCOUNT_READ = (120, 120)        # tokens/s, burst; 10 tokens per request -> 12 reads/s
+ACCOUNT_WRITE = (80, 80)         # 8 writes/s
 _SHARED_READ: dict = {}
 _SHARED_LOCK = threading.Lock()
 RATE_LIMITS: dict = {}            # host -> deque of 429 timestamps (for the dashboard)
@@ -127,9 +129,12 @@ class KalshiClient:
         self.timeout = timeout
         self.session = requests.Session()
         self.host = urlparse(self.base_url).netloc
-        # public readers share one budget per host; an authenticated (account) client keeps its own
-        self.read_bucket = TokenBucket(rate=200, capacity=600) if key_id else shared_read_bucket(self.host)
-        self.write_bucket = TokenBucket(rate=100, capacity=100)
+        # public readers share one budget per host; an authenticated (account) client keeps its own.
+        # Kalshi's basic tier allows 20 reads and 10 writes a second. The account budget used to sit exactly on that with a
+        # 60-request burst, so every scan's opening burst overshot and was refused (429). Now 12 reads/s and 8 writes/s,
+        # with no burst beyond one second's worth: under the limit with room for clock drift.
+        self.read_bucket = TokenBucket(rate=ACCOUNT_READ[0], capacity=ACCOUNT_READ[1]) if key_id else shared_read_bucket(self.host)
+        self.write_bucket = TokenBucket(rate=ACCOUNT_WRITE[0], capacity=ACCOUNT_WRITE[1])
         self.net_retries = 0
 
     @property
