@@ -354,9 +354,45 @@ def newmkt_test():
     check("newmkt is a named study and only runs when asked for", "newmkt" in ST.RUN and "newmkt" in ST.EXTRA and "newmkt" not in ST.KINDS)
 
 
+def newflow_test():
+    import sqlite3
+    tmp = tempfile.mkdtemp()
+    wdb = WarehouseDB(Path(tmp) / "f.db")
+    O = 1_790_000_000.0
+    wdb.execute("INSERT INTO wh_series VALUES('S', 'Weather', 'S', 'quadratic', 1.0, 'daily', '{}', 0)")
+    for t, res in (("A-1", "yes"), ("B-1", "no"), ("C-1", "yes")):
+        wdb.execute("INSERT INTO wh_markets(ticker, event_ticker, series_ticker, category, status, open_ts, close_ts, result, volume, complete) "
+                    "VALUES(?,?, 'S', 'Weather', 'finalized', ?, ?, ?, 100, 1)", (t, t.split("-")[0], O, O + 2 * 86400, res))
+    rows = (("A-1", O + 60, 0.40, "yes"),          # signal: YES at 40c
+            ("A-1", O + 90, 0.45, "yes"),          # 5c dearer: not within 1c of the 40c signal (and no later YES within 1c of 45c)
+            ("A-1", O + 300, 0.41, "yes"),         # 4 minutes after the first signal, 1c dearer: the follower's entry at 41c; wins
+            ("B-1", O + 100, 0.70, "no"),          # signal: NO at 30c
+            ("B-1", O + 100 + 900, 0.70, "no"),    # same price but 15 minutes later: too late for 10 minutes, in time for 30; wins (result no)
+            ("C-1", O + 5000, 0.50, "yes"),        # first trade after the first hour: no signal
+            ("C-1", O + 5100, 0.50, "yes"))
+    for i, (t, ts, yp, side) in enumerate(rows):
+        wdb.execute("INSERT INTO wh_trades VALUES(?,?,?,?,?,?,?,0)", (f"f{i}", t, ts, yp, 5, side, "bid" if side == "yes" else "ask"))
+    conn = sqlite3.connect(str(Path(tmp) / "f.db"))
+    conn.row_factory = sqlite3.Row
+    r = ST.newflow(conn, {})
+    rule = {(x["wait_s"], x["slip_c"]): x for x in r["rules"]}
+    check("newflow: signals are first-hour taker trades, one per market and side; a market first traded later has none",
+          r["signals"] == 2 and r["markets_with_first_hour_trades"] == 2 and r["signal_itself"]["entries"] == 2, r)
+    check("newflow: the follower buys the same side at the next real trade within 10 minutes and 1c: 41c on A, wins 59c less the fee",
+          rule[(600, 1)]["entries"] == 1 and close(rule[(600, 1)]["ret_c"], 100 * (0.59 - 0.07 * 0.41 * 0.59), 0.01), rule[(600, 1)])
+    check("newflow: with no slip the 41c trade is not a follow of the 40c signal but IS one of the 45c signal (cheaper is fine); nothing within 2 minutes",
+          rule[(600, 0)]["entries"] == 1 and rule[(600, 0)]["avg_price_c"] == 41.0 and rule[(120, 1)]["entries"] == 0, (rule[(600, 0)], rule[(120, 1)]))
+    check("newflow: a 30-minute wait also catches B's NO at 30c (won): two entries",
+          rule[(1800, 1)]["entries"] == 2 and rule[(1800, 1)]["win_pct"] == 100.0 and rule[(1800, 1)]["events"] == 2, rule[(1800, 1)])
+    check("newflow: the main rule is broken down by half, side, price and category",
+          r["by_side"][0]["entries"] == 1 and r["by_category"][0]["category"] == "Weather" and r["first_half"]["entries"] + r["second_half"]["entries"] == 1, r)
+    check("newflow is a named study and only runs when asked for", "newflow" in ST.RUN and "newflow" in ST.EXTRA and "newflow" not in ST.KINDS)
+
+
 if __name__ == "__main__":
     main()
     newmkt_test()
+    newflow_test()
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", FAIL)

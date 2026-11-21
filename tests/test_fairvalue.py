@@ -268,6 +268,11 @@ def main():
           and name_match("University at Albany", "Albany Great Danes") and not name_match("Saint Mary's", "Mt. St. Mary's Mountaineers")
           and not name_match("Colorado St.", "CSU Northridge Matadors") and not name_match("Missouri St.", "SE Missouri St Redhawks")
           and name_match("Citadel", "The Citadel Bulldogs") and name_match("Los Angeles L", "Los Angeles Lakers") and name_match("New York R", "New York Rangers"))
+    check("more sportsbook shorthand: Boston Univ., Arkansas-Little Rock, Massachusetts, Cal Baptist, Texas A&M-CC",
+          name_match("Boston University", "Boston Univ. Terriers") and not name_match("Boston College", "Boston Univ. Terriers")
+          and name_match("Little Rock", "Arkansas-Little Rock Trojans") and not name_match("Arkansas", "Arkansas-Little Rock Trojans")
+          and name_match("UMass", "Massachusetts Minutemen") and not name_match("UMass Lowell", "Massachusetts Minutemen")
+          and name_match("California Baptist", "Cal Baptist Lancers") and name_match("Texas A&M-Corpus Christi", "Texas A&M-CC Islanders"))
     check("apostrophes and more shorthand: Hawaii / Hawai'i, UL Monroe, SE Louisiana",
           name_match("Hawai'i", "Hawaii Rainbow Warriors") and name_match("Hawai\u02bbi", "Hawaii Rainbow Warriors") and name_match("Louisiana-Monroe", "UL Monroe Warhawks")
           and name_match("Southeastern Louisiana", "SE Louisiana Lions") and name_match("St. John's", "St. John's Red Storm") and name_match("Saint Joseph's", "St. Josephs Hawks")

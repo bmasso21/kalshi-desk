@@ -281,7 +281,7 @@ def baskets(conn, flt: dict | None = None) -> dict:
 
 
 # ---------------------------------------------------------------- scalp --
-EXTRA = ("scalp", "hourly", "goldfv", "gasfv", "newmkt")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
+EXTRA = ("scalp", "hourly", "goldfv", "gasfv", "newmkt", "newflow")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
 SCALP_ENTRY_MIN = (2, 5, 10)         # minutes after the contract opens
 SCALP_STOPS = (None, 0.25, 0.50)     # sell if the price falls this fraction below what was paid; None = no stop
 SCALP_TARGETS = (0.05, 0.10, 0.20, 0.35, 0.60, None)   # take profit at +x%; None = hold to the end
@@ -814,7 +814,118 @@ def newmkt(conn, flt: dict | None = None) -> dict:
             "by_category": [{"category": c, "trades": cats[c], "rows": by_age(lambda r, c=c: r["cat"] == c)} for c in top]}
 
 
-RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly, "goldfv": goldfv, "gasfv": gasfv, "newmkt": newmkt}
+FLOW_WAITS = (120, 600, 1800)     # seconds a follower has to get the same side after the signal trade
+FLOW_SLIPS = (0.0, 0.01, 0.02)    # how much more than the signal price the follower may pay
+FLOW_MAIN = (600, 0.01)
+FLOW_WINDOW = 3600                # signals come from a market's first hour
+
+
+def newflow(conn, flt: dict | None = None) -> dict:
+    """Follow the early flow: the new-market study found that whoever crosses the spread in a market's first hour wins.
+    That is not a rule (it does not say which side). This replays one: when a taker buys a side in the first hour
+    (the signal), buy the SAME side at the next real trade on that side within the wait, if it costs no more than the
+    signal price plus the slip. One entry per market and side: the first that qualifies. Entry prices are real later
+    trades, so the side was buyable there - but only because someone else also bought, which a live follower cannot
+    count on; a paper test at real asks is the check."""
+    flt = flt or {}
+    w, args = _where(flt)
+    ty = ("CASE WHEN t.taker_outcome_side='yes' THEN 1 WHEN t.taker_outcome_side='no' THEN 0 "
+          "WHEN t.taker_book_side='bid' THEN 1 WHEN t.taker_book_side='ask' THEN 0 END")
+    span = conn.execute(f"SELECT MIN(m.close_ts) a, MAX(m.close_ts) b, COUNT(*) n FROM wh_markets m WHERE {w} AND m.complete = 1 "
+                        f"AND m.open_ts IS NOT NULL AND m.close_ts - m.open_ts >= {NEW_MIN_LIFE}", args).fetchone()
+    if not span["n"]:
+        return {"markets": 0, "note": "no settled markets open a day or more with stored trades in scope"}
+    mid = (span["a"] + span["b"]) / 2
+    maxw = max(FLOW_WAITS)
+    cur = conn.execute(f"""
+      SELECT m.ticker tk, COALESCE(m.event_ticker, m.ticker) ev, COALESCE(m.category, '?') cat, m.close_ts c, m.result res, m.open_ts o,
+             COALESCE(s.fee_multiplier, 1) fm, t.ts ts, t.yes_price yp, {ty} y
+      FROM wh_markets m JOIN wh_trades t ON t.ticker = m.ticker AND t.ts >= m.open_ts AND t.ts < m.open_ts + {FLOW_WINDOW + maxw}
+      LEFT JOIN wh_series s ON s.series_ticker = m.series_ticker
+      WHERE {w} AND m.complete = 1 AND m.open_ts IS NOT NULL AND m.close_ts - m.open_ts >= {NEW_MIN_LIFE}
+            AND t.yes_price > 0 AND t.yes_price < 1 AND t.count > 0 AND {ty} IS NOT NULL
+      ORDER BY m.ticker, t.ts""", args)
+    acc: dict = {}                       # key -> event -> [n, sum of returns]
+    meta: dict = {}                      # key -> [entries, wins, sum price]
+    sig = {"markets_with_first_hour_trades": 0, "signals": 0}
+
+    def add(key, ev, ret, price):
+        g = acc.setdefault(key, {}).setdefault(ev, [0.0, 0.0])
+        g[0] += 1
+        g[1] += ret
+        x = meta.setdefault(key, [0, 0, 0.0])
+        x[0] += 1
+        x[1] += 1 if ret > 0 else 0
+        x[2] += price
+
+    def market(rows):
+        if not rows:
+            return
+        r0 = rows[0]
+        first = [r for r in rows if r["ts"] < r0["o"] + FLOW_WINDOW]
+        if not first:
+            return
+        sig["markets_with_first_hour_trades"] += 1
+        half = 0 if r0["c"] < mid else 1
+        for side in (1, 0):
+            tr = [(r["ts"], r["yp"] if side else 1 - r["yp"]) for r in rows if r["y"] == side]
+            sg = [x for x in tr if x[0] < r0["o"] + FLOW_WINDOW]
+            if not sg:
+                continue
+            idx = list(range(len(sg)))                       # tr is time-ordered, so the signals are its first len(sg) trades
+            sig["signals"] += 1
+            won = 1.0 if (r0["res"] == "yes") == bool(side) else 0.0
+            fee = lambda p: TAKER * r0["fm"] * p * (1 - p)
+            p0 = sg[0][1]                                    # the first taker on this side (cannot be copied: it IS the signal)
+            add(("signal",), r0["ev"], won - p0 - fee(p0), p0)
+            for wt in FLOW_WAITS:
+                for sl in FLOW_SLIPS:
+                    hit = None
+                    for i, (ts, p) in enumerate(sg):
+                        j = idx[i] + 1
+                        while j < len(tr) and tr[j][0] - ts <= wt:
+                            if tr[j][0] > ts and tr[j][1] <= p + sl + 1e-9:
+                                hit = tr[j][1]
+                                break
+                            j += 1
+                        if hit is not None:
+                            break
+                    if hit is None:
+                        continue
+                    ret = won - hit - fee(hit)
+                    add(("rule", wt, sl), r0["ev"], ret, hit)
+                    if (wt, sl) == FLOW_MAIN:
+                        add(("half", half), r0["ev"], ret, hit)
+                        add(("cat", r0["cat"]), r0["ev"], ret, hit)
+                        add(("side", "yes" if side else "no"), r0["ev"], ret, hit)
+                        add(("price", "under 20c" if hit < 0.20 else "20-79c" if hit < 0.80 else "80c+"), r0["ev"], ret, hit)
+    buf, last = [], None
+    for r in cur:
+        if r["tk"] != last:
+            market(buf)
+            buf, last = [], r["tk"]
+        buf.append(r)
+    market(buf)
+
+    def out(key):
+        m = meta.get(key)
+        if not m:
+            return {"entries": 0}
+        st = _stat(acc[key])
+        return {"entries": m[0], "win_pct": round(100 * m[1] / m[0], 1), "avg_price_c": round(100 * m[2] / m[0], 1),
+                "ret_c": st["ret_c"], "t": st["t"], "events": st["events"]}
+    cats = sorted((k[1] for k in meta if k[0] == "cat"), key=lambda c: -meta[("cat", c)][0])
+    return {"markets": span["n"], **sig, "from": span["a"], "to": span["b"], "split_at": mid,
+            "main_rule": {"wait_s": FLOW_MAIN[0], "slip_c": int(FLOW_MAIN[1] * 100)},
+            "signal_itself": out(("signal",)),
+            "rules": [{"wait_s": wt, "slip_c": int(round(sl * 100)), **out(("rule", wt, sl))} for wt in FLOW_WAITS for sl in FLOW_SLIPS],
+            "first_half": out(("half", 0)), "second_half": out(("half", 1)),
+            "by_side": [{"side": x, **out(("side", x))} for x in ("yes", "no")],
+            "by_price": [{"price": x, **out(("price", x))} for x in ("under 20c", "20-79c", "80c+")],
+            "by_category": [{"category": c, **out(("cat", c))} for c in cats[:12]]}
+
+
+RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly, "goldfv": goldfv, "gasfv": gasfv, "newmkt": newmkt, "newflow": newflow}
 
 
 class Studies:
