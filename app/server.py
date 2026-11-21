@@ -1342,6 +1342,15 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         threading.Thread(target=arb.scan, daemon=True, name="arb-now").start()
         return {"started": True}
 
+    from .flowwatch import FlowWatch
+    floww = FlowWatch(lambda: cfg.data.get("flow") or {}, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+    if start_engine:
+        floww.start()
+
+    @app.get("/api/flow")
+    def flow_view():
+        return floww.status()
+
     @app.get("/api/trackers")
     def trackers_view():
         """One line per paper tracker that is running: when it last checked, its note and any error (for the Home page)."""
@@ -1351,6 +1360,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 ("mentions", "Mentions", mentions.state, "last", bool(mentions.opt("mentions_enabled", True))),
                 ("poly", "Polymarket gap", polyw.state, "last", bool(polyw.opt("poly_enabled", True))),
                 ("arb", "Arbitrage", arb.state, "last_scan", bool(arb.opt("arb_enabled", True))),
+                ("flow", "Early flow", floww.state, "last", bool(floww.opt("flow_enabled", True))),
                 ("gold", "Gold watch", gapwatch.state, "last_check", bool(gapwatch.enabled))]
         return {"trackers": [{"key": k, "name": n, "on": on, "last": st.get(f), "running": bool(st.get("running")),
                               "error": st.get("error"), "note": st.get("note") or ""} for k, n, st, f, on in rows]}

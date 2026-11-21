@@ -121,6 +121,12 @@ def sources(wdb) -> list[dict]:
         out.append({"key": key, "name": name, "market": market, "description": desc,
                     "rows": [{"pnl": r["pnl"], "cost": r["price"] + r["fee"], "cluster": r["event"], "ts": r["start_ts"]} for r in pp if r["status"] == "settled" and r["pnl"] is not None],
                     "open": sum(1 for r in pp if r["status"] == "open")})
+    fl = q("SELECT event, price, fee, pnl, close_ts, status FROM flow_picks")
+    out.append({"key": "flow_weather", "name": "Weather: follow large first-hour trades", "market": "New weather markets (first hour)",
+                "description": "A single trade of 100+ contracts in a new weather market's first hour; the same side is bought at the real ask within 10 minutes "
+                               "if it costs no more than 1c above that trade. Backtest: +1.85c a contract, t 2.0 - suggestive, not proven",
+                "rows": [{"pnl": r["pnl"], "cost": r["price"] + r["fee"], "cluster": r["event"], "ts": r["close_ts"]} for r in fl if r["status"] == "settled" and r["pnl"] is not None],
+                "open": sum(1 for r in fl if r["status"] == "open")})
     mo = q("SELECT event, price, filled, pnl, close_ts, status FROM men_orders")
     out.append({"key": "mentions_maker", "name": "Mentions: resting bids, back of the queue", "market": "Mentions (will a speaker say a word)",
                 "description": "One resting bid per side at the best bid, 1-24 h before the close, filled only by real trades after the queue ahead; held to settlement. "
