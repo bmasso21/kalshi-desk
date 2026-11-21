@@ -386,6 +386,14 @@ def newflow_test():
           rule[(1800, 1)]["entries"] == 2 and rule[(1800, 1)]["win_pct"] == 100.0 and rule[(1800, 1)]["events"] == 2, rule[(1800, 1)])
     check("newflow: the main rule is broken down by half, side, price and category",
           r["by_side"][0]["entries"] == 1 and r["by_category"][0]["category"] == "Weather" and r["first_half"]["entries"] + r["second_half"]["entries"] == 1, r)
+    wdb.execute("UPDATE wh_trades SET count = 150 WHERE trade_id = 'f3'")          # B's signal becomes a large trade (150 contracts)
+    conn.commit() if False else None
+    conn2 = sqlite3.connect(str(Path(tmp) / "f.db"))
+    conn2.row_factory = sqlite3.Row
+    big = {x["min_contracts"]: x for x in ST.newflow(conn2, {})["large_signals"]}
+    check("newflow: large signals only: one 150-contract trade (B's NO at 30c, won); its follow is 15 minutes later, outside the 10-minute rule; none of 500+",
+          big[100]["signal_itself"]["entries"] == 1 and close(big[100]["signal_itself"]["ret_c"], 100 * (0.7 - 0.07 * 0.3 * 0.7), 0.01)
+          and big[100]["follow"]["entries"] == 0 and big[500]["signal_itself"]["entries"] == 0, big)
     check("newflow is a named study and only runs when asked for", "newflow" in ST.RUN and "newflow" in ST.EXTRA and "newflow" not in ST.KINDS)
 
 

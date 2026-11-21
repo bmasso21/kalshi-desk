@@ -110,11 +110,17 @@ def sources(wdb) -> list[dict]:
                                    "The backtest paid on NO only, possibly just a falling season: the two sides are scored apart",
                     "rows": [{"pnl": r["pnl"], "cost": r["price"] + r["fee"], "cluster": r["day"], "ts": r["close_ts"]} for r in rs if r["status"] == "settled" and r["pnl"] is not None],
                     "open": sum(1 for r in rs if r["status"] == "open")})
-    pp = q("SELECT event, price, fee, pnl, start_ts, status FROM poly_picks")
-    out.append({"key": "poly_gap", "name": "Games: Kalshi 3c+ under Polymarket", "market": "NBA, NFL, NHL game winners",
-                "description": "Kalshi's ask 3c or more below Polymarket's midpoint after the fee (Polymarket spread 3c or less), bought before the start; checked every 5 minutes",
-                "rows": [{"pnl": r["pnl"], "cost": r["price"] + r["fee"], "cluster": r["event"], "ts": r["start_ts"]} for r in pp if r["status"] == "settled" and r["pnl"] is not None],
-                "open": sum(1 for r in pp if r["status"] == "open")})
+    pall = q("SELECT event, sport, price, fee, pnl, start_ts, status FROM poly_picks")
+    for key, name, market, desc, pp in (
+            ("poly_gap", "Games: Kalshi 3c+ under Polymarket", "NBA, NFL, NHL game winners",
+             "Kalshi's ask 3c or more below Polymarket's midpoint after the fee (Polymarket spread 3c or less), bought before the start; checked every 5 minutes",
+             [r for r in pall if r["sport"] != "fed"]),
+            ("poly_fed", "Fed decisions: Kalshi 3c+ under Polymarket", "Fed decisions (KXFEDDECISION)",
+             "Each outcome of a Fed meeting: Kalshi's ask 3c or more below Polymarket's midpoint after the fee; settles after the meeting",
+             [r for r in pall if r["sport"] == "fed"])):
+        out.append({"key": key, "name": name, "market": market, "description": desc,
+                    "rows": [{"pnl": r["pnl"], "cost": r["price"] + r["fee"], "cluster": r["event"], "ts": r["start_ts"]} for r in pp if r["status"] == "settled" and r["pnl"] is not None],
+                    "open": sum(1 for r in pp if r["status"] == "open")})
     mo = q("SELECT event, price, filled, pnl, close_ts, status FROM men_orders")
     out.append({"key": "mentions_maker", "name": "Mentions: resting bids, back of the queue", "market": "Mentions (will a speaker say a word)",
                 "description": "One resting bid per side at the best bid, 1-24 h before the close, filled only by real trades after the queue ahead; held to settlement. "

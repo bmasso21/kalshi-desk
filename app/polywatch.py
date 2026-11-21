@@ -12,6 +12,10 @@ Every few minutes, for NBA, NFL and NHL games starting within a day:
      of the other ('SA' / 'SAS').
   3. The rule: a team whose Kalshi ask is 3c or more below Polymarket's midpoint after Kalshi's fee is bought once on
      paper at that real ask, and settles on Kalshi's result.
+Fed decisions are compared the same way (added 21 Nov 2026): Polymarket's "Fed Decision in <month>?" events against
+Kalshi's KXFEDDECISION ladder for the same meeting, outcome by outcome (cut 50+, cut 25, no change, hike 25, hike 50+).
+An event is used only if all five outcomes are found on both sites; each outcome is bought once on paper when Kalshi's
+ask is 3c+ under Polymarket's midpoint after the fee, and settles on Kalshi's result after the meeting.
 Read-only public data from both sites. Places no orders anywhere."""
 from __future__ import annotations
 
@@ -31,6 +35,35 @@ MAX_POLY_SPREAD = 0.03
 HORIZON_H = 24
 MIN_LEAD_SEC = 300                 # nothing is bought in the last 5 minutes before the start, or after it
 MON = "JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split()
+FED_TAG, FED_SERIES = "fed-rates", "KXFEDDECISION"
+FED_SLUG = re.compile(r"^fed-decision-in-([a-z]+)(?:-\d+)*$")
+FED_MONTHS = "january february march april may june july august september october november december".split()
+# Polymarket's outcome title -> Kalshi's market suffix (the Fed moves in 25 bp steps, so "50+ bps" and ">25bps" are the same event)
+FED_OUTCOMES = {"50+ bps decrease": "C26", "25 bps decrease": "C25", "no change": "H0", "25 bps increase": "H25", "50+ bps increase": "H26"}
+
+
+def fed_events(evs: list[dict], now: float) -> list[dict]:
+    """Polymarket's 'Fed Decision in <month>?' events -> [{event (Kalshi event ticker), label, end, outcomes: {suffix: (bid, ask)}}].
+    The meeting is the one in the month of the event's end date (US Eastern); the month in the slug must agree."""
+    out = []
+    for e in evs or []:
+        m = FED_SLUG.match(str(e.get("slug") or ""))
+        end = _ts(e.get("endDate"))
+        if not m or m.group(1) not in FED_MONTHS or not end or end <= now:
+            continue
+        d = dt.datetime.fromtimestamp(end - 5 * 3600, dt.timezone.utc)
+        if FED_MONTHS[d.month - 1] != m.group(1):
+            continue
+        oc = {}
+        for mk in e.get("markets") or []:
+            code = FED_OUTCOMES.get(str(mk.get("groupItemTitle") or "").strip().lower())
+            b, a = fnum(mk.get("bestBid")), fnum(mk.get("bestAsk"))
+            if code and not mk.get("closed") and mk.get("active", True) and b is not None and a is not None and 0 <= b <= a <= 1:
+                oc[code] = (b, a)
+        if set(oc) == set(FED_OUTCOMES.values()):                 # all five or nothing: a missing outcome may mean different rules
+            out.append({"event": f"{FED_SERIES}-{d.year % 100:02d}{MON[d.month - 1]}", "label": f"Fed decision {MON[d.month - 1].title()} {d.year}",
+                        "end": end, "outcomes": oc})
+    return out
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS poly_board (ticker TEXT PRIMARY KEY, sport TEXT, game TEXT, team TEXT, start_ts REAL, poly_bid REAL, poly_ask REAL,
@@ -188,10 +221,49 @@ class PolyWatch:
                                               "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                                               (now, m["ticker"], ev, sport, name, team, g["start"], round(mid, 4), ka, round(TAKER * ka * (1 - ka), 6), round(edge, 4)))
                         picks += cur.rowcount if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
+        fed = {"meetings": 0, "paired": 0, "picks": 0}
+        try:
+            fed = self.scan_fed(now, min_edge)
+        except Exception as e:
+            errs.append(f"fed: {e}"[:120])
+        diag["fed"] = fed
+        picks += fed["picks"]
         self.settle(now)
         self.state.update(last=now, error="; ".join(errs) or None, games=games, paired=paired, by_sport=diag,
-                          note=f"{games} Polymarket games starting within {HORIZON_H} h, {paired} paired with Kalshi, {picks} new paper buy(s)")
+                          note=f"{games} Polymarket games starting within {HORIZON_H} h, {paired} paired with Kalshi; "
+                               f"{fed['meetings']} Fed meeting(s), {fed['paired']} paired; {picks} new paper buy(s)")
         return {"games": games, "paired": paired, "picks": picks}
+
+    def scan_fed(self, now: float, min_edge: float) -> dict:
+        r = self.http.get(GAMMA, params={"tag_slug": FED_TAG, "closed": "false", "limit": 100, "offset": 0},
+                          headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=25)
+        r.raise_for_status()
+        fes = fed_events(r.json() or [], now)
+        out = {"meetings": len(fes), "paired": 0, "picks": 0}
+        if not fes:
+            return out
+        km = {m["ticker"]: m for m in self.k.markets(status="open", series_ticker=FED_SERIES, max_items=400)}
+        for fe in fes:
+            ms = {c: km.get(f"{fe['event']}-{c}") for c in fe["outcomes"]}
+            if not all(ms.values()):
+                continue                                          # Kalshi does not list all five for that meeting: skip it
+            out["paired"] += 1
+            for c, (pb, pa) in fe["outcomes"].items():
+                m = ms[c]
+                start = _ts(m.get("close_time")) or fe["end"]
+                kb, ka = fnum(m.get("yes_bid_dollars")) or 0.0, fnum(m.get("yes_ask_dollars"))
+                tight = pa - pb <= MAX_POLY_SPREAD + 1e-9
+                mid = (pb + pa) / 2
+                edge = (mid - ka - TAKER * ka * (1 - ka)) if ka and 0 < ka < 1 and tight else None
+                team = m.get("yes_sub_title") or c
+                self.db.execute("INSERT OR REPLACE INTO poly_board VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                (m["ticker"], "fed", fe["label"], team, start, round(pb, 4), round(pa, 4), kb, ka, edge, now))
+                if edge is not None and edge >= min_edge and self.opt("poly_enabled", True):
+                    cur = self.db.execute("INSERT OR IGNORE INTO poly_picks(ts, ticker, event, sport, game, team, start_ts, poly_mid, price, fee, edge) "
+                                          "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                          (now, m["ticker"], fe["event"], "fed", fe["label"], team, start, round(mid, 4), ka, round(TAKER * ka * (1 - ka), 6), round(edge, 4)))
+                    out["picks"] += cur.rowcount if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
+        return out
 
     def settle(self, now: float | None = None) -> int:
         now = now or time.time()

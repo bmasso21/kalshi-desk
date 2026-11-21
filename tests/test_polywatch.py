@@ -115,6 +115,45 @@ def main():
     check("settles on Kalshi's result: payout less the ask and fee", p["status"] == "settled" and close(p["pnl"], 1 - .35 - .07 * .35 * .65, 1e-5), p)
     row = {x["key"]: x for x in SB.board(wdb)["strategies"]}["poly_gap"]
     check("the scoreboard scores it", row["score"]["trades"] == 1 and row["score"]["wins"] == 1, row["score"])
+    # ---- Fed decisions ----
+    def fmk(title, bid, ask):
+        return {"groupItemTitle": title, "bestBid": bid, "bestAsk": ask, "active": True, "closed": False}
+    fed_ev = {"slug": "fed-decision-in-december-20260729232808632", "endDate": "2026-12-10T04:59:00Z",
+              "markets": [fmk("50+ bps decrease", .003, .004), fmk("25 bps decrease", .006, .007), fmk("No change", .074, .075),
+                          fmk("25 bps increase", .88, .89), fmk("50+ bps increase", .022, .023)]}
+    fe = P.fed_events([fed_ev, {**fed_ev, "slug": "fed-decision-in-january-2027", "markets": fed_ev["markets"][:4], "endDate": "2027-01-28T04:59:00Z"},
+                       {**fed_ev, "slug": "how-many-fed-rate-cuts-in-2026"}, {**fed_ev, "slug": "fed-decision-in-march-2027"}], NOW)
+    check("Fed: only 'Fed Decision in <month>' events with all five outcomes and a slug month that agrees with the end date; meeting = end date's month in Eastern time",
+          len(fe) == 1 and fe[0]["event"] == "KXFEDDECISION-26DEC" and close(fe[0]["outcomes"]["H25"][0], .88) and set(fe[0]["outcomes"]) == {"C26", "C25", "H0", "H25", "H26"}, fe)
+
+    class FSes:
+        def get(self, url, params=None, headers=None, timeout=None):
+            return Resp([fed_ev] if params["tag_slug"] == "fed-rates" else [])
+
+    class FK:
+        res = {}
+
+        def markets(self, status=None, tickers=None, max_items=None, series_ticker=None, **kw):
+            if tickers:
+                return [{"ticker": t, "result": self.res.get(t, "")} for t in tickers]
+            assert series_ticker == "KXFEDDECISION" and status == "open"
+            q = {"C26": (0, .01), "C25": (0, .01), "H0": (.08, .09), "H25": (.82, .83), "H26": (.02, .03)}     # H25: 83c ask vs Polymarket 88.5c
+            return [{"ticker": f"KXFEDDECISION-26DEC-{c}", "yes_sub_title": c, "yes_bid_dollars": str(b), "yes_ask_dollars": str(a),
+                     "close_time": "2026-12-09T19:00:00Z"} for c, (b, a) in q.items()] + [{"ticker": "KXFEDDECISION-27JAN-H0", "yes_ask_dollars": "0.5"}]
+    fdb = WarehouseDB(Path(tempfile.mkdtemp()) / "f.db")
+    fw = P.PolyWatch(lambda: {}, fdb, FK(), session=FSes())
+    fr = fw.scan(NOW)
+    fb = {x["ticker"].rsplit("-", 1)[-1]: x for x in fdb.query("SELECT * FROM poly_board WHERE sport='fed'")}
+    fp = fdb.query("SELECT * FROM poly_picks")
+    check("Fed: each outcome is compared with Kalshi's market for the same meeting; 83c ask against an 88.5c midpoint is bought once on paper",
+          len(fb) == 5 and close(fb["H25"]["edge"], .885 - .83 - .07 * .83 * .17) and fb["H0"]["edge"] < 0 and len(fp) == 1 and fp[0]["ticker"] == "KXFEDDECISION-26DEC-H25"
+          and fp[0]["sport"] == "fed" and fr["picks"] == 1 and fw.state["by_sport"]["fed"] == {"meetings": 1, "paired": 1, "picks": 1}, (fb, fp, fr))
+    check("Fed: nothing settles before the meeting", fw.settle(NOW + 86400) == 0)
+    FK.res = {"KXFEDDECISION-26DEC-H25": "yes"}
+    fw.settle(P._ts("2026-12-09T19:00:00Z") + 7200)
+    rows = {x["key"]: x for x in SB.board(fdb)["strategies"]}
+    check("Fed: settles on Kalshi's result and is scored on its own scoreboard row, apart from the games",
+          rows["poly_fed"]["score"]["trades"] == 1 and rows["poly_fed"]["score"]["wins"] == 1 and rows["poly_gap"]["score"]["trades"] == 0, (rows["poly_fed"]["score"], rows["poly_gap"]["score"]))
     check("the Kalshi client it is given has no order methods", not any(hasattr(k, a) for a in ("create_order", "cancel_order")))
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)

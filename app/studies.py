@@ -818,6 +818,7 @@ FLOW_WAITS = (120, 600, 1800)     # seconds a follower has to get the same side 
 FLOW_SLIPS = (0.0, 0.01, 0.02)    # how much more than the signal price the follower may pay
 FLOW_MAIN = (600, 0.01)
 FLOW_WINDOW = 3600                # signals come from a market's first hour
+FLOW_SIZES = (100, 500, 2000)     # "large" signal trades: this many contracts or more in one trade
 
 
 def newflow(conn, flt: dict | None = None) -> dict:
@@ -839,7 +840,7 @@ def newflow(conn, flt: dict | None = None) -> dict:
     maxw = max(FLOW_WAITS)
     cur = conn.execute(f"""
       SELECT m.ticker tk, COALESCE(m.event_ticker, m.ticker) ev, COALESCE(m.category, '?') cat, m.close_ts c, m.result res, m.open_ts o,
-             COALESCE(s.fee_multiplier, 1) fm, t.ts ts, t.yes_price yp, {ty} y
+             COALESCE(s.fee_multiplier, 1) fm, t.ts ts, t.yes_price yp, t.count n, {ty} y
       FROM wh_markets m JOIN wh_trades t ON t.ticker = m.ticker AND t.ts >= m.open_ts AND t.ts < m.open_ts + {FLOW_WINDOW + maxw}
       LEFT JOIN wh_series s ON s.series_ticker = m.series_ticker
       WHERE {w} AND m.complete = 1 AND m.open_ts IS NOT NULL AND m.close_ts - m.open_ts >= {NEW_MIN_LIFE}
@@ -869,6 +870,7 @@ def newflow(conn, flt: dict | None = None) -> dict:
         half = 0 if r0["c"] < mid else 1
         for side in (1, 0):
             tr = [(r["ts"], r["yp"] if side else 1 - r["yp"]) for r in rows if r["y"] == side]
+            sz = [r["n"] for r in rows if r["y"] == side]
             sg = [x for x in tr if x[0] < r0["o"] + FLOW_WINDOW]
             if not sg:
                 continue
@@ -899,6 +901,30 @@ def newflow(conn, flt: dict | None = None) -> dict:
                         add(("cat", r0["cat"]), r0["ev"], ret, hit)
                         add(("side", "yes" if side else "no"), r0["ev"], ret, hit)
                         add(("price", "under 20c" if hit < 0.20 else "20-79c" if hit < 0.80 else "80c+"), r0["ev"], ret, hit)
+            # the same rule, but only LARGE first-hour trades count as signals (the profit of early takers sat in a few big trades)
+            wt, sl = FLOW_MAIN
+            for big in FLOW_SIZES:
+                bi = [i for i in idx if sz[i] >= big]
+                if not bi:
+                    continue
+                pb = sg[bi[0]][1]
+                add(("bigsignal", big), r0["ev"], won - pb - fee(pb), pb)
+                hit = None
+                for i in bi:
+                    ts, p = sg[i]
+                    j = i + 1
+                    while j < len(tr) and tr[j][0] - ts <= wt:
+                        if tr[j][0] > ts and tr[j][1] <= p + sl + 1e-9:
+                            hit = tr[j][1]
+                            break
+                        j += 1
+                    if hit is not None:
+                        break
+                if hit is not None:
+                    ret = won - hit - fee(hit)
+                    add(("big", big), r0["ev"], ret, hit)
+                    add(("bighalf", big, half), r0["ev"], ret, hit)
+                    add(("bigcat", big, r0["cat"]), r0["ev"], ret, hit)
     buf, last = [], None
     for r in cur:
         if r["tk"] != last:
@@ -922,7 +948,11 @@ def newflow(conn, flt: dict | None = None) -> dict:
             "first_half": out(("half", 0)), "second_half": out(("half", 1)),
             "by_side": [{"side": x, **out(("side", x))} for x in ("yes", "no")],
             "by_price": [{"price": x, **out(("price", x))} for x in ("under 20c", "20-79c", "80c+")],
-            "by_category": [{"category": c, **out(("cat", c))} for c in cats[:12]]}
+            "by_category": [{"category": c, **out(("cat", c))} for c in cats[:12]],
+            "large_signals": [{"min_contracts": b, "signal_itself": out(("bigsignal", b)), "follow": out(("big", b)),
+                               "first_half": out(("bighalf", b, 0)), "second_half": out(("bighalf", b, 1)),
+                               "by_category": [{"category": c, **out(("bigcat", b, c))} for c in cats[:12] if ("bigcat", b, c) in meta]}
+                              for b in FLOW_SIZES]}
 
 
 RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly, "goldfv": goldfv, "gasfv": gasfv, "newmkt": newmkt, "newflow": newflow}
