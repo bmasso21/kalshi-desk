@@ -1342,6 +1342,19 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         threading.Thread(target=arb.scan, daemon=True, name="arb-now").start()
         return {"started": True}
 
+    @app.get("/api/trackers")
+    def trackers_view():
+        """One line per paper tracker that is running: when it last checked, its note and any error (for the Home page)."""
+        rows = [("sports", "Sports fair value", fairvalue.state, "last_poll", bool((cfg.data.get("sports") or {}).get("fv_enabled", True))),
+                ("fed", "Fed decisions", fed.state, "last", bool(fed.opt("fed_enabled", True))),
+                ("gas", "Gas prices", gasw.state, "last", bool(gasw.opt("gas_enabled", True))),
+                ("mentions", "Mentions", mentions.state, "last", bool(mentions.opt("mentions_enabled", True))),
+                ("poly", "Polymarket gap", polyw.state, "last", bool(polyw.opt("poly_enabled", True))),
+                ("arb", "Arbitrage", arb.state, "last_scan", bool(arb.opt("arb_enabled", True))),
+                ("gold", "Gold watch", gapwatch.state, "last_check", bool(gapwatch.enabled))]
+        return {"trackers": [{"key": k, "name": n, "on": on, "last": st.get(f), "running": bool(st.get("running")),
+                              "error": st.get("error"), "note": st.get("note") or ""} for k, n, st, f, on in rows]}
+
     from .catalog import Catalog
     catalog = Catalog(wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
 

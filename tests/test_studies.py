@@ -326,8 +326,37 @@ def main():
     check("the studies' database connection is read-only", wrote is False)
 
 
+def newmkt_test():
+    import sqlite3
+    tmp = tempfile.mkdtemp()
+    wdb = WarehouseDB(Path(tmp) / "n.db")
+    O = 1_790_000_000.0
+    wdb.execute("INSERT INTO wh_series VALUES('S', 'Weather', 'S', 'quadratic', 1.0, 'daily', '{}', 0)")
+    for t, life, res in (("A-1", 3 * 86400, "yes"), ("SHORT-1", 3600, "yes")):
+        wdb.execute("INSERT INTO wh_markets(ticker, event_ticker, series_ticker, category, status, open_ts, close_ts, result, volume, complete) "
+                    "VALUES(?,?, 'S', 'Weather', 'finalized', ?, ?, ?, 100, 1)", (t, t.split("-")[0], O, O + life, res))
+    for i, (t, ts, yp, n, side) in enumerate((("A-1", O + 600, 0.40, 10, "yes"),            # 10 minutes old: YES bought at 40c, wins
+                                              ("A-1", O + 2 * 86400, 0.70, 10, "no"),       # 2 days old: NO bought at 30c, loses
+                                              ("A-1", O - 5, 0.50, 10, "yes"),              # before the open: ignored
+                                              ("SHORT-1", O + 600, 0.40, 10, "yes"))):      # a one-hour contract: not in the study
+        wdb.execute("INSERT INTO wh_trades VALUES(?,?,?,?,?,?,?,0)", (f"n{i}", t, ts, yp, n, side, "bid" if side == "yes" else "ask"))
+    conn = sqlite3.connect(str(Path(tmp) / "n.db"))
+    conn.row_factory = sqlite3.Row
+    r = ST.newmkt(conn, {})
+    age = {x["age"]: x for x in r["by_age"]}
+    check("newmkt: only markets open a day or more; trades grouped by the market's age", r["markets"] == 1 and set(age) == {"first hour", "1-3 days"}, r)
+    check("newmkt: first-hour taker bought YES at 40c and won: +60c less the 1.68c fee; the maker on the other side lost 60c",
+          close(age["first hour"]["taker"]["ret_c"], 100 * (0.6 - 0.07 * 0.4 * 0.6), 0.01) and close(age["first hour"]["maker"]["ret_c"], -60.0, 0.01), age["first hour"])
+    check("newmkt: the 2-day-old NO at 30c lost: -30c less the fee; contracts counted",
+          close(age["1-3 days"]["taker"]["ret_c"], -100 * (0.3 + 0.07 * 0.7 * 0.3), 0.01) and age["1-3 days"]["contracts"] == 10, age["1-3 days"])
+    pr = {x["price"]: [y["age"] for y in x["rows"]] for x in r["by_age_and_price"]}
+    check("newmkt: split by price paid and by category too", pr["20-79c"] == ["first hour", "1-3 days"] and r["by_category"][0]["category"] == "Weather", pr)
+    check("newmkt is a named study and only runs when asked for", "newmkt" in ST.RUN and "newmkt" in ST.EXTRA and "newmkt" not in ST.KINDS)
+
+
 if __name__ == "__main__":
     main()
+    newmkt_test()
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", FAIL)

@@ -281,7 +281,7 @@ def baskets(conn, flt: dict | None = None) -> dict:
 
 
 # ---------------------------------------------------------------- scalp --
-EXTRA = ("scalp", "hourly", "goldfv", "gasfv")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
+EXTRA = ("scalp", "hourly", "goldfv", "gasfv", "newmkt")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
 SCALP_ENTRY_MIN = (2, 5, 10)         # minutes after the contract opens
 SCALP_STOPS = (None, 0.25, 0.50)     # sell if the price falls this fraction below what was paid; None = no stop
 SCALP_TARGETS = (0.05, 0.10, 0.20, 0.35, 0.60, None)   # take profit at +x%; None = hold to the end
@@ -747,7 +747,74 @@ def gasfv(conn, flt: dict | None = None, client=None) -> dict:
     return out
 
 
-RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly, "goldfv": goldfv, "gasfv": gasfv}
+AGE_BUCKETS = ((0, 3600, "first hour"), (3600, 21600, "1-6 h"), (21600, 86400, "6-24 h"), (86400, 3 * 86400, "1-3 days"), (3 * 86400, 1e12, "after 3 days"))
+NEW_MIN_LIFE = 86400            # only markets open for a day or more: "new" means nothing on a 15-minute contract
+NEW_PRICE = ((0, 0.20, "under 20c"), (0.20, 0.80, "20-79c"), (0.80, 1.01, "80c+"))
+
+
+def newmkt(conn, flt: dict | None = None) -> dict:
+    """Brand-new markets: are prices in a market's first hours worse than later ones? Every stored trade of a settled
+    market that stayed open a day or more, grouped by the market's age when the trade happened. Taker = whoever
+    crossed the spread (pays the price and the taker fee); maker = the resting order on the other side."""
+    flt = flt or {}
+    w, args = _where(flt)
+    life = f"m.open_ts IS NOT NULL AND m.close_ts - m.open_ts >= {NEW_MIN_LIFE}"
+    span = conn.execute(f"SELECT MIN(m.close_ts) a, MAX(m.close_ts) b, COUNT(*) n FROM wh_markets m WHERE {w} AND m.complete = 1 AND {life}", args).fetchone()
+    if not span["n"]:
+        return {"markets": 0, "note": "no settled markets open a day or more with stored trades in scope"}
+    mid = (span["a"] + span["b"]) / 2
+    ty = ("CASE WHEN t.taker_outcome_side='yes' THEN 1 WHEN t.taker_outcome_side='no' THEN 0 "
+          "WHEN t.taker_book_side='bid' THEN 1 WHEN t.taker_book_side='ask' THEN 0 END")
+    tp = f"(CASE WHEN {ty}=1 THEN t.yes_price ELSE 1-t.yes_price END)"
+    age = "CASE " + " ".join(f"WHEN t.ts - m.open_ts < {hi} THEN {i}" for i, (_, hi, _) in enumerate(AGE_BUCKETS[:-1])) + f" ELSE {len(AGE_BUCKETS) - 1} END"
+    pb = "CASE " + " ".join(f"WHEN {tp} < {hi} THEN {i}" for i, (_, hi, _) in enumerate(NEW_PRICE[:-1])) + f" ELSE {len(NEW_PRICE) - 1} END"
+    sql = f"""
+    SELECT ev, cat, ab, pb, half, SUM(n) n, SUM(tp*n) px, SUM(win*n) wins, SUM(tfee*n) tfee, SUM(mfee*n) mfee, COUNT(*) trades FROM (
+      SELECT COALESCE(m.event_ticker, m.ticker) ev, COALESCE(m.category, '?') cat, t.count n, {tp} tp,
+             CASE WHEN ({ty}=1 AND m.result='yes') OR ({ty}=0 AND m.result='no') THEN 1.0 ELSE 0.0 END win,
+             {age} ab, {pb} pb, CASE WHEN m.close_ts < ? THEN 0 ELSE 1 END half,
+             {TAKER} * COALESCE(s.fee_multiplier, 1) * t.yes_price * (1 - t.yes_price) tfee,
+             ({MAKER_SQL}) * COALESCE(s.fee_multiplier, 1) * t.yes_price * (1 - t.yes_price) mfee
+      FROM wh_trades t JOIN wh_markets m ON m.ticker = t.ticker LEFT JOIN wh_series s ON s.series_ticker = m.series_ticker
+      WHERE {w} AND m.complete = 1 AND {life} AND t.yes_price > 0 AND t.yes_price < 1 AND t.count > 0 AND {ty} IS NOT NULL
+            AND t.ts >= m.open_ts AND t.ts <= m.close_ts
+    ) GROUP BY ev, cat, ab, pb, half"""
+    rows = conn.execute(sql, [mid] + args).fetchall()
+
+    def table(pred, key):
+        tk, mk, meta = {}, {}, {}
+        for r in rows:
+            if not pred(r):
+                continue
+            k = key(r)
+            a, b = tk.setdefault(k, {}).setdefault(r["ev"], [0.0, 0.0]), mk.setdefault(k, {}).setdefault(r["ev"], [0.0, 0.0])
+            a[0] += r["n"]
+            a[1] += r["wins"] - r["px"] - r["tfee"]
+            b[0] += r["n"]
+            b[1] += r["px"] - r["wins"] - r["mfee"]
+            x = meta.setdefault(k, [0.0, 0.0, 0.0, 0])
+            x[0] += r["n"]
+            x[1] += r["px"]
+            x[2] += r["wins"]
+            x[3] += r["trades"]
+        return {k: {"contracts": round(n), "trades": trades, "avg_price_c": round(100 * px / n, 1), "win_pct": round(100 * wins / n, 1),
+                    "taker": _stat(tk[k]), "maker": _stat(mk[k])} for k, (n, px, wins, trades) in sorted(meta.items())}
+    names = [lab for _, _, lab in AGE_BUCKETS]
+
+    def by_age(pred):
+        return [{"age": names[k], **v} for k, v in table(pred, lambda r: r["ab"]).items()]
+    cats = {}
+    for r in rows:
+        cats[r["cat"]] = cats.get(r["cat"], 0) + r["trades"]
+    top = [c for c, _ in sorted(cats.items(), key=lambda kv: -kv[1])[:12]]
+    return {"markets": span["n"], "from": span["a"], "to": span["b"], "split_at": mid, "min_life_h": NEW_MIN_LIFE // 3600,
+            "by_age": by_age(lambda r: True),
+            "first_half": by_age(lambda r: r["half"] == 0), "second_half": by_age(lambda r: r["half"] == 1),
+            "by_age_and_price": [{"price": lab, "rows": by_age(lambda r, i=i: r["pb"] == i)} for i, (_, _, lab) in enumerate(NEW_PRICE)],
+            "by_category": [{"category": c, "trades": cats[c], "rows": by_age(lambda r, c=c: r["cat"] == c)} for c in top]}
+
+
+RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly, "goldfv": goldfv, "gasfv": gasfv, "newmkt": newmkt}
 
 
 class Studies:

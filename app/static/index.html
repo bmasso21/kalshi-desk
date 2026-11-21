@@ -101,6 +101,7 @@ tr>:first-child{padding-left:0}tr>:last-child{padding-right:0}
 .mut{color:var(--mut)}.y{color:var(--yes)}.n{color:var(--no)}.w{color:var(--warn)}
 .big{font-size:24px;font-weight:650;letter-spacing:-.02em;line-height:1.25}
 .hide{display:none}
+body:not(.showparked) .parked{display:none!important}
 
 /* positions */
 .pos{background:rgba(255,255,255,.03);border-radius:12px;padding:16px;margin-top:12px}
@@ -247,6 +248,10 @@ details>summary{cursor:pointer}
   <span><button class="b" onclick="polyNow()">Check now</button> <button class="b" onclick="loadPoly()">Refresh</button></span></div><div id="polyBody" class="mut" style="margin-top:10px">Loading…</div></div></section>
 <section id="t-fed" class="hide"><div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Fed decisions vs futures <span class="mut" style="font-weight:400;font-size:12px">· Kalshi's odds for each FOMC meeting against 30-day fed funds futures (FedWatch method); paper only</span></h3>
   <span><button class="b" onclick="fedNow()">Check now</button> <button class="b" onclick="loadFed()">Refresh</button></span></div><div id="fedBody" class="mut" style="margin-top:6px">Loading…</div></div></section>
+<section id="t-arb" class="hide">
+  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Arbitrage scan <span class="mut" style="font-weight:400;font-size:12px">· Kalshi priced against itself, confirmed at live order-book prices; places no orders</span></h3>
+    <span><button class="b" onclick="arbNow()">Scan now</button> <button class="b" onclick="loadArb()">Refresh</button></span></div><div id="arbBody" class="mut" style="margin-top:6px">Not loaded.</div></div>
+</section>
 <section id="t-research" class="hide">
   <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Edge studies <span class="mut" style="font-weight:400;font-size:12px">· past data only, places no orders</span></h3><span><select id="stCat" onchange="loadStudies()"><option value="">All categories</option></select> <button class="b pri" onclick="runStudies()">Run all</button> <button class="b" onclick="loadStudies()">Refresh</button></span></div>
    <details class="how"><summary>How to read these</summary><p class="mut" style="font-size:12px">Each study asks one question of the stored market history. Returns are cents per contract after Kalshi's fee formula (per-order rounding not included). <b>t</b> compares the result with its own noise, counted across events because outcomes in one event move together: under 2 in size means it could easily be luck. Every table is split into the earlier and later half of the period; an effect that shows in only one half is not an effect. Quotes in the last two studies are hourly snapshots without size: they show a gap existed, not how many contracts you could have had.</p></details>
@@ -255,16 +260,15 @@ details>summary{cursor:pointer}
   <div class="card"><h3 style="margin-top:0">Run a backtest</h3><div id="btForm"></div></div>
   <div class="card"><h3 style="margin-top:0">Backtests</h3><table><thead><tr><th>#</th><th>When</th><th>Strategy</th><th>Status</th><th class="r">Markets</th><th>Results (conservative / optimistic fills)</th></tr></thead><tbody id="btBody"></tbody></table></div>
   <div id="btDetail"></div>
-  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Short contracts: which entry and exit worked? <span class="mut" style="font-weight:400;font-size:12px">· replay of past trades, places no orders</span></h3>
+  <div class="card parked"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Short contracts: which entry and exit worked? <span class="mut" style="font-weight:400;font-size:12px">· replay of past trades, places no orders</span></h3>
     <span><select id="scKind" onchange="scKindChange()" title="Contract length"><option value="scalp">15-minute (enter after the open)</option><option value="hourly">Hourly (enter before the close)</option></select> <input id="scSer" style="width:330px" value="KXBTC15M,KXGOLD15M,KXWTI15M,KXNATGAS15M,KXINX15M,KXSILVER15M,KXCOPPER15M,KX10YRRATE15M" title="Series, comma separated"> <button class="b pri" onclick="runScalp()">Run</button> <button class="b" onclick="loadScalp()">Refresh</button></span></div><div id="scBody" class="mut" style="margin-top:6px">Not loaded.</div></div>
-  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Arbitrage scan <span class="mut" style="font-weight:400;font-size:12px">· Kalshi priced against itself, confirmed at live order-book prices; places no orders</span></h3>
-    <span><button class="b" onclick="arbNow()">Scan now</button> <button class="b" onclick="loadArb()">Refresh</button></span></div><div id="arbBody" class="mut" style="margin-top:6px">Not loaded.</div></div>
   <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Everything on Kalshi <span class="mut" style="font-weight:400;font-size:12px">· every open market by category and series, busiest first (public data)</span></h3>
     <span><button class="b" onclick="catRefresh()">Re-read Kalshi</button> <button class="b" onclick="loadCat()">Refresh</button></span></div><div id="catBody" class="mut" style="margin-top:6px">Not loaded.</div></div>
-  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Gold fair value (live) <span class="mut" style="font-weight:400;font-size:12px">· check a trade before you place it by hand; model price from live gold vs Kalshi's real asks</span></h3>
+  <div class="card parked"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Gold fair value (live) <span class="mut" style="font-weight:400;font-size:12px">· check a trade before you place it by hand; model price from live gold vs Kalshi's real asks</span></h3>
     <span><label class="mut" style="font-size:12px"><input type="checkbox" id="glAll"> all strikes</label> <button class="b" onclick="loadGL()">Refresh</button></span></div><div id="glBody" class="mut" style="margin-top:6px">Not loaded.</div></div>
-  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Hourly gold cushion (paper) <span class="mut" style="font-weight:400;font-size:12px">· buys the favoured side at the real ask when gold sits $10+ past the strike; places no orders</span></h3>
+  <div class="card parked"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Hourly gold cushion (paper) <span class="mut" style="font-weight:400;font-size:12px">· buys the favoured side at the real ask when gold sits $10+ past the strike; places no orders</span></h3>
     <span><button class="b" onclick="gwCheck()">Check now</button> <button class="b" onclick="loadGW()">Refresh</button></span></div><div id="gwBody" class="mut" style="margin-top:6px">Not loaded.</div></div>
+  <p class="mut" style="font-size:12px;margin:10px 2px"><a href="#" onclick="toggleParked();return false" class="parkLink"></a></p>
 </section>
 <section id="t-settings" class="hide"><div id="settingsBox"></div></section>
 </main>
@@ -293,14 +297,18 @@ async function api(u,o={}){o.headers={'Content-Type':'application/json','X-Desk-
   if(!r.ok)throw new Error(j.error||j.detail||('HTTP '+r.status));return j}
 // navigation: five sections, each with sub-pages (the old tabs live on as sub-pages)
 const TABS={home:[['home','Overview']],markets:[['markets','Browse'],['scanner','Scanner']],portfolio:[['portfolio','Positions'],['ledger','Activity'],['clv','CLV']],
-  strategies:[['rewards','Market making'],['fairvalue','Sports fair value'],['fed','Fed decisions'],['gas','Gas prices'],['mentions','Mentions'],['poly','Polymarket gap'],['weather','Weather (parked)'],['research','Research']],
+  strategies:[['rewards','Market making'],['fairvalue','Sports fair value'],['fed','Fed decisions'],['gas','Gas prices'],['mentions','Mentions'],['poly','Polymarket gap'],['arb','Arbitrage'],['research','Research'],['weather','Weather (parked)']],
   settings:[['settings:conn','Connection'],['settings:limits','Limits & safety'],['settings:strat','Strategies'],['settings:alerts','Alerts'],['settings:maint','Maintenance']]};
 let TOP='home',SUBSEL={},SGRP='conn',SET_LOADED=false;
-function go(top,sub){TOP=top;const subs=TABS[top];sub=sub||SUBSEL[top]||subs[0][0];SUBSEL[top]=sub;
+// Parked and retired things (weather, gold, the 15-minute replay, retired strategies) are hidden unless asked for.
+const PARKED_TABS=new Set(['weather']);let SHOWP=false;try{SHOWP=localStorage.getItem('kd_showparked')==='1'}catch(e){}
+function parkLabel(){document.body.classList.toggle('showparked',SHOWP);document.querySelectorAll('.parkLink').forEach(a=>a.textContent=SHOWP?'Hide retired and parked':'Show retired and parked')}
+function toggleParked(){SHOWP=!SHOWP;try{localStorage.setItem('kd_showparked',SHOWP?'1':'0')}catch(e){}parkLabel();go(TOP)}
+function go(top,sub){TOP=top;const subs=TABS[top].filter(([k])=>SHOWP||!PARKED_TABS.has(k));sub=sub||SUBSEL[top]||subs[0][0];if(!subs.some(([k])=>k===sub))sub=subs[0][0];SUBSEL[top]=sub;parkLabel();
   document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('on',x.dataset.t===top));
   $('#sub').innerHTML=subs.length>1?subs.map(([k,l])=>`<button class="${k===sub?'on':''}" onclick="go('${top}','${k}')">${l}</button>`).join(''):'';
   const [sec,grp]=sub.split(':');document.querySelectorAll('main>section').forEach(x=>x.classList.toggle('hide',x.id!=='t-'+sec));
-  const LOAD={home:()=>{loadBoard();loadHome()},scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:()=>{loadRewards();loadMM()},portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,weather:loadWeather,research:()=>{loadResearch();loadGW();loadGL();loadCat();loadArb()},fairvalue:loadFV,fed:loadFed,gas:loadGas,mentions:loadMen,poly:loadPoly};
+  const LOAD={home:()=>{loadBoard();loadHome()},scanner:loadSignals,markets:()=>EVENTS.length||loadEvents(),rewards:()=>{loadRewards();loadMM()},portfolio:loadPortfolio,ledger:loadLedger,clv:loadClv,weather:loadWeather,research:()=>{loadResearch();loadCat();if(SHOWP){loadGW();loadGL()}},arb:loadArb,fairvalue:loadFV,fed:loadFed,gas:loadGas,mentions:loadMen,poly:loadPoly};
   if(sec==='settings'){SGRP=grp;if(!SET_LOADED){SET_LOADED=true;loadSettings()}else showGrp()}else{SET_LOADED=false;LOAD[sec]()}
   window.scrollTo(0,0)}
 function showGrp(){document.querySelectorAll('#settingsBox [data-g]').forEach(e=>e.classList.toggle('hide',e.dataset.g!==SGRP));const sb=$('#saveBar');if(sb)sb.classList.toggle('hide',SGRP==='alerts'||SGRP==='maint')}
@@ -309,25 +317,26 @@ function paperRows(reps,withStop){return reps.map(rp=>{const v=rp.models.queue,s
 let boardTimer=null;
 const STC={qualified:'y',review:'w',collecting:'mut',failing:'n',retired:'mut'};
 async function loadBoard(){const B=$('#boardBox');clearTimeout(boardTimer);try{
-  const [sb,fv,gw,rs,cat,stt]=await Promise.all([api('/api/scoreboard'),api('/api/fairvalue').catch(()=>null),api('/api/gapwatch').catch(()=>null),api('/api/research').catch(()=>null),api('/api/catalog').catch(()=>null),api('/api/status').catch(()=>null)]);
+  const [sb,fv,gw,rs,cat,stt]=await Promise.all([api('/api/scoreboard'),api('/api/fairvalue').catch(()=>null),api('/api/trackers').catch(()=>null),api('/api/research').catch(()=>null),api('/api/catalog').catch(()=>null),api('/api/status').catch(()=>null)]);
   const al=sb.autolive,ago=t=>{if(!t)return 'never';const m=Math.round((Date.now()/1000-t)/60);return m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago'};
   const chip=(cl,label,val)=>`<span class="chip ${cl}">${label} <b>${val}</b></span>`;
   let h=`<div class="card"><h3 style="margin:0">Strategies</h3><p class="mut" style="font-size:12px;margin:2px 0 0">All paper, at real asks and fees. ${sb.qualified.length?'<b class="y">'+sb.qualified.length+' qualified.</b>':'None has qualified yet.'} To qualify: ${sb.bar.min_trades}+ settled trades over ${sb.bar.min_events}+ separate games or hours, profit after fees in both halves, t ≥ ${sb.bar.min_t}.</p>`;
   h+=`<div class="tw"><table style="margin-top:10px"><thead><tr><th>Strategy</th><th>Checks passed</th><th class="r">Trades</th><th class="r">Won</th><th class="r">P&amp;L</th><th class="r">Return</th><th class="r">t</th><th>Open</th></tr></thead><tbody>`;
-  h+=sb.strategies.map(x=>{const c=x.score,v=x.verdict,okn=v.rules.filter(r=>r.ok).length,ret=v.status==='retired',lbl=v.status[0].toUpperCase()+v.status.slice(1);
+  const nRet=sb.strategies.filter(x=>x.verdict.status==='retired').length;
+  h+=sb.strategies.filter(x=>SHOWP||x.verdict.status!=='retired').map(x=>{const c=x.score,v=x.verdict,okn=v.rules.filter(r=>r.ok).length,ret=v.status==='retired',lbl=v.status[0].toUpperCase()+v.status.slice(1);
     return `<tr title="${esc(x.description||'')}"><td><b>${esc(x.name)}</b><div class="mut" style="font-size:12px">${esc(x.market)}</div></td><td><details class="chk"><summary><span class="badge ${STC[v.status]==='mut'?'':STC[v.status]||''}">${lbl}</span>${ret?'':!c.trades?`<span class="mut" style="margin-left:8px">no settled trades yet</span>`:`<span class="meter">${v.rules.map(r=>`<i class="${r.ok?'ok':''}"></i>`).join('')}</span><span class="mut">${okn} of ${v.rules.length}</span>`}</summary><ul>${!c.trades&&!ret?`<li>Nothing has settled yet${x.open?' ('+x.open+' open)':''}. Checks start with the first settled trade.</li>`:v.rules.map(r=>`<li class="${r.ok?'ok':''}">${esc(String(r.detail).replace('t = None','t not available yet'))}</li>`).join('')}</ul></details></td>
     <td class="r">${c.trades??0}</td><td class="r">${c.wins!=null?c.wins+'/'+c.trades:'–'}</td><td class="r ${c.pnl>0?'y':c.pnl<0?'n':''}">${c.pnl==null?'–':(c.pnl>0?'+':'')+'$'+(+c.pnl).toFixed(2)}</td><td class="r">${c.return_pct==null?'–':c.return_pct+'%'}</td><td class="r">${c.t??'–'}</td><td>${x.open??''}</td></tr>`}).join('');
-  h+=`</tbody></table></div></div>`;B.innerHTML=h;
+  h+=`</tbody></table></div>${nRet?`<p class="mut" style="font-size:12px;margin:10px 0 0"><a href="#" onclick="toggleParked();return false" class="parkLink"></a></p>`:''}</div>`;B.innerHTML=h;parkLabel();
   // health
   h='';
-  const wh=rs&&rs.warehouse,fs=fv&&fv.state,gs=gw&&gw.state,u=fv&&fv.usage;
+  const wh=rs&&rs.warehouse,fs=fv&&fv.state,u=fv&&fv.usage,trk=((gw&&gw.trackers)||[]).filter(t=>t.on&&t.key!=='sports');
   h+=`<div class="card"><h3 style="margin-top:0">Scanners and data</h3>`+
     chip(fs&&fs.error?'bad':'on','Sports odds',fs?`${ago(fs.last_poll)} · ${u?u.left:'?'} credits left`:'?')+
-    chip(gs&&gs.error?'bad':'on','Gold watch',gs?ago(gs.last_check):'?')+
+    trk.map(t=>`<span title="${esc(t.note||'')}">`+chip(t.error?'bad':t.running?'warn':'on',esc(t.name),t.running?'checking now':ago(t.last))+`</span>`).join('')+
     chip(wh&&wh.error?'bad':(wh&&wh.running?'warn':'on'),'Data collector',wh?(wh.running?'running: '+esc(wh.progress||wh.phase):'last pass '+ago(wh.last_sync)):'?')+
     (()=>{const n=stt&&stt.rate_limited_1h?Object.values(stt.rate_limited_1h).reduce((a,b)=>a+b,0):0;return chip(n>20?'bad':n?'warn':'on','Kalshi "too many requests"',n+' in the last hour')})()+
     chip('off','Kalshi catalogue',cat&&cat.catalog?`${(cat.catalog.open_markets||0).toLocaleString()} open markets · ${ago(cat.catalog.ts)}`:'not read')+
-    ((fs&&fs.error)||(gs&&gs.error)||(wh&&wh.error)?`<p class="n" style="font-size:12px;margin:4px 0 0">${esc([fs&&fs.error,gs&&gs.error,wh&&wh.error].filter(Boolean).join(' · '))}</p>`:'')+`</div>`;
+    ((fs&&fs.error)||trk.some(t=>t.error)||(wh&&wh.error)?`<p class="n" style="font-size:12px;margin:4px 0 0">${esc([fs&&fs.error,...trk.filter(t=>t.error).map(t=>t.name+': '+t.error),wh&&wh.error].filter(Boolean).join(' · '))}</p>`:'')+`</div>`;
   // owner's limits
   h+=`<div class="card"><h3 style="margin:0">Automatic live trading</h3><p class="mut" style="font-size:12px;margin:2px 0 10px">Your limits for strategies that qualify.</p>
    <p>${chip(al.enabled?'warn':'off','Status',al.enabled?'ON (within the caps below)':'off')}${chip('off','Executor',al.executor_built?'built':'not built yet')}</p>
