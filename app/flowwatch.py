@@ -6,7 +6,8 @@ within 10 minutes and 1c made +1.5c (t 1.6), +1.85c in weather (t 2.0). Positive
 the backtest could only enter where someone else also bought. This runs the rule forward at REAL asks.
 
 Every minute:
-  1. Weather markets about to open are known in advance (Kalshi lists them hours before they open). Each market open
+  1. Weather markets about to open are known in advance (Kalshi lists them 10 minutes to several hours before they
+     open; the weather series are re-listed every 5 minutes). Each market open
      for less than 70 minutes, and due to stay open a day or more, is watched.
   2. One call per watched event gives every market's traded volume and quote. A market whose volume grew by 100+
      contracts has its new trades read; a single trade of 100+ contracts inside the first hour is a SIGNAL
@@ -30,7 +31,8 @@ WINDOW = 3600                  # signals come from a market's first hour
 WAIT = 600                     # seconds after the signal in which the side may be bought
 SLIP = 0.01                    # at most this much above the signal price
 MIN_LIFE = 86400               # markets open a day or more
-DISCOVER_EVERY = 1800          # seconds between looks for markets about to open
+DISCOVER_EVERY = 300           # seconds between looks for markets about to open. Kalshi creates the daily rain markets only
+                               # 10 minutes before they open: a half-hourly look found them 20 minutes late (22 Nov 2026)
 WALK_EVERY = 24 * 3600         # seconds between full walks of every weather series
 LOOK_AHEAD = 6 * 3600
 MAX_SERIES = 600

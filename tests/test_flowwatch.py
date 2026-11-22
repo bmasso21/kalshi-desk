@@ -87,6 +87,7 @@ def main():
     n0 = len(k.calls)
     fw.scan(OPEN - 3540)
     check("before the open nothing is polled", len(k.calls) == n0, k.calls[n0:])
+    check("the weather series are re-listed every 5 minutes (rain markets are created only 10 minutes before they open)", F.DISCOVER_EVERY == 300)
 
     # 10:05: A has traded 80 contracts in small lots; B one trade of 150 YES at 24c; C one of 300 NO at 29c (YES price 71c)
     T = OPEN + 300
