@@ -285,6 +285,7 @@ class FairValue:
             c = consensus(e)
             start = _iso(e.get("commence_time"))
             if not c or not start:
+                out["no_odds"] = out.get("no_odds", 0) + 1                # listed by the odds service without usable prices: not a name problem
                 continue
             mt = match_fixture({"start_ts": start, "p1": c["home"], "p2": c["away"]}, kev)
             if not mt:
@@ -377,7 +378,7 @@ class FairValue:
         for r in res:
             if "error" not in r and not r.get("skipped"):                # every pull, also when every game matched: the list
                 um = self.db.get("fv_unmatched") or {}                     # used to keep showing mismatches fixed days ago
-                um[r["sport"]] = {"ts": time.time(), "games": r["games"], "matched": r["matched"], "unmatched": r.get("unmatched", []),
+                um[r["sport"]] = {"ts": time.time(), "games": r["games"], "matched": r["matched"], "no_odds": r.get("no_odds", 0), "unmatched": r.get("unmatched", []),
                                   "kalshi_names": sorted({m.get("yes_sub_title") or "" for ms in self.kalshi_events(self.sports()[r["sport"]]["series"]).values() for m in ms})[:400]}
                 self.db.put("fv_unmatched", um)
         self.db.execute("DELETE FROM fv_board2 WHERE commence_ts < ?", (time.time() - 6 * 3600,))

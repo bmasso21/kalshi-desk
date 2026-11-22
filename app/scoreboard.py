@@ -15,6 +15,9 @@ DEFAULT_BAR = {"min_trades": 100, "min_events": 30, "min_t": 2.0}
 AUTOLIVE_DEFAULT = {"enabled": False, "total_cap": 0.0, "per_strategy_cap": 0.0, "per_trade_max": 0.0, "daily_loss_stop": 0.0}
 
 
+MIN_EVENTS_FOR_T = 5
+
+
 def score(rows: list[dict]) -> dict:
     """rows: [{pnl, cost, cluster, ts}] settled paper trades of ONE strategy."""
     if not rows:
@@ -31,7 +34,8 @@ def score(rows: list[dict]) -> dict:
         c[1] += 1
     k = len(cl)
     var = sum((s - mean * m) ** 2 for s, m in cl.values())
-    se = math.sqrt(var * k / (k - 1)) / n if k > 1 else None
+    # t needs enough separate events to mean anything: two losing trades of almost the same size gave "t -41"
+    se = math.sqrt(var * k / (k - 1)) / n if k >= MIN_EVENTS_FOR_T else None
     by_time = sorted(rows, key=lambda r: r["ts"])
     mid = by_time[len(by_time) // 2]["ts"]
 

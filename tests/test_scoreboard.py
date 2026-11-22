@@ -30,12 +30,16 @@ def main():
     rows = [{"pnl": 1.0, "cost": 0.5, "cluster": 1, "ts": 10}, {"pnl": 1.0, "cost": 0.5, "cluster": 1, "ts": 11},
             {"pnl": 0.0, "cost": 0.5, "cluster": 2, "ts": 20}, {"pnl": -1.0, "cost": 0.5, "cluster": 3, "ts": 30},
             {"pnl": -1.0, "cost": 0.5, "cluster": 3, "ts": 31}, {"pnl": -1.0, "cost": 0.5, "cluster": 3, "ts": 32}]
+    few = SB.score(rows)
+    check("score: with fewer than 5 separate events there is no t yet (two near-identical losses once showed 't -41')",
+          few["trades"] == 6 and few["events"] == 3 and few["t"] is None and close(few["pnl"], -1.0), few)
+    rows += [{"pnl": 0.0, "cost": 0.5, "cluster": 4, "ts": 40}, {"pnl": 0.0, "cost": 0.5, "cluster": 5, "ts": 41}]
     s = SB.score(rows)
-    mean = -1 / 6
-    se = math.sqrt(((2 - 2 * mean) ** 2 + (0 - mean) ** 2 + (-3 - 3 * mean) ** 2) * 3 / 2) / 6
-    check("score: totals, return on stake, and a t-stat that treats trades settling together as one", s["trades"] == 6 and s["events"] == 3
-          and close(s["pnl"], -1.0) and close(s["return_pct"], round(100 * -1 / 3, 2)) and close(s["t"], round(mean / se, 2)), s)
-    check("score: first and second half by time", s["first_half"]["trades"] == 3 and s["second_half"]["trades"] == 3 and s["first_half"]["pnl"] == 2.0, s)
+    mean = -1 / 8
+    se = math.sqrt(((2 - 2 * mean) ** 2 + (0 - mean) ** 2 + (-3 - 3 * mean) ** 2 + 2 * (0 - mean) ** 2) * 5 / 4) / 8
+    check("score: totals, return on stake, and a t-stat that treats trades settling together as one", s["trades"] == 8 and s["events"] == 5
+          and close(s["pnl"], -1.0) and close(s["return_pct"], round(100 * -1 / 4, 2)) and close(s["t"], round(mean / se, 2)), s)
+    check("score: first and second half by time", s["first_half"]["trades"] == 4 and s["second_half"]["trades"] == 4 and s["first_half"]["pnl"] == 1.0, s)
     check("no trades -> zeros", SB.score([])["trades"] == 0)
     good = [{"pnl": 0.05 + (0.01 if i % 2 else -0.01), "cost": 0.9, "cluster": i, "ts": i} for i in range(120)]
     v = SB.judge(SB.score(good), {})
