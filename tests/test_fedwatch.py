@@ -90,6 +90,33 @@ def main():
     row = {x["key"]: x for x in SB.board(wdb)["strategies"]}["fed"]
     check("Fed picks appear on the scoreboard", row["score"]["trades"] >= 1, row["score"])
     check("the client it is given has no order methods", not any(hasattr(k, a) for a in ("create_order", "cancel_order")))
+    class Flaky:
+        def __init__(self, fails):
+            self.fails, self.n = fails, 0
+
+        def get(self, url, **kw):
+            self.n += 1
+            if self.n <= self.fails:
+                raise ConnectionResetError(10054, "An existing connection was forcibly closed by the remote host")
+
+            class R:
+                status_code = 200
+
+                def raise_for_status(self):
+                    pass
+
+                def json(self):
+                    return {"refRates": [{"percentRate": 3.88}]}
+            return R()
+    fl = F.FedWatch(lambda: {}, WarehouseDB(Path(tempfile.mkdtemp()) / "fl.db"), None, session=Flaky(1))
+    check("a dropped idle connection is retried once (the half-hourly check no longer fails on 'connection reset')", close(fl.effr(), 3.88) and fl.http.n == 2)
+    fl2 = F.FedWatch(lambda: {}, WarehouseDB(Path(tempfile.mkdtemp()) / "fl2.db"), None, session=Flaky(2))
+    try:
+        fl2.effr()
+        twice = False
+    except ConnectionError:
+        twice = True
+    check("a connection that fails twice is still an error (no endless retry)", twice and fl2.http.n == 2)
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 

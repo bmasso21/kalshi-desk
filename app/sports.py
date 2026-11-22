@@ -265,7 +265,7 @@ BOOK_ALIASES = ((r"\(chi\)", "Chicago"), (r"^se louisiana\b", "Southeastern Loui
                 (r"^umkc\b", "Kansas City"), (r"^mt\.?\s+st\b", "Mount St"),
                 (r"^boston univ\.?(?=\s|$)", "Boston University"), (r"^arkansas-little rock\b", "Little Rock"),
                 (r"^massachusetts\b", "UMass"), (r"^cal baptist\b", "California Baptist"),
-                (r"^texas a&m-cc\b", "Texas A&M-Corpus Christi"))
+                (r"^texas a&m-cc\b", "Texas A&M-Corpus Christi"), (r"^iupui\b", "IU Indy"))
 KALSHI_PREFIX = r"^university (?:at|of)\s+"          # Kalshi: "University at Albany"; sportsbooks: "Albany Great Danes"
 
 

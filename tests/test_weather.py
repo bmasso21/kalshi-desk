@@ -404,7 +404,7 @@ def main():
     b = c.get("/api/weather/board?days=2").json()
     check("API board responds (no open events in synthetic past world)", b["events"] == [] and "note" in b)
     check("API eval needs the CSRF token", c.post("/api/weather/eval").status_code in (401, 403))
-    check("version 3.30.0", c.get("/api/session").status_code == 200 and __import__("app").__version__ == "3.30.0")
+    check("version 3.30.1", c.get("/api/session").status_code == 200 and __import__("app").__version__ == "3.30.1")
     tr = {t["key"]: t for t in c.get("/api/trackers").json()["trackers"]}
     check("API /api/trackers: one line per paper tracker; the retired gold watch is reported as off so the Home page hides it",
           set(tr) == {"sports", "fed", "gas", "mentions", "poly", "arb", "flow", "gold"} and tr["gold"]["on"] is False and tr["gas"]["on"] is True

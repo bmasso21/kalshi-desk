@@ -120,15 +120,24 @@ class FedWatch:
         return default if v in (None, "") else v
 
     # ---------------------------------------------------------------- data --
+    def _get(self, url, **kw):
+        """GET with one retry on a dropped connection. The session keeps connections open between the half-hourly
+        checks; the far end closes an idle one, and the first request on it fails ('connection reset', 10054)."""
+        import requests
+        try:
+            return self.http.get(url, **kw)
+        except (requests.ConnectionError, ConnectionError):
+            return self.http.get(url, **kw)
+
     def effr(self) -> float:
-        r = self.http.get("https://markets.newyorkfed.org/api/rates/unsecured/effr/last/1.json", timeout=20)
+        r = self._get("https://markets.newyorkfed.org/api/rates/unsecured/effr/last/1.json", timeout=20)
         r.raise_for_status()
         return float(r.json()["refRates"][0]["percentRate"])
 
     def futures(self, months: list[tuple]) -> dict:
         out = {}
         for y, m in months:
-            r = self.http.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{futures_symbol(y, m)}",
+            r = self._get(f"https://query1.finance.yahoo.com/v8/finance/chart/{futures_symbol(y, m)}",
                               params={"interval": "1d", "range": "5d"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
             if r.status_code != 200:
                 continue
