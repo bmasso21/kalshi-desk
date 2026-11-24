@@ -28,6 +28,7 @@ many contracts you could have had.
 """
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import sqlite3
@@ -281,7 +282,7 @@ def baskets(conn, flt: dict | None = None) -> dict:
 
 
 # ---------------------------------------------------------------- scalp --
-EXTRA = ("scalp", "hourly", "goldfv", "gasfv", "newmkt", "newflow")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
+EXTRA = ("scalp", "hourly", "goldfv", "gasfv", "newmkt", "newflow", "wxlock")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
 SCALP_ENTRY_MIN = (2, 5, 10)         # minutes after the contract opens
 SCALP_STOPS = (None, 0.25, 0.50)     # sell if the price falls this fraction below what was paid; None = no stop
 SCALP_TARGETS = (0.05, 0.10, 0.20, 0.35, 0.60, None)   # take profit at +x%; None = hold to the end
@@ -955,7 +956,168 @@ def newflow(conn, flt: dict | None = None) -> dict:
                               for b in FLOW_SIZES]}
 
 
-RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly, "goldfv": goldfv, "gasfv": gasfv, "newmkt": newmkt, "newflow": newflow}
+LOCK_MARGINS = (0, 1, 2)          # degrees of doubt allowed between the station's 5-minute readings and the official CLI value
+LOCK_OBS_LAG = 900                # a reading counts as known 15 minutes after it was taken
+LOCK_PRICE = ((0, 0.90, "under 90c"), (0.90, 0.95, "90-94c"), (0.95, 0.98, "95-97c"), (0.98, 1.0, "98-99c"))
+LOCK_HOURS = ((0, 3, "last 3 h of the day"), (3, 6, "3-6 h left"), (6, 12, "6-12 h left"), (12, 99, "12+ h left"))
+
+
+def _locked(kind, M, m, stype, floor, cap):
+    """Which side a temperature market is certain to settle on, given the day's observed extreme so far M
+    (running high for a high market, running low for a low market), allowing m degrees between the readings
+    and the official value. None when the readings do not settle it yet."""
+    if M is None:
+        return None
+    k = round(M)
+    if kind == "high":                                     # the official high will be at least k - m
+        lo = k - m
+        if stype == "greater" and floor is not None and lo > floor:
+            return "yes"
+        if stype == "less" and cap is not None and lo >= cap:
+            return "no"
+        if stype == "between" and cap is not None and lo > cap:
+            return "no"
+    else:                                                  # the official low will be at most k + m
+        hi = k + m
+        if stype == "greater" and floor is not None and hi <= floor:
+            return "no"
+        if stype == "less" and cap is not None and hi < cap:
+            return "yes"
+        if stype == "between" and floor is not None and hi < floor:
+            return "no"
+    return None
+
+
+def wxlock(conn, flt: dict | None = None) -> dict:
+    """Observed temperature: once the station's readings so far TODAY already settle a high/low market (the high
+    can only rise, the low only fall), was the certain side still for sale below $1?
+    For every stored trade in a settled daily temperature market, the day's observed extreme up to 15 minutes before
+    the trade decides whether the market was already settled by the readings. Only trades where the taker BOUGHT the
+    settled side count as entries (the ask was really there), at the price they paid plus the taker fee.
+    The margin allows for the official CLI value differing from the 5-minute readings."""
+    from .weather import STATIONS, day_window, event_date, parse_rules
+    from .goldfv import _bucket
+    flt = flt or {}
+    smap = {}
+    for r in conn.execute("SELECT DISTINCT series_ticker FROM wh_markets WHERE raw LIKE '%temperature recorded at%'").fetchall():
+        for x in conn.execute("SELECT raw FROM wh_markets WHERE series_ticker=? AND raw LIKE '%temperature recorded at%' ORDER BY close_ts DESC LIMIT 20",
+                              (r["series_ticker"],)).fetchall():
+            try:
+                p = parse_rules(json.loads(x["raw"] or "{}").get("rules_primary"))
+            except ValueError:
+                p = None
+            if p and p[1] in STATIONS:
+                smap[r["series_ticker"]] = p
+                break
+    if flt.get("series"):
+        smap = {k: v for k, v in smap.items() if k in flt["series"]}
+    if not smap:
+        return {"markets": 0, "note": "no temperature series with a known station in the warehouse"}
+    ty = ("CASE WHEN t.taker_outcome_side='yes' THEN 1 WHEN t.taker_outcome_side='no' THEN 0 "
+          "WHEN t.taker_book_side='bid' THEN 1 WHEN t.taker_book_side='ask' THEN 0 END")
+    acc, meta = {}, {}
+    wrong, seen_mk, locked_mk, cap = [], 0, {m: set() for m in LOCK_MARGINS}, {}
+    bad = {m: set() for m in LOCK_MARGINS}            # markets the readings called wrongly (official value disagreed)
+
+    def add(key, ev, ret, price, n):
+        g = acc.setdefault(key, {}).setdefault(ev, [0.0, 0.0])
+        g[0] += 1
+        g[1] += ret
+        x = meta.setdefault(key, [0, 0, 0.0, 0.0])
+        x[0] += 1
+        x[1] += 1 if ret > 0 else 0
+        x[2] += price
+        x[3] += n
+    obs_cache = {}
+    for series, (kind, cli) in sorted(smap.items()):
+        icao, aid, off = STATIONS[cli]
+        if aid not in obs_cache:
+            rows = conn.execute("SELECT ts, tmpf FROM wx_obs WHERE station=? AND tmpf IS NOT NULL ORDER BY ts", (aid,)).fetchall()
+            obs_cache = {aid: ([r["ts"] for r in rows], [r["tmpf"] for r in rows])}
+        ots, ovs = obs_cache[aid]
+        if not ots:
+            continue
+        mks = conn.execute("SELECT m.ticker, m.event_ticker, m.result, m.strike_type, m.floor_strike, m.cap_strike, m.close_ts, "
+                           "COALESCE(s.fee_multiplier, 1) fm FROM wh_markets m LEFT JOIN wh_series s ON s.series_ticker = m.series_ticker "
+                           "WHERE m.series_ticker=? AND m.complete=1 AND m.result IN ('yes','no')", (series,)).fetchall()
+        for mk in mks:
+            d = event_date(mk["event_ticker"] or "")
+            if not d:
+                continue
+            ds, de = day_window(d, off)
+            i0, i1 = bisect.bisect_left(ots, ds), bisect.bisect_left(ots, de)
+            if i1 - i0 < 12:                                 # too few readings that day to trust
+                continue
+            run, cur = [], None
+            for i in range(i0, i1):                          # running extreme through the day
+                v = ovs[i]
+                cur = v if cur is None else (max(cur, v) if kind == "high" else min(cur, v))
+                run.append(cur)
+            seen_mk += 1
+            tr = conn.execute(f"SELECT t.ts, t.yes_price yp, t.count n, {ty} y FROM wh_trades t WHERE t.ticker=? AND t.ts >= ? "
+                              "AND t.yes_price > 0 AND t.yes_price < 1 AND t.count > 0 ORDER BY t.ts", (mk["ticker"], ds)).fetchall()
+            first = {}
+            for t in tr:
+                if t["y"] is None or t["ts"] > mk["close_ts"]:
+                    continue
+                j = bisect.bisect_right(ots, min(t["ts"] - LOCK_OBS_LAG, de - 1), i0, i1) - i0
+                if j <= 0:
+                    continue
+                M = run[j - 1]
+                hl = max(0.0, (de - t["ts"]) / 3600)
+                for m in LOCK_MARGINS:
+                    side = _locked(kind, M, m, mk["strike_type"], mk["floor_strike"], mk["cap_strike"])
+                    if side is None:
+                        continue
+                    locked_mk[m].add(mk["ticker"])
+                    bought = (t["y"] == 1) == (side == "yes")
+                    price = t["yp"] if side == "yes" else 1 - t["yp"]
+                    right = mk["result"] == side
+                    if not right and mk["ticker"] not in bad[m]:
+                        bad[m].add(mk["ticker"])
+                        if m == 0 and len(wrong) < 40:
+                            wrong.append({"ticker": mk["ticker"], "kind": kind, "observed": M, "locked_side": side, "result": mk["result"]})
+                    if not bought:
+                        continue
+                    fee = TAKER * mk["fm"] * price * (1 - price)
+                    ret = (1.0 if right else 0.0) - price - fee
+                    ev = mk["event_ticker"] or mk["ticker"]
+                    add(("all", m), ev, ret, price, t["n"])
+                    pb = _bucket(price, LOCK_PRICE)
+                    add(("price", m, pb), ev, ret, price, t["n"])
+                    add(("kind", m, kind), ev, ret, price, t["n"])
+                    add(("hours", m, _bucket(hl, LOCK_HOURS)), ev, ret, price, t["n"])
+                    if (mk["ticker"], m) not in first:            # the rule: first chance per market
+                        first[(mk["ticker"], m)] = 1
+                        add(("first", m), ev, ret, price, t["n"])
+                        add(("firstprice", m, pb), ev, ret, price, t["n"])
+                    if m == 1 and price < 0.98:                    # how much was there to buy below 98c
+                        c = cap.setdefault(d.isoformat(), 0.0)
+                        cap[d.isoformat()] = c + t["n"] * price
+
+    def out(key):
+        x = meta.get(key)
+        if not x:
+            return {"entries": 0}
+        st = _stat(acc[key])
+        return {"entries": x[0], "win_pct": round(100 * x[1] / x[0], 2), "avg_price_c": round(100 * x[2] / x[0], 2),
+                "contracts": round(x[3]), "ret_c": st["ret_c"], "t": st["t"], "events": st["events"]}
+    days = sorted(cap)
+    return {"markets": seen_mk, "series": len(smap),
+            "settled_by_readings": [{"margin_deg": m, "markets": len(locked_mk[m]), "readings_wrong": len(bad[m]),
+                                     "wrong_pct": round(100 * len(bad[m]) / len(locked_mk[m]), 3) if locked_mk[m] else None} for m in LOCK_MARGINS],
+            "obs_lag_min": LOCK_OBS_LAG // 60,
+            "by_margin": [{"margin_deg": m, "all_trades": out(("all", m)), "first_per_market": out(("first", m)),
+                           "by_price": [{"price": lab, **out(("price", m, lab))} for _, _, lab in LOCK_PRICE],
+                           "first_by_price": [{"price": lab, **out(("firstprice", m, lab))} for _, _, lab in LOCK_PRICE],
+                           "by_kind": [{"kind": k, **out(("kind", m, k))} for k in ("high", "low")],
+                           "by_hours_left": [{"hours": lab, **out(("hours", m, lab))} for _, _, lab in LOCK_HOURS]} for m in LOCK_MARGINS],
+            "readings_wrong_m0": wrong,
+            "dollars_buyable_under_98c_m1": {"days": len(days), "per_day_avg": round(sum(cap.values()) / len(days), 2) if days else 0,
+                                             "per_day_median": round(sorted(cap.values())[len(days) // 2], 2) if days else 0}}
+
+
+RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly, "goldfv": goldfv, "gasfv": gasfv, "newmkt": newmkt, "newflow": newflow, "wxlock": wxlock}
 
 
 class Studies:

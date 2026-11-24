@@ -397,10 +397,61 @@ def newflow_test():
     check("newflow is a named study and only runs when asked for", "newflow" in ST.RUN and "newflow" in ST.EXTRA and "newflow" not in ST.KINDS)
 
 
+def wxlock_test():
+    import datetime as dt
+    import sqlite3
+    from app import weather as W
+    tmp = tempfile.mkdtemp()
+    wdb = WarehouseDB(Path(tmp) / "x.db")
+    W.WxStore(wdb)
+    wdb.execute("INSERT INTO wh_series VALUES('KXHIGHNY', 'Climate and Weather', 'NY high', 'quadratic', 1.0, 'daily', '{}', 0)")
+    rules = json.dumps({"rules_primary": "If the maximum temperature recorded at Central Park, New York (CLINYC) for November 20, 2026 is ..."})
+    ds = dt.datetime(2026, 11, 20, 5, tzinfo=dt.timezone.utc).timestamp()        # midnight EST
+    H = lambda h, mi=0: ds + h * 3600 + mi * 60
+    for t, st, fl, cp, res in (("KXHIGHNY-26NOV20-T55", "greater", 55, None, "yes"),     # high above 55: settled YES once 60 is read
+                               ("KXHIGHNY-26NOV20-B56.5", "between", 56, 57, "no"),     # 56-57: settled NO once 60 is read
+                               ("KXHIGHNY-26NOV20-T59", "greater", 59, None, "no")):    # above 59: the official high was 59 (readings said 60)
+        wdb.execute("INSERT INTO wh_markets(ticker, event_ticker, series_ticker, category, status, open_ts, close_ts, result, volume, complete, "
+                    "strike_type, floor_strike, cap_strike, raw) VALUES(?, 'KXHIGHNY-26NOV20', 'KXHIGHNY', 'Climate and Weather', 'finalized', ?, ?, ?, 100, 1, ?, ?, ?, ?)",
+                    (t, ds - 86400, ds + 86400, res, st, fl, cp, rules))
+    temps = [40] * 10 + [50] * 3 + [60] + [55] * 10          # hourly readings: 60 at 13:00 local (18:00 UTC)
+    for h, v in enumerate(temps):
+        wdb.execute("INSERT INTO wx_obs VALUES('NYC', ?, ?)", (int(H(h)), v))
+    for i, (tk, ts, yp, side) in enumerate((("KXHIGHNY-26NOV20-T55", H(13, 10), 0.80, "yes"),   # 18:00 reading not known until 18:15: not settled yet
+                                            ("KXHIGHNY-26NOV20-T55", H(13, 20), 0.95, "yes"),   # settled YES, bought at 95c: wins
+                                            ("KXHIGHNY-26NOV20-T55", H(13, 30), 0.97, "no"),    # taker bought the losing side: not an entry
+                                            ("KXHIGHNY-26NOV20-T55", H(14, 0), 0.97, "yes"),    # bought at 97c: wins
+                                            ("KXHIGHNY-26NOV20-B56.5", H(13, 20), 0.04, "no"),  # NO bought at 96c: wins
+                                            ("KXHIGHNY-26NOV20-T59", H(13, 20), 0.90, "yes"))): # readings say YES at 0 margin; official 59 -> loses
+        wdb.execute("INSERT INTO wh_trades VALUES(?,?,?,?,?,?,?,0)", (f"w{i}", tk, ts, yp, 10, side, "bid" if side == "yes" else "ask"))
+    conn = sqlite3.connect(str(Path(tmp) / "x.db"))
+    conn.row_factory = sqlite3.Row
+    r = ST.wxlock(conn, {})
+    bm = {x["margin_deg"]: x for x in r["by_margin"]}
+    sb = {x["margin_deg"]: x for x in r["settled_by_readings"]}
+    fee = lambda p: 0.07 * p * (1 - p)
+    a0 = bm[0]["all_trades"]
+    check("wxlock: a market counts as settled by the readings only 15 minutes after the reading; only takers who BOUGHT the settled side are entries",
+          r["markets"] == 3 and a0["entries"] == 4 and a0["contracts"] == 40, a0)
+    check("wxlock: returns are payout less price less the taker fee (95c and 97c and 96c win, 90c on the wrongly called market loses)",
+          close(a0["ret_c"], 100 * ((1 - .95 - fee(.95)) + (1 - .97 - fee(.97)) + (1 - .96 - fee(.96)) + (-.90 - fee(.90))) / 4, 0.01), a0)
+    check("wxlock: with 1 degree of margin the 59 market is no longer called, and nothing is called wrongly",
+          sb[0]["readings_wrong"] == 1 and sb[0]["markets"] == 3 and sb[1]["markets"] == 2 and sb[1]["readings_wrong"] == 0
+          and bm[1]["all_trades"]["entries"] == 3 and bm[1]["all_trades"]["win_pct"] == 100.0, (sb, bm[1]["all_trades"]))
+    check("wxlock: the first chance per market is kept apart, and results are split by price, kind and hours left",
+          bm[1]["first_per_market"]["entries"] == 2 and {x["price"]: x["entries"] for x in bm[1]["by_price"]}["95-97c"] == 3
+          and bm[1]["by_kind"][0]["entries"] == 3 and r["readings_wrong_m0"][0]["ticker"] == "KXHIGHNY-26NOV20-T59", bm[1])
+    check("wxlock is a named study and only runs when asked for", "wxlock" in ST.RUN and "wxlock" in ST.EXTRA and "wxlock" not in ST.KINDS)
+    check("_locked: lows can only fall (a 30 reading settles 'low below 33' YES and 'low above 32' NO; with 2 degrees of doubt 'below 32' is not settled)",
+          ST._locked("low", 30, 0, "less", None, 33) == "yes" and ST._locked("low", 30, 0, "greater", 32, None) == "no"
+          and ST._locked("low", 30, 2, "less", None, 32) is None and ST._locked("high", 30, 0, "less", None, 33) is None)
+
+
 if __name__ == "__main__":
     main()
     newmkt_test()
     newflow_test()
+    wxlock_test()
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", FAIL)
