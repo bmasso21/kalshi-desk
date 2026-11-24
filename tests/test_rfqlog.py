@@ -1,4 +1,5 @@
 """Combo price requests (RFQs): read-only production log. Hand-checkable."""
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -40,10 +41,10 @@ class Reader:
         self.rows = []
         self.calls = []
 
-    def request(self, method, path, params=None, **kw):
-        self.calls.append((method, path, dict(params or {})))
-        assert method == "GET" and path == "/communications/rfqs" and params == {"limit": 100}
-        return {"rfqs": list(self.rows)}
+    def paginate(self, path, key, params, max_items=None):
+        self.calls.append((path, dict(params or {}), max_items))
+        assert path == "/communications/rfqs" and key == "rfqs" and params == {"limit": 100}
+        yield from self.rows
 
 
 class Pub:
@@ -113,8 +114,8 @@ def main():
         err = str(e)
     check("without a production key it says so and reads nothing", err and "production API key" in err)
     check("the public client it is given has no order methods", not any(hasattr(pub, a) for a in ("create_order", "cancel_order", "create_quote")))
-    check("the request rate is estimated from the newest page (3 requests created 30 s before the scan, all at once)",
-          wdb.query("SELECT COUNT(*) n FROM rfq_rate")[0]["n"] == 2 and "legs_share" in st["rate"], st["rate"])
+    check("the arrival rate counts requests not in the previous full listing (none new on the second read; the first read is the backlog)",
+          wdb.query("SELECT COUNT(*) n FROM rfq_rate")[0]["n"] == 1 and wdb.query("SELECT listed FROM rfq_rate")[0]["listed"] == 0 and "legs_share" in st["rate"], st["rate"])
     R.SAMPLE_PCT = 10
     ids = [f"id{i}" for i in range(2000)]
     share = sum(R.sampled(i) for i in ids) / len(ids)
@@ -131,6 +132,15 @@ def main():
     kept = [i for i in ("r1", "r2", "r3") if R.sampled(i)]
     check("prune removes requests stored before sampling that are not in the sample",
           dropped == 3 - len(kept) and sorted(r["id"] for r in wdb.query("SELECT id FROM rfq_log WHERE id IN ('r1','r2','r3')")) == kept, (dropped, kept))
+    rd3 = Reader()
+    l3 = R.RfqLog(lambda: {}, WarehouseDB(Path(tempfile.mkdtemp()) / "a.db"), pub, reader_factory=lambda: rd3)
+    rd3.rows = [rfq(f"a{i}", [("A-1", "yes"), ("B-1", "no")]) for i in range(5)]
+    l3.scan(NOW)
+    rd3.rows = rd3.rows[2:] + [rfq(f"b{i}", [("A-1", "yes")] * 8) for i in range(3)]
+    l3.scan(NOW + 60)
+    rr = l3.db.query("SELECT * FROM rfq_rate")
+    check("3 requests appear between two reads a minute apart: 3 arrivals, about 180 an hour, all in the 7-12 legs bucket",
+          len(rr) == 1 and rr[0]["listed"] == 3 and l3.state["per_hour_est"] == 180 and json.loads(rr[0]["legs_hist"]) == {"7-12": 3}, (rr, l3.state))
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 

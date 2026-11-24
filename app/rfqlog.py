@@ -25,8 +25,9 @@ from .sports import ensure_schema
 
 READ_PATH = "/communications/rfqs"
 EVERY = 60
-PAGE = 100                        # one page of the newest requests per minute. Requests run at tens of thousands a day
-SAMPLE_PCT = 10                   # (24 Nov 2026: 1,000 new every minute), so a fixed 10% sample, chosen by id, is stored
+PAGE = 100
+MAX_LIST = 3000                   # the list holds every OPEN request (over 1,000 at a time); it is read in full each minute
+SAMPLE_PCT = 10                   # a fixed 10% sample, chosen by id, is stored
 MAX_LEGS = 12                     # legs are priced and followed only for combos this size or smaller
 
 SCHEMA = """
@@ -106,6 +107,7 @@ class RfqLog:
         self._reader_factory = reader_factory
         ensure_schema(wdb, SCHEMA)
         self._stop = threading.Event()
+        self._prev = None                       # (time, ids) of the previous full listing
         self.state = {"running": False, "last": None, "error": None, "note": "", "seen_last_scan": 0}
 
     def opt(self, k, default):
@@ -129,15 +131,22 @@ class RfqLog:
         now = now or time.time()
         new, closed = 0, 0
         known = {}
-        page = self.reader().request("GET", READ_PATH, params={"limit": PAGE})
-        rows = page.get("rfqs") or []
-        cts = [c for c in (_ts(r.get("created_ts")) for r in rows) if c]
-        hist = {}
-        for r in rows:
-            n = len(r.get("mve_selected_legs") or [])
-            b = "0" if n == 0 else "2-3" if n <= 3 else "4-6" if n <= 6 else "7-12" if n <= 12 else "13+"
-            hist[b] = hist.get(b, 0) + 1
-        self.db.execute("INSERT OR REPLACE INTO rfq_rate VALUES(?,?,?,?,?)", (now, len(rows), min(cts) if cts else None, max(cts) if cts else None, json.dumps(hist)))
+        rows = list(self.reader().paginate(READ_PATH, "rfqs", {"limit": PAGE}, max_items=MAX_LIST))
+        listed = len(rows)
+        # arrival rate: requests not in the previous full listing (the first listing after a start is the backlog)
+        ids_now = {r.get("id") for r in rows if r.get("id")}
+        arrivals, hist, rate = None, {}, None
+        if self._prev is not None:
+            arr = [r for r in rows if r.get("id") not in self._prev[1]]
+            arrivals = len(arr)
+            for r in arr:
+                n = len(r.get("mve_selected_legs") or [])
+                b = "0" if n == 0 else "2-3" if n <= 3 else "4-6" if n <= 6 else "7-12" if n <= 12 else "13+"
+                hist[b] = hist.get(b, 0) + 1
+            if now > self._prev[0]:
+                rate = round(arrivals / (now - self._prev[0]) * 3600)
+                self.db.execute("INSERT OR REPLACE INTO rfq_rate VALUES(?,?,?,?,?)", (now, arrivals, self._prev[0], now, json.dumps(hist)))
+        self._prev = (now, ids_now)
         rows = [r for r in rows if sampled(r.get("id"))]
         if rows:
             ids = [r.get("id") for r in rows if r.get("id")]
@@ -176,11 +185,9 @@ class RfqLog:
                                    len(legs), json.dumps(legs) if len(legs) <= MAX_LEGS else "[]", lp, 1 if lp is not None else 0, (r.get("status") or "open").lower()))
             new += 1 if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
         settled = self.settle(now)
-        span = (max(cts) - min(cts)) if len(cts) > 1 else None
-        rate = round(len(cts) / span * 3600) if span else None
-        self.state.update(last=now, error=None, seen_last_scan=len(cts), per_hour_est=rate,
-                          note=f"newest {len(cts)} requests span {round(span) if span else '?'} s (about {rate if rate else '?'} an hour); "
-                               f"{new} sampled and stored, {closed} newly closed, {settled} combos decided")
+        self.state.update(last=now, error=None, seen_last_scan=listed, per_hour_est=rate,
+                          note=f"{listed} open requests listed{'' if arrivals is None else f', {arrivals} new since the last read (about {rate} an hour)'}"
+                               f"{' (list capped: some missed)' if listed >= MAX_LIST else ''}; {new} sampled and stored, {closed} newly closed, {settled} combos decided")
         return {"listed": len(rows), "new": new, "closed": closed, "settled": settled}
 
     def settle(self, now: float, batch: int = 300) -> int:
