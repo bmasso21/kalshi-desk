@@ -1360,6 +1360,15 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     def final_view():
         return finalw.status()
 
+    from .rfqlog import RfqLog
+    rfql = RfqLog(lambda: cfg.data, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+    if start_engine:
+        rfql.start()
+
+    @app.get("/api/rfq")
+    def rfq_view():
+        return rfql.status()
+
     @app.get("/api/trackers")
     def trackers_view():
         """One line per paper tracker that is running: when it last checked, its note and any error (for the Home page)."""
@@ -1371,6 +1380,7 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 ("arb", "Arbitrage", arb.state, "last_scan", bool(arb.opt("arb_enabled", True))),
                 ("flow", "Early flow", floww.state, "last", bool(floww.opt("flow_enabled", True))),
                 ("final", "Games decided", finalw.state, "last", bool(finalw.opt("final_enabled", True))),
+                ("rfq", "Combo requests log", rfql.state, "last", bool(rfql.opt("enabled", True))),
                 ("gold", "Gold watch", gapwatch.state, "last_check", bool(gapwatch.enabled))]
         return {"trackers": [{"key": k, "name": n, "on": on, "last": st.get(f), "running": bool(st.get("running")),
                               "error": st.get("error"), "note": st.get("note") or ""} for k, n, st, f, on in rows]}
