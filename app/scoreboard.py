@@ -125,6 +125,13 @@ def sources(wdb) -> list[dict]:
         out.append({"key": key, "name": name, "market": market, "description": desc,
                     "rows": [{"pnl": r["pnl"], "cost": r["price"] + r["fee"], "cluster": r["event"], "ts": r["start_ts"]} for r in pp if r["status"] == "settled" and r["pnl"] is not None],
                     "open": sum(1 for r in pp if r["status"] == "open")})
+    fp = q("SELECT event, price, size, fee, pnl, settled_ts, ts, status FROM final_picks")
+    out.append({"key": "sports_final", "name": "Games already decided: buy the winner after the final", "market": "NBA, NFL, NHL, college game winners",
+                "description": "When ESPN shows a game final and Kalshi still offers the winner at 99c or less, 100 contracts are bought on paper "
+                               "(fee rounded up to the cent on the order). Scored per contract",
+                "rows": [{"pnl": r["pnl"] / r["size"], "cost": r["price"] + r["fee"] / r["size"], "cluster": r["event"], "ts": r["settled_ts"] or r["ts"]}
+                         for r in fp if r["status"] == "settled" and r["pnl"] is not None and r["size"]],
+                "open": sum(1 for r in fp if r["status"] == "open")})
     fl = q("SELECT event, price, fee, pnl, close_ts, status FROM flow_picks")
     out.append({"key": "flow_weather", "name": "Weather: follow large first-hour trades", "market": "New weather markets (first hour)",
                 "description": "A single trade of 100+ contracts in a new weather market's first hour; the same side is bought at the real ask within 10 minutes "
@@ -150,6 +157,7 @@ def sources(wdb) -> list[dict]:
 
 
 RETIRED = {"gold_fv": "retired 18 Nov: -25% on 51 paper buys (the free live gold price is too noisy)",
+           "sports_lean": "retired 24 Nov: 41 settled, 13 won, -$5.69 (-30% on stake), t -2.07 over 29 games",
            "gold_cushion15": "retired 19 Nov: 339 of 353 won yet lost $5.14 (the rare miss costs more than the many small wins pay)"}
 
 

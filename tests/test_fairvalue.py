@@ -65,7 +65,8 @@ def book(key, home, hp, away, ap):
 
 def main():
     wdb = WarehouseDB(Path(tempfile.mkdtemp()) / "w.db")
-    cfg = {"theodds_key": "k" * 32, "fv_monthly_cap": 3, "fv_sports": {"americanfootball_nfl": {"series": "KXNFLGAME", "markets": "h2h"}}}
+    cfg = {"theodds_key": "k" * 32, "fv_monthly_cap": 3, "fv_lean_enabled": True,     # the lean tier is retired; switched on here to test it
+           "fv_sports": {"americanfootball_nfl": {"series": "KXNFLGAME", "markets": "h2h"}}}
     http, k = Http(), Kalshi()
     fv = FV.FairValue(lambda: cfg, wdb, k, session=http, base="http://odds.test/v4")
     # margin removal: 1.80 / 2.10 -> 0.5556 + 0.4762 = 1.0317 -> 53.85% / 46.15%
@@ -289,6 +290,12 @@ def main():
     d = FV.DEFAULT_SPORTS["basketball_ncaab"]
     check("college basketball is scanned by default: game, spread and total, every 12 hours",
           d["series"] == "KXNCAAMBGAME" and d["markets"] == "h2h,spreads,totals" and d["series"].replace("GAME", "SPREAD") == "KXNCAAMBSPREAD", d)
+    cfg["fv_lean_enabled"] = False
+    nl = len(wdb.query("SELECT 1 FROM fv_picks2 WHERE tier='lean'"))
+    fv._consider({"picks": 0, "leans": 0}, time.time(), "americanfootball_nfl", {"id": "zz"}, "G", time.time() + 7200, "spread", "Team +3.5", 3.5,
+                 "KXNFLSPREAD-ZZ-T", "no", 0.50, 5, 0.01, 0.53, 0.55) if hasattr(fv, "_consider") else None
+    check("retired: with the lean tier off (the default) no new lean picks are recorded",
+          len(wdb.query("SELECT 1 FROM fv_picks2 WHERE tier='lean'")) == nl and FV.FairValue(lambda: {}, wdb, k).opt("fv_lean_enabled", False) is False)
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 

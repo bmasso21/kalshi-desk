@@ -447,11 +447,60 @@ def wxlock_test():
           and ST._locked("low", 30, 2, "less", None, 32) is None and ST._locked("high", 30, 0, "less", None, 33) is None)
 
 
+def rainlock_test():
+    import datetime as dt
+    import sqlite3
+    tmp = tempfile.mkdtemp()
+    wdb = WarehouseDB(Path(tmp) / "r.db")
+    wdb.execute("INSERT INTO wh_series VALUES('KXRAIN', 'Climate and Weather', 'Rain', 'quadratic', 1.0, 'daily', '{}', 0)")
+    ds = dt.datetime(2026, 11, 20, 5, tzinfo=dt.timezone.utc).timestamp()        # midnight EST, Nov 20
+    H = lambda h, mi=0: ds + h * 3600 + mi * 60
+    rule = lambda cli: json.dumps({"rules_primary": f"If the total precipitation at CLI{cli} in Somewhere in Nov 20, 2026 is strictly greater than 0 inches, then the market resolves to Yes."})
+    for t, cli, res in (("KXRAIN-26NOV20-NYC", "NYC", "yes"), ("KXRAIN-26NOV20-PHIL", "PHL", "no"), ("KXRAIN-26NOV20-BOS", "BOS", "no")):
+        wdb.execute("INSERT INTO wh_markets(ticker, event_ticker, series_ticker, category, status, open_ts, close_ts, result, volume, complete, "
+                    "strike_type, floor_strike, raw) VALUES(?, 'KXRAIN-26NOV20', 'KXRAIN', 'Climate and Weather', 'finalized', ?, ?, ?, 100, 1, 'greater', 0, ?)",
+                    (t, ds - 86400, ds + 86400, res, rule(cli)))
+    obs = {"NYC": [(H(h, 51), 0.0) for h in range(24)], "PHL": [(H(h, 51), 0.0) for h in range(24)], "BOS": [(H(h, 51), 0.0) for h in range(24)]}
+    obs["NYC"][9] = (H(9, 51), 0.03)                   # 9:51 am: 0.03 in -> YES known from 10:06
+    obs["PHL"][0] = (H(0, 51), 0.04)                   # first hour of the day (may be rain from before midnight): ignored
+    obs["BOS"][14] = (H(14, 51), 0.01)                 # one hundredth read, but the official total was 0: a wrong call at 0.01 only
+    calls = []
+
+    def fetch(aid, a, b):
+        calls.append(aid)
+        return obs[aid]
+    for i, (tk, ts, yp, side) in enumerate((("KXRAIN-26NOV20-NYC", H(10, 0), 0.60, "yes"),   # before 10:06: not an entry
+                                            ("KXRAIN-26NOV20-NYC", H(10, 10), 0.90, "yes"),  # YES at 90c after the reading: wins
+                                            ("KXRAIN-26NOV20-NYC", H(10, 20), 0.95, "no"),   # taker bought NO: not an entry
+                                            ("KXRAIN-26NOV20-NYC", H(13, 0), 0.97, "yes"),   # YES at 97c: wins
+                                            ("KXRAIN-26NOV20-PHIL", H(2, 0), 0.50, "yes"),   # PHL never settled by readings
+                                            ("KXRAIN-26NOV20-BOS", H(15, 30), 0.85, "yes"))): # BOS at 0.01: YES bought at 85c, loses
+        wdb.execute("INSERT INTO wh_trades VALUES(?,?,?,?,?,?,?,0)", (f"r{i}", tk, ts, yp, 10, side, "bid" if side == "yes" else "ask"))
+    conn = sqlite3.connect(str(Path(tmp) / "r.db"))
+    conn.row_factory = sqlite3.Row
+    r = ST.rainlock(conn, {}, fetch=fetch)
+    sb = {x["threshold_in"]: x for x in r["settled_by_readings"]}
+    bt = {x["threshold_in"]: x for x in r["by_threshold"]}
+    fee = lambda p: 0.07 * p * (1 - p)
+    check("rainlock: one archive request per station; 3 markets, 1 rained",
+          sorted(calls) == ["BOS", "NYC", "PHL"] and r["markets"] == 3 and r["rained"] == 1, (calls, r["markets"]))
+    check("rainlock: the first hour's reading is ignored; 0.01 in calls BOS wrongly, 0.02 in does not",
+          sb[0.01]["markets"] == 2 and sb[0.01]["readings_wrong"] == 1 and sb[0.02]["markets"] == 1 and sb[0.02]["readings_wrong"] == 0, sb)
+    a2 = bt[0.02]["all_trades"]
+    check("rainlock: entries are YES bought at least 15 minutes after the reading; 90c and 97c win after the fee",
+          a2["entries"] == 2 and close(a2["ret_c"], 100 * ((1 - .90 - fee(.90)) + (1 - .97 - fee(.97))) / 2, 0.01) and bt[0.02]["first_per_market"]["entries"] == 1, a2)
+    a1 = bt[0.01]["all_trades"]
+    check("rainlock: at 0.01 in the wrongly called market's 85c buy loses and is counted",
+          a1["entries"] == 3 and a1["win_pct"] < 100 and r["readings_wrong_examples"][0]["ticker"] == "KXRAIN-26NOV20-BOS", a1)
+    check("rainlock is a named study and only runs when asked for", "rainlock" in ST.RUN and "rainlock" in ST.EXTRA and "rainlock" not in ST.KINDS)
+
+
 if __name__ == "__main__":
     main()
     newmkt_test()
     newflow_test()
     wxlock_test()
+    rainlock_test()
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", FAIL)

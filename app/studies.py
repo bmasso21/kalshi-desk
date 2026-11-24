@@ -31,6 +31,7 @@ from __future__ import annotations
 import bisect
 import json
 import math
+import re
 import sqlite3
 import threading
 import time
@@ -282,7 +283,7 @@ def baskets(conn, flt: dict | None = None) -> dict:
 
 
 # ---------------------------------------------------------------- scalp --
-EXTRA = ("scalp", "hourly", "goldfv", "gasfv", "newmkt", "newflow", "wxlock")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
+EXTRA = ("scalp", "hourly", "goldfv", "gasfv", "newmkt", "newflow", "wxlock", "rainlock")                  # run only when asked for: it applies to short contracts (15 minutes and the like)
 SCALP_ENTRY_MIN = (2, 5, 10)         # minutes after the contract opens
 SCALP_STOPS = (None, 0.25, 0.50)     # sell if the price falls this fraction below what was paid; None = no stop
 SCALP_TARGETS = (0.05, 0.10, 0.20, 0.35, 0.60, None)   # take profit at +x%; None = hold to the end
@@ -1117,7 +1118,165 @@ def wxlock(conn, flt: dict | None = None) -> dict:
                                              "per_day_median": round(sorted(cap.values())[len(days) // 2], 2) if days else 0}}
 
 
-RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly, "goldfv": goldfv, "gasfv": gasfv, "newmkt": newmkt, "newflow": newflow, "wxlock": wxlock}
+# CLI code in the rain markets' rules -> (IEM ASOS id, standard-time UTC offset). West Palm Beach's rules name "CLIDJT";
+# Palm Beach International (PBI) is the official station there - an assumption, reported as such.
+RAIN_STATIONS = {"ABQ": ("ABQ", -7), "ATL": ("ATL", -5), "AUS": ("AUS", -6), "BOS": ("BOS", -5), "ORD": ("ORD", -6), "CLE": ("CLE", -5),
+                 "CLL": ("CLL", -6), "CMH": ("CMH", -5), "DFW": ("DFW", -6), "DCA": ("DCA", -5), "DEN": ("DEN", -7), "DTW": ("DTW", -5),
+                 "EWR": ("EWR", -5), "HOU": ("HOU", -6), "IND": ("IND", -5), "LAX": ("LAX", -8), "LEX": ("LEX", -5), "LAS": ("LAS", -8),
+                 "MIA": ("MIA", -5), "MSP": ("MSP", -6), "MKE": ("MKE", -6), "MSY": ("MSY", -6), "NYC": ("NYC", -5), "OKC": ("OKC", -6),
+                 "PHL": ("PHL", -5), "PIT": ("PIT", -5), "PVD": ("PVD", -5), "SAN": ("SAN", -8), "SAT": ("SAT", -6), "SDF": ("SDF", -5),
+                 "SEA": ("SEA", -8), "SFO": ("SFO", -8), "SGF": ("SGF", -6), "STL": ("STL", -6), "TPA": ("TPA", -5), "TTN": ("TTN", -5),
+                 "DJT": ("PBI", -5)}
+RAIN_RULE = re.compile(r"total precipitation at CLI([A-Z0-9]{3}) .*?strictly greater than 0 inches", re.I | re.S)
+RAIN_THRESH = (0.01, 0.02, 0.05)  # inches in one reading: 0.01 is "measurable"; more is a safety margin against the official total
+
+
+def iem_precip(aid: str, start: float, end: float, session=None) -> list[tuple]:
+    """[(ts, inches)] of hourly/special METAR precipitation (p01i) from the Iowa Environmental Mesonet. Trace = 0."""
+    import csv
+    import datetime as dt
+    import io
+    import requests
+    http = session or requests
+    a, b = dt.datetime.fromtimestamp(start, dt.timezone.utc), dt.datetime.fromtimestamp(end, dt.timezone.utc)
+    params = [("station", aid), ("data", "p01i"), ("tz", "Etc/UTC"), ("format", "onlycomma"), ("latlon", "no"), ("missing", "M"),
+              ("trace", "T"), ("direct", "no"), ("report_type", "3"), ("report_type", "4"),
+              ("year1", a.year), ("month1", a.month), ("day1", a.day), ("year2", b.year), ("month2", b.month), ("day2", b.day)]
+    r = http.get("https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py", params=params, timeout=180,
+                 headers={"User-Agent": "KalshiDesk (personal research)"})
+    r.raise_for_status()
+    out = []
+    for row in csv.DictReader(io.StringIO(r.text)):
+        v = row.get("p01i")
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            continue
+        try:
+            ts = dt.datetime.strptime(row.get("valid", ""), "%Y-%m-%d %H:%M").replace(tzinfo=dt.timezone.utc).timestamp()
+        except ValueError:
+            continue
+        out.append((ts, x))
+    return sorted(out)
+
+
+def rainlock(conn, flt: dict | None = None, session=None, fetch=None) -> dict:
+    """Observed rain: a daily rain market pays YES if the day's official precipitation is above 0 (trace = 0). Once the
+    station has reported measurable rain today, YES is all but settled. Was YES still for sale below $1, and did buying it
+    pay after fees? Readings: hourly and special METARs (IEM), each counted 15 minutes after it was taken; the first hour
+    of the day is ignored (its reading can include rain from before midnight). Only takers who BOUGHT YES are entries."""
+    import time as _t
+    from .goldfv import _bucket
+    from .weather import day_window, event_date
+    flt = flt or {}
+    polite = fetch is None
+    fetch = fetch or (lambda aid, a, b: iem_precip(aid, a, b, session))
+    mk_by_stn = {}
+    for r in conn.execute("SELECT ticker, event_ticker, result, close_ts, open_ts, series_ticker, raw FROM wh_markets "
+                          "WHERE complete=1 AND result IN ('yes','no') AND raw LIKE '%total precipitation at CLI%'").fetchall():
+        try:
+            raw = json.loads(r["raw"] or "{}")
+        except ValueError:
+            continue
+        m = RAIN_RULE.search(raw.get("rules_primary") or "")
+        d = event_date(r["event_ticker"] or "")
+        if not m or not d or m.group(1).upper() not in RAIN_STATIONS:
+            continue
+        mk_by_stn.setdefault(m.group(1).upper(), []).append((r, d))
+    if not mk_by_stn:
+        return {"markets": 0, "note": "no settled daily rain markets with stored trades"}
+    ty = ("CASE WHEN t.taker_outcome_side='yes' THEN 1 WHEN t.taker_outcome_side='no' THEN 0 "
+          "WHEN t.taker_book_side='bid' THEN 1 WHEN t.taker_book_side='ask' THEN 0 END")
+    acc, meta, locked, bad, wrong, fetched, failed = {}, {}, {x: set() for x in RAIN_THRESH}, {x: set() for x in RAIN_THRESH}, [], 0, []
+    yes_days = no_days = 0
+
+    def add(key, ev, ret, price, n):
+        g = acc.setdefault(key, {}).setdefault(ev, [0.0, 0.0])
+        g[0] += 1
+        g[1] += ret
+        x = meta.setdefault(key, [0, 0, 0.0, 0.0])
+        x[0] += 1
+        x[1] += 1 if ret > 0 else 0
+        x[2] += price
+        x[3] += n
+    for cli, mks in sorted(mk_by_stn.items()):
+        aid, off = RAIN_STATIONS[cli]
+        lo = min(day_window(d, off)[0] for _, d in mks) - 86400
+        hi = max(day_window(d, off)[1] for _, d in mks) + 86400
+        try:
+            obs = fetch(aid, lo, hi)
+            fetched += 1
+        except Exception as e:
+            failed.append(f"{aid}: {str(e)[:80]}")
+            continue
+        ots = [o[0] for o in obs]
+        for mk, d in mks:
+            ds, de = day_window(d, off)
+            i0, i1 = bisect.bisect_left(ots, ds + 3600), bisect.bisect_left(ots, de)
+            if i1 - i0 < 12:
+                continue
+            first_at = {}                                    # threshold -> when the first reading at or above it became known
+            for i in range(i0, i1):
+                for th in RAIN_THRESH:
+                    if th not in first_at and obs[i][1] >= th - 1e-9:
+                        first_at[th] = obs[i][0] + LOCK_OBS_LAG
+            if mk["result"] == "yes":
+                yes_days += 1
+            else:
+                no_days += 1
+            for th, at in first_at.items():
+                locked[th].add(mk["ticker"])
+                if mk["result"] != "yes" and mk["ticker"] not in bad[th]:
+                    bad[th].add(mk["ticker"])
+                    if th == RAIN_THRESH[0] and len(wrong) < 40:
+                        wrong.append({"ticker": mk["ticker"], "station": aid, "known_at": at})
+            if not first_at:
+                continue
+            fm = (conn.execute("SELECT fee_multiplier FROM wh_series WHERE series_ticker=?", (mk["series_ticker"],)).fetchone() or {"fee_multiplier": 1})
+            fm = fm["fee_multiplier"] if fm["fee_multiplier"] is not None else 1.0
+            tr = conn.execute(f"SELECT t.ts, t.yes_price yp, t.count n, {ty} y FROM wh_trades t WHERE t.ticker=? AND t.ts >= ? AND t.yes_price > 0 "
+                              "AND t.yes_price < 1 AND t.count > 0 ORDER BY t.ts", (mk["ticker"], min(first_at.values()))).fetchall()
+            done = set()
+            for t in tr:
+                if t["y"] != 1 or t["ts"] > mk["close_ts"]:
+                    continue
+                hl = max(0.0, (de - t["ts"]) / 3600)
+                for th, at in first_at.items():
+                    if t["ts"] < at:
+                        continue
+                    p = t["yp"]
+                    ret = (1.0 if mk["result"] == "yes" else 0.0) - p - TAKER * fm * p * (1 - p)
+                    ev = mk["event_ticker"] or mk["ticker"]
+                    add(("all", th), ev, ret, p, t["n"])
+                    add(("price", th, _bucket(p, LOCK_PRICE)), ev, ret, p, t["n"])
+                    add(("hours", th, _bucket(hl, LOCK_HOURS)), ev, ret, p, t["n"])
+                    add(("lag", th, "within 1 h of the reading" if t["ts"] - at < 3600 else "later"), ev, ret, p, t["n"])
+                    if th not in done:
+                        done.add(th)
+                        add(("first", th), ev, ret, p, t["n"])
+        if polite:
+            _t.sleep(1.0)                                    # be polite to the free archive
+
+    def out(key):
+        x = meta.get(key)
+        if not x:
+            return {"entries": 0}
+        st = _stat(acc[key])
+        return {"entries": x[0], "win_pct": round(100 * x[1] / x[0], 2), "avg_price_c": round(100 * x[2] / x[0], 2),
+                "contracts": round(x[3]), "ret_c": st["ret_c"], "t": st["t"], "events": st["events"]}
+    return {"markets": yes_days + no_days, "rained": yes_days, "dry": no_days, "stations_fetched": fetched, "stations_failed": failed,
+            "assumption": "West Palm Beach (CLIDJT) read from Palm Beach International (PBI)",
+            "settled_by_readings": [{"threshold_in": th, "markets": len(locked[th]), "readings_wrong": len(bad[th]),
+                                     "wrong_pct": round(100 * len(bad[th]) / len(locked[th]), 3) if locked[th] else None} for th in RAIN_THRESH],
+            "by_threshold": [{"threshold_in": th, "all_trades": out(("all", th)), "first_per_market": out(("first", th)),
+                              "by_price": [{"price": lab, **out(("price", th, lab))} for _, _, lab in LOCK_PRICE],
+                              "by_hours_left": [{"hours": lab, **out(("hours", th, lab))} for _, _, lab in LOCK_HOURS],
+                              "by_delay": [{"delay": lab, **out(("lag", th, lab))} for lab in ("within 1 h of the reading", "later")]}
+                             for th in RAIN_THRESH],
+            "readings_wrong_examples": wrong}
+
+
+RUN = {"longshot": longshot, "calib": calib, "late": late, "baskets": baskets, "scalp": scalp, "hourly": hourly, "goldfv": goldfv, "gasfv": gasfv, "newmkt": newmkt, "newflow": newflow, "wxlock": wxlock, "rainlock": rainlock}
 
 
 class Studies:

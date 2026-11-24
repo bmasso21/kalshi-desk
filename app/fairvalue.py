@@ -258,6 +258,8 @@ class FairValue:
         tier = "edge" if e_take >= float(self.opt("fv_min_edge", 0.02)) - 1e-9 else "lean" if e_take >= float(self.opt("fv_lean_edge", 0.0)) - 1e-9 else None
         if tier == "lean" and ask < float(self.opt("fv_lean_min_price", 0.30)) - 1e-9:
             tier = None     # removing a bookmaker's margin evenly overstates underdogs by about a cent: a "lean" on one is that error, not value
+        if tier == "lean" and not self.opt("fv_lean_enabled", False):
+            tier = None     # retired 24 Nov 2026 (41 paper buys, -30%, t -2.07); fv_lean_enabled = true brings it back
         if not tier or self.db.query("SELECT 1 FROM fv_picks2 WHERE ticker=? AND side=?", (ticker, side)):
             return
         fee = TAKER * ask * (1 - ask)
