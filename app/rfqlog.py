@@ -55,8 +55,14 @@ def fnum(v):
 
 
 def _ts(s):
+    """ISO time -> epoch seconds. Kalshi's RFQ times can carry nanoseconds ('...:59.123456789Z'), which Python's parser
+    rejects: the fraction is cut to microseconds first."""
+    import re
+    if not s:
+        return None
+    t = re.sub(r"(\.\d{6})\d+", r"\1", str(s).strip()).replace("Z", "+00:00")
     try:
-        return dt.datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp() if s else None
+        return dt.datetime.fromisoformat(t).timestamp()
     except ValueError:
         return None
 
@@ -147,6 +153,9 @@ class RfqLog:
                 rate = round(arrivals / (now - self._prev[0]) * 3600)
                 self.db.execute("INSERT OR REPLACE INTO rfq_rate VALUES(?,?,?,?,?)", (now, arrivals, self._prev[0], now, json.dumps(hist)))
         self._prev = (now, ids_now)
+        ages = sorted(now - c for c in (_ts(r.get("created_ts")) for r in rows) if c)
+        self.state["open_age_s"] = {"median": round(ages[len(ages) // 2]) if ages else None, "max": round(ages[-1]) if ages else None,
+                                    "unparsed": listed - len(ages)}
         rows = [r for r in rows if sampled(r.get("id"))]
         if rows:
             ids = [r.get("id") for r in rows if r.get("id")]
@@ -180,7 +189,7 @@ class RfqLog:
             lp = legs_price(legs, quotes) if legs and len(legs) <= MAX_LEGS else None
             cur = self.db.execute("INSERT OR IGNORE INTO rfq_log(id, created_ts, seen_ts, market, collection, contracts, target_cost, excludes_fees, "
                                   "n_legs, legs, legs_mid, legs_priced, status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                  (r["id"], _ts(r.get("created_ts")) or now, now, r.get("market_ticker"), r.get("mve_collection_ticker"),
+                                  (r["id"], _ts(r.get("created_ts")), now, r.get("market_ticker"), r.get("mve_collection_ticker"),
                                    fnum(r.get("contracts_fp")), fnum(r.get("target_cost_dollars")), 1 if r.get("target_cost_excludes_fees") else 0,
                                    len(legs), json.dumps(legs) if len(legs) <= MAX_LEGS else "[]", lp, 1 if lp is not None else 0, (r.get("status") or "open").lower()))
             new += 1 if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
@@ -192,7 +201,7 @@ class RfqLog:
 
     def settle(self, now: float, batch: int = 300) -> int:
         """Combos whose legs have all settled (or one leg lost): won / lost, from the legs' public results."""
-        rows = self.db.query("SELECT id, legs FROM rfq_log WHERE outcome IS NULL AND n_legs > 0 AND n_legs <= ? AND created_ts < ? ORDER BY created_ts LIMIT ?",
+        rows = self.db.query("SELECT id, legs FROM rfq_log WHERE outcome IS NULL AND n_legs > 0 AND n_legs <= ? AND COALESCE(created_ts, seen_ts) < ? ORDER BY seen_ts LIMIT ?",
                              (MAX_LEGS, now - 3600, batch))
         if not rows:
             return 0
@@ -253,7 +262,7 @@ class RfqLog:
         med = lambda xs: xs[len(xs) // 2] if xs else None
 
         # decided combos: did the requester's combo hit as often as the price they asked for implies?
-        dec = q("SELECT created_ts, contracts, target_cost, legs_mid, outcome FROM rfq_log WHERE outcome IN ('won','lost')")
+        dec = q("SELECT COALESCE(created_ts, seen_ts) created_ts, contracts, target_cost, legs_mid, outcome FROM rfq_log WHERE outcome IN ('won','lost')")
 
         def block(rs, price_of):
             rs = [r for r in rs if price_of(r) is not None and 0 < price_of(r) < 1]

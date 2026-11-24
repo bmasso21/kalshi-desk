@@ -141,6 +141,8 @@ def main():
     rr = l3.db.query("SELECT * FROM rfq_rate")
     check("3 requests appear between two reads a minute apart: 3 arrivals, about 180 an hour, all in the 7-12 legs bucket",
           len(rr) == 1 and rr[0]["listed"] == 3 and l3.state["per_hour_est"] == 180 and json.loads(rr[0]["legs_hist"]) == {"7-12": 3}, (rr, l3.state))
+    check("nanosecond times are read (cut to microseconds); junk is None", close(R._ts("2026-11-24T21:25:59.123456789Z"), R._ts("2026-11-24T21:25:59.123456Z"))
+          and R._ts("2026-11-24T21:25:59.123456Z") is not None and R._ts("junk") is None and R._ts(None) is None)
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 
