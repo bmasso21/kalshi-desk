@@ -40,10 +40,10 @@ class Reader:
         self.rows = []
         self.calls = []
 
-    def paginate(self, path, key, params, max_items=None):
-        self.calls.append((path, dict(params)))
-        assert path == "/communications/rfqs" and key == "rfqs"
-        yield from self.rows
+    def request(self, method, path, params=None, **kw):
+        self.calls.append((method, path, dict(params or {})))
+        assert method == "GET" and path == "/communications/rfqs" and params == {"limit": 100}
+        return {"rfqs": list(self.rows)}
 
 
 class Pub:
@@ -76,6 +76,7 @@ def main():
           and R.outcome([{"market_ticker": "A", "side": "yes"}, {"market_ticker": "B", "side": "no"}], {"A": "no"}) == "lost"
           and R.outcome([{"market_ticker": "A", "side": "yes"}, {"market_ticker": "B", "side": "no"}], {"A": "yes"}) is None)
 
+    R.SAMPLE_PCT = 100                         # keep every request in this test
     rd2, pub = Reader(), Pub()
     wdb = WarehouseDB(Path(tempfile.mkdtemp()) / "w.db")
     lg = R.RfqLog(lambda: {}, wdb, pub, reader_factory=lambda: rd2)
@@ -112,6 +113,24 @@ def main():
         err = str(e)
     check("without a production key it says so and reads nothing", err and "production API key" in err)
     check("the public client it is given has no order methods", not any(hasattr(pub, a) for a in ("create_order", "cancel_order", "create_quote")))
+    check("the request rate is estimated from the newest page (3 requests created 30 s before the scan, all at once)",
+          wdb.query("SELECT COUNT(*) n FROM rfq_rate")[0]["n"] == 2 and "legs_share" in st["rate"], st["rate"])
+    R.SAMPLE_PCT = 10
+    ids = [f"id{i}" for i in range(2000)]
+    share = sum(R.sampled(i) for i in ids) / len(ids)
+    check("about 10% of requests are sampled, always the same ones for the same id", 0.07 < share < 0.13 and R.sampled("id7") == R.sampled("id7"), share)
+    big = rfq("big", [(f"L{i}-1", "yes") for i in range(20)])
+    big["id"] = next(i for i in ids if R.sampled(i))
+    small_unsampled = next(i for i in ids if not R.sampled(i))
+    rd2.rows = [big, rfq(small_unsampled, [("A-1", "yes"), ("B-1", "no")])]
+    lg.scan(NOW + 9000)
+    b = wdb.query("SELECT * FROM rfq_log WHERE id=?", (big["id"],))[0]
+    check("combos over 12 legs are counted but not priced or followed; unsampled requests are not stored",
+          b["n_legs"] == 20 and b["legs"] == "[]" and b["legs_mid"] is None and not wdb.query("SELECT 1 FROM rfq_log WHERE id=?", (small_unsampled,)), b)
+    dropped = lg.prune()
+    kept = [i for i in ("r1", "r2", "r3") if R.sampled(i)]
+    check("prune removes requests stored before sampling that are not in the sample",
+          dropped == 3 - len(kept) and sorted(r["id"] for r in wdb.query("SELECT id FROM rfq_log WHERE id IN ('r1','r2','r3')")) == kept, (dropped, kept))
     print(f"\n{len(OK)} passed, {len(FAIL)} failed")
     sys.exit(1 if FAIL else 0)
 

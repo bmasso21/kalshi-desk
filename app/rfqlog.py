@@ -25,13 +25,16 @@ from .sports import ensure_schema
 
 READ_PATH = "/communications/rfqs"
 EVERY = 60
-MAX_PER_SCAN = 1000
+PAGE = 100                        # one page of the newest requests per minute. Requests run at tens of thousands a day
+SAMPLE_PCT = 10                   # (24 Nov 2026: 1,000 new every minute), so a fixed 10% sample, chosen by id, is stored
+MAX_LEGS = 12                     # legs are priced and followed only for combos this size or smaller
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rfq_log (id TEXT PRIMARY KEY, created_ts REAL, seen_ts REAL, market TEXT, collection TEXT, contracts REAL,
     target_cost REAL, excludes_fees INTEGER, n_legs INTEGER, legs TEXT, legs_mid REAL, legs_priced INTEGER, status TEXT,
     closed_ts REAL, reason TEXT, outcome TEXT, settled_ts REAL);
 CREATE INDEX IF NOT EXISTS rfq_log_open ON rfq_log(outcome, created_ts);
+CREATE TABLE IF NOT EXISTS rfq_rate (ts REAL PRIMARY KEY, listed INTEGER, oldest REAL, newest REAL, legs_hist TEXT);
 """
 
 
@@ -55,6 +58,11 @@ def _ts(s):
         return dt.datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp() if s else None
     except ValueError:
         return None
+
+
+def sampled(rid: str) -> bool:
+    import hashlib
+    return int(hashlib.sha1(str(rid).encode()).hexdigest()[:8], 16) % 100 < SAMPLE_PCT
 
 
 def mid(m: dict):
@@ -121,7 +129,16 @@ class RfqLog:
         now = now or time.time()
         new, closed = 0, 0
         known = {}
-        rows = list(self.reader().paginate(READ_PATH, "rfqs", {"limit": 100}, max_items=MAX_PER_SCAN))
+        page = self.reader().request("GET", READ_PATH, params={"limit": PAGE})
+        rows = page.get("rfqs") or []
+        cts = [c for c in (_ts(r.get("created_ts")) for r in rows) if c]
+        hist = {}
+        for r in rows:
+            n = len(r.get("mve_selected_legs") or [])
+            b = "0" if n == 0 else "2-3" if n <= 3 else "4-6" if n <= 6 else "7-12" if n <= 12 else "13+"
+            hist[b] = hist.get(b, 0) + 1
+        self.db.execute("INSERT OR REPLACE INTO rfq_rate VALUES(?,?,?,?,?)", (now, len(rows), min(cts) if cts else None, max(cts) if cts else None, json.dumps(hist)))
+        rows = [r for r in rows if sampled(r.get("id"))]
         if rows:
             ids = [r.get("id") for r in rows if r.get("id")]
             for i in range(0, len(ids), 500):
@@ -142,7 +159,8 @@ class RfqLog:
                 continue
             fresh.append(r)
         # leg prices at the moment the request is seen (public data, one call per 100 leg markets)
-        tickers = sorted({lg.get("market_ticker") for r in fresh for lg in (r.get("mve_selected_legs") or []) if lg.get("market_ticker")})
+        tickers = sorted({lg.get("market_ticker") for r in fresh if len(r.get("mve_selected_legs") or []) <= MAX_LEGS
+                          for lg in (r.get("mve_selected_legs") or []) if lg.get("market_ticker")})
         quotes = {}
         for i in range(0, len(tickers), 100):
             for m in self.k.markets(status=None, tickers=tickers[i:i + 100], max_items=100):
@@ -150,22 +168,25 @@ class RfqLog:
         for r in fresh:
             legs = [{"market_ticker": lg.get("market_ticker"), "event_ticker": lg.get("event_ticker"), "side": (lg.get("side") or "yes").lower()}
                     for lg in (r.get("mve_selected_legs") or [])]
-            lp = legs_price(legs, quotes) if legs else None
+            lp = legs_price(legs, quotes) if legs and len(legs) <= MAX_LEGS else None
             cur = self.db.execute("INSERT OR IGNORE INTO rfq_log(id, created_ts, seen_ts, market, collection, contracts, target_cost, excludes_fees, "
                                   "n_legs, legs, legs_mid, legs_priced, status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                   (r["id"], _ts(r.get("created_ts")) or now, now, r.get("market_ticker"), r.get("mve_collection_ticker"),
                                    fnum(r.get("contracts_fp")), fnum(r.get("target_cost_dollars")), 1 if r.get("target_cost_excludes_fees") else 0,
-                                   len(legs), json.dumps(legs), lp, 1 if lp is not None else 0, (r.get("status") or "open").lower()))
+                                   len(legs), json.dumps(legs) if len(legs) <= MAX_LEGS else "[]", lp, 1 if lp is not None else 0, (r.get("status") or "open").lower()))
             new += 1 if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
         settled = self.settle(now)
-        self.state.update(last=now, error=None, seen_last_scan=len(rows),
-                          note=f"{len(rows)} requests listed, {new} new, {closed} newly closed, {settled} combos decided")
+        span = (max(cts) - min(cts)) if len(cts) > 1 else None
+        rate = round(len(cts) / span * 3600) if span else None
+        self.state.update(last=now, error=None, seen_last_scan=len(cts), per_hour_est=rate,
+                          note=f"newest {len(cts)} requests span {round(span) if span else '?'} s (about {rate if rate else '?'} an hour); "
+                               f"{new} sampled and stored, {closed} newly closed, {settled} combos decided")
         return {"listed": len(rows), "new": new, "closed": closed, "settled": settled}
 
     def settle(self, now: float, batch: int = 300) -> int:
         """Combos whose legs have all settled (or one leg lost): won / lost, from the legs' public results."""
-        rows = self.db.query("SELECT id, legs FROM rfq_log WHERE outcome IS NULL AND n_legs > 0 AND created_ts < ? ORDER BY created_ts LIMIT ?",
-                             (now - 3600, batch))
+        rows = self.db.query("SELECT id, legs FROM rfq_log WHERE outcome IS NULL AND n_legs > 0 AND n_legs <= ? AND created_ts < ? ORDER BY created_ts LIMIT ?",
+                             (MAX_LEGS, now - 3600, batch))
         if not rows:
             return 0
         legs = {r["id"]: json.loads(r["legs"] or "[]") for r in rows}
@@ -182,7 +203,21 @@ class RfqLog:
                 n += 1
         return n
 
+    def prune(self) -> int:
+        """Keep only the sampled requests and combos small enough to follow (the first version stored every request)."""
+        ids = [r["id"] for r in self.db.query("SELECT id FROM rfq_log")]
+        drop = [i for i in ids if not sampled(i)]
+        for i in range(0, len(drop), 500):
+            ch = drop[i:i + 500]
+            self.db.execute(f"DELETE FROM rfq_log WHERE id IN ({','.join('?' * len(ch))})", tuple(ch))
+        self.db.execute("UPDATE rfq_log SET legs='[]' WHERE n_legs > ?", (MAX_LEGS,))
+        return len(drop)
+
     def loop(self):
+        try:
+            self.prune()
+        except Exception as e:
+            self.state["error"] = f"prune: {e}"[:300]
         self._stop.wait(480)
         while not self._stop.is_set():
             if self.opt("enabled", True):
@@ -211,7 +246,7 @@ class RfqLog:
         med = lambda xs: xs[len(xs) // 2] if xs else None
 
         # decided combos: did the requester's combo hit as often as the price they asked for implies?
-        dec = q("SELECT created_ts, contracts, target_cost, legs_mid, outcome FROM rfq_log WHERE outcome IN ('won','lost') AND contracts > 0")
+        dec = q("SELECT created_ts, contracts, target_cost, legs_mid, outcome FROM rfq_log WHERE outcome IN ('won','lost')")
 
         def block(rs, price_of):
             rs = [r for r in rs if price_of(r) is not None and 0 < price_of(r) < 1]
@@ -231,7 +266,15 @@ class RfqLog:
                     "avg_price_c": round(100 * sum(price_of(r) for r in rs) / n, 2),
                     "requester_edge_c": round(100 * mean, 2), "t": round(mean / se, 2) if se else None}
         per_ct = lambda r: (r["target_cost"] / r["contracts"]) if r["target_cost"] and r["contracts"] else None
-        return {"state": self.state, "enabled": bool(self.opt("enabled", True)),
+        rt = q("SELECT listed, oldest, newest, legs_hist FROM rfq_rate WHERE newest > oldest ORDER BY ts DESC LIMIT 1440")
+        rates = sorted(r["listed"] / (r["newest"] - r["oldest"]) * 3600 for r in rt)
+        lh = {}
+        for r in rt:
+            for b, n in json.loads(r["legs_hist"] or "{}").items():
+                lh[b] = lh.get(b, 0) + n
+        return {"state": self.state, "enabled": bool(self.opt("enabled", True)), "sample_pct": SAMPLE_PCT, "max_legs": MAX_LEGS,
+                "rate": {"per_hour_median": round(rates[len(rates) // 2]) if rates else None, "reads": len(rt),
+                         "legs_share": {b: round(100 * n / sum(lh.values()), 1) for b, n in sorted(lh.items())} if lh else {}},
                 "totals": {"requests": tot["n"], "combos": tot["combos"], "per_day": round(tot["n"] / span_d, 1) if span_d else None,
                            "median_contracts": med(sizes), "median_target_cost": med(costs),
                            "since": tot["a"], "decided": len(dec)},
