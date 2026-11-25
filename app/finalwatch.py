@@ -195,7 +195,7 @@ class FinalWatch:
                 else:
                     price, offered, tk, side = opts[0]
                     fee = order_fee(price, SIZE)
-                    if self.opt("final_enabled", True):
+                    if self.opt("final_enabled", False):
                         cur = self.db.execute("INSERT OR IGNORE INTO final_picks(ts, game_id, league, name, event, ticker, side, price, size, offered, fee, secs_after_final) "
                                               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (now, g["id"], lg, g["name"], ev, tk, side, price, SIZE, offered, fee, 0.0))
                         pick = 1 if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
@@ -233,7 +233,7 @@ class FinalWatch:
     def loop(self):
         self._stop.wait(420)
         while not self._stop.is_set():
-            if self.opt("final_enabled", True):
+            if self.opt("final_enabled", False):        # retired 25 Nov 2026: final_enabled = true brings it back
                 try:
                     self.state["running"] = True
                     self.scan()

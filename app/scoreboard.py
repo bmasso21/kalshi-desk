@@ -132,6 +132,13 @@ def sources(wdb) -> list[dict]:
                 "rows": [{"pnl": r["pnl"] / r["size"], "cost": r["price"] + r["fee"] / r["size"], "cluster": r["event"], "ts": r["settled_ts"] or r["ts"]}
                          for r in fp if r["status"] == "settled" and r["pnl"] is not None and r["size"]],
                 "open": sum(1 for r in fp if r["status"] == "open")})
+    rp = q("SELECT event, price, size, fee, pnl, settled_ts, ts, status FROM rain_picks")
+    out.append({"key": "rain_observed", "name": "Rain: YES after the station reports rain", "market": "Daily rain (KXRAIN)",
+                "description": "Once a city's official station reports 0.01 in or more today (after the first hour), YES is bought on paper at the real "
+                               "ask if 97c or less. Backtest: the readings were never wrong in 373 days; the price side is unproven. Scored per contract",
+                "rows": [{"pnl": r["pnl"] / r["size"], "cost": r["price"] + r["fee"] / r["size"], "cluster": r["event"], "ts": r["settled_ts"] or r["ts"]}
+                         for r in rp if r["status"] == "settled" and r["pnl"] is not None and r["size"]],
+                "open": sum(1 for r in rp if r["status"] == "open")})
     fl = q("SELECT event, price, fee, pnl, close_ts, status FROM flow_picks")
     out.append({"key": "flow_weather", "name": "Weather: follow large first-hour trades", "market": "New weather markets (first hour)",
                 "description": "A single trade of 100+ contracts in a new weather market's first hour; the same side is bought at the real ask within 10 minutes "
@@ -144,6 +151,12 @@ def sources(wdb) -> list[dict]:
                                "Each trade is one filled order (up to 10 contracts)",
                 "rows": [{"pnl": r["pnl"], "cost": r["filled"] * r["price"], "cluster": r["event"], "ts": r["close_ts"]} for r in mo if r["status"] == "filled" and r["pnl"] is not None],
                 "open": sum(1 for r in mo if r["status"] == "resting")})
+    po = q("SELECT event, price, filled, pnl, close_ts, status FROM prop_orders")
+    out.append({"key": "props_maker", "name": "Player props: resting bids, back of the queue", "market": "NBA and NFL player props",
+                "description": "One resting bid per side at the best bid, 1-24 h before the close, filled only by real trades after the queue ahead; held to settlement. "
+                               "Each trade is one filled order (up to 10 contracts)",
+                "rows": [{"pnl": r["pnl"], "cost": r["filled"] * r["price"], "cluster": r["event"], "ts": r["close_ts"]} for r in po if r["status"] == "filled" and r["pnl"] is not None],
+                "open": sum(1 for r in po if r["status"] == "resting")})
     ar = q("SELECT kind, event, cost, pnl_real, settled_ts, status, locked FROM arb_opps")
     for kinds, key, label, desc in ((("no_basket", "ladder"), "arb_locked", "Arbitrage: locked (NO baskets, ladders)",
                                      "Kalshi priced against itself: every outcome pays at least the cost after fees, confirmed at live order-book prices"),
@@ -157,6 +170,7 @@ def sources(wdb) -> list[dict]:
 
 
 RETIRED = {"gold_fv": "retired 18 Nov: -25% on 51 paper buys (the free live gold price is too noisy)",
+           "sports_final": "retired 25 Nov: 93 games seen final, the winner was never offered below $1 (or Kalshi had already closed)",
            "sports_lean": "retired 24 Nov: 41 settled, 13 won, -$5.69 (-30% on stake), t -2.07 over 29 games",
            "gold_cushion15": "retired 19 Nov: 339 of 353 won yet lost $5.14 (the rare miss costs more than the many small wins pay)"}
 

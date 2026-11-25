@@ -96,11 +96,14 @@ def replay(side: str, price: float, queue_ahead: float, size: float, placed: flo
 
 
 class MentionsPaper:
+    TABLE = "men_orders"
+    CATEGORY = "Mentions"
+
     def __init__(self, cfg_getter, wdb, kalshi_client):
         self._cfg = cfg_getter
         self.db = wdb
         self.k = kalshi_client                 # public production market data only
-        ensure_schema(wdb, SCHEMA)
+        ensure_schema(wdb, SCHEMA.replace("men_orders", self.TABLE))
         self._stop = threading.Event()
         self._fees: dict = {}
         self._series = (0.0, [], False)            # (when listed, tickers, True while a full walk is pending)
@@ -113,7 +116,7 @@ class MentionsPaper:
     # ------------------------------------------------------------- placing --
     def scan(self, now: float | None = None) -> dict:
         now = now or time.time()
-        have = {r["ticker"] for r in self.db.query("SELECT DISTINCT ticker FROM men_orders")}
+        have = {r["ticker"] for r in self.db.query(f"SELECT DISTINCT ticker FROM {self.TABLE}")}
         new, seen, ends, live = {}, 0, [], set()
         # One call per Mentions series lists its open events with their markets; walking ALL markets closing in a day
         # (thousands of crypto and currency ladders) never reached them and cost dozens of requests an hour.
@@ -150,12 +153,12 @@ class MentionsPaper:
                 p, q = lv[0]
                 if not PRICE_LO - EPS <= p <= PRICE_HI + EPS:
                     continue
-                cur = self.db.execute("INSERT OR IGNORE INTO men_orders(ts, ticker, event, series, side, price, queue_ahead, size, close_ts, cancel_ts) "
+                cur = self.db.execute(f"INSERT OR IGNORE INTO {self.TABLE}(ts, ticker, event, series, side, price, queue_ahead, size, close_ts, cancel_ts) "
                                       "VALUES(?,?,?,?,?,?,?,?,?,?)",
                                       (now, t, m.get("event_ticker"), t.split("-")[0], side, round(p, 4), q, size, c, c - WINDOW_LO_H * 3600))
                 placed += cur.rowcount if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
         done = self.settle(now)
-        self.state.update(last=now, error=None, note=f"{len(live)} Mentions series with open markets ({seen} markets); {len(new)} new ones ending in {WINDOW_LO_H}-{WINDOW_HI_H} h, "
+        self.state.update(last=now, error=None, note=f"{len(live)} {self.CATEGORY} series with open markets ({seen} markets); {len(new)} new ones ending in {WINDOW_LO_H}-{WINDOW_HI_H} h, "
                                                      f"{placed} resting bids placed on paper, {done} settled")
         return {"markets": len(new), "placed": placed, "settled": done}
 
@@ -165,7 +168,7 @@ class MentionsPaper:
         series whose markets are listed the same day they end.) (Picking the busiest by
         lifetime volume missed most of the live ones: the big names had no open event at all.)"""
         if now - self._series[0] > float(self.opt("mentions_walk_h", WALK_H)) * 3600 or not self._series[1]:
-            ss = [s["ticker"] for s in (self.k.series_list("Mentions") or []) if s.get("ticker")]
+            ss = [s["ticker"] for s in (self.k.series_list(self.CATEGORY) or []) if s.get("ticker")]
             self._series = (now, ss[:MAX_SERIES], True)
         self.state["series"] = len(self._series[1])
         return self._series[1]
@@ -188,7 +191,7 @@ class MentionsPaper:
 
     def settle(self, now: float | None = None) -> int:
         now = now or time.time()
-        rows = self.db.query("SELECT * FROM men_orders WHERE status='resting' AND close_ts<? ORDER BY close_ts", (now - 120,))
+        rows = self.db.query(f"SELECT * FROM {self.TABLE} WHERE status='resting' AND close_ts<? ORDER BY close_ts", (now - 120,))
         tickers = list(dict.fromkeys(r["ticker"] for r in rows))[:MAX_SETTLE_PER_PASS]
         if not tickers:
             return 0
@@ -202,18 +205,18 @@ class MentionsPaper:
             mine = [r for r in rows if r["ticker"] == t]
             if x not in ("yes", "no"):
                 if x in ("void", "scalar") or now - mine[0]["close_ts"] > 7 * 86400:       # never settled yes/no: drop it
-                    self.db.execute("UPDATE men_orders SET status='void', settled_ts=? WHERE ticker=? AND status='resting'", (now, t))
+                    self.db.execute(f"UPDATE {self.TABLE} SET status='void', settled_ts=? WHERE ticker=? AND status='resting'", (now, t))
                 continue
             trades = self._trades(t, min(r["ts"] for r in mine))
             fi = self._fee_info(mine[0]["series"])
             for r in mine:
                 f = replay(r["side"], r["price"], r["queue_ahead"], r["size"], r["ts"], r["cancel_ts"], trades)
                 if f <= 0:
-                    self.db.execute("UPDATE men_orders SET status='unfilled', filled=0, result=?, settled_ts=? WHERE id=?", (x, now, r["id"]))
+                    self.db.execute(f"UPDATE {self.TABLE} SET status='unfilled', filled=0, result=?, settled_ts=? WHERE id=?", (x, now, r["id"]))
                 else:
                     fee = float(kalshi_fee(r["price"], f, fi.get("fee_type"), fi.get("fee_multiplier") or 1, maker=True))
                     pnl = f * ((1.0 if r["side"] == x else 0.0) - r["price"]) - fee
-                    self.db.execute("UPDATE men_orders SET status='filled', filled=?, result=?, fee=?, pnl=?, settled_ts=? WHERE id=?",
+                    self.db.execute(f"UPDATE {self.TABLE} SET status='filled', filled=?, result=?, fee=?, pnl=?, settled_ts=? WHERE id=?",
                                     (f, x, round(fee, 4), round(pnl, 4), now, r["id"]))
                 n += 1
         return n
@@ -233,7 +236,7 @@ class MentionsPaper:
             self._stop.wait(float(self.opt("mentions_every_min", 60)) * 60)
 
     def start(self):
-        threading.Thread(target=self.loop, daemon=True, name="mentions").start()
+        threading.Thread(target=self.loop, daemon=True, name=self.TABLE).start()
 
     def stop(self):
         self._stop.set()
@@ -243,10 +246,11 @@ class MentionsPaper:
         tot = q("SELECT COUNT(*) n, COALESCE(SUM(status='resting'), 0) resting, COALESCE(SUM(status='unfilled'), 0) unfilled, COALESCE(SUM(status='filled'), 0) filled, "
                 "COALESCE(SUM(CASE WHEN status='filled' THEN filled END), 0) contracts, COALESCE(SUM(pnl), 0) pnl, "
                 "COALESCE(SUM(CASE WHEN status='filled' THEN filled * price END), 0) staked, COALESCE(SUM(fee), 0) fees, "
-                "COALESCE(SUM(status='filled' AND pnl > 0), 0) won, COUNT(DISTINCT CASE WHEN status='filled' THEN event END) events FROM men_orders")[0]
+                "COALESCE(SUM(status='filled' AND pnl > 0), 0) won, COUNT(DISTINCT CASE WHEN status='filled' THEN event END) events "
+                f"FROM {self.TABLE}")[0]
         by = q("SELECT side, CASE WHEN price < 0.10 THEN 'under 10c' WHEN price < 0.40 THEN '10-39c' WHEN price < 0.70 THEN '40-69c' ELSE '70c+' END band, "
                "COUNT(*) orders, SUM(status='filled') filled, COALESCE(SUM(pnl), 0) pnl, COALESCE(SUM(CASE WHEN status='filled' THEN filled * price END), 0) staked "
-               "FROM men_orders WHERE status IN ('filled', 'unfilled') GROUP BY side, band ORDER BY side, MIN(price)")
+               f"FROM {self.TABLE} WHERE status IN ('filled', 'unfilled') GROUP BY side, band ORDER BY side, MIN(price)")
         return {"state": self.state, "size": float(self.opt("mentions_size", SIZE)), "window_h": [WINDOW_LO_H, WINDOW_HI_H], "totals": tot, "by": by,
-                "recent": q("SELECT ts, ticker, side, price, queue_ahead, size, status, filled, result, pnl, close_ts FROM men_orders "
+                "recent": q(f"SELECT ts, ticker, side, price, queue_ahead, size, status, filled, result, pnl, close_ts FROM {self.TABLE} "
                             "ORDER BY CASE status WHEN 'resting' THEN 1 ELSE 0 END, settled_ts DESC, ts DESC LIMIT 60")}

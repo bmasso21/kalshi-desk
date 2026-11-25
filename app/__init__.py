@@ -1,2 +1,2 @@
 """Kalshi Desk - local trading assistant for Kalshi event contracts."""
-__version__ = "3.33.3"
+__version__ = "3.34.0"

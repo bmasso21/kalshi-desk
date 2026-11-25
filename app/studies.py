@@ -1131,33 +1131,41 @@ RAIN_RULE = re.compile(r"total precipitation at CLI([A-Z0-9]{3}) .*?strictly gre
 RAIN_THRESH = (0.01, 0.02, 0.05)  # inches in one reading: 0.01 is "measurable"; more is a safety margin against the official total
 
 
-def iem_precip(aid: str, start: float, end: float, session=None) -> list[tuple]:
-    """[(ts, inches)] of hourly/special METAR precipitation (p01i) from the Iowa Environmental Mesonet. Trace = 0."""
+def iem_precip_multi(aids, start: float, end: float, session=None, waits=(20, 60, 120)) -> dict:
+    """{asos id: [(ts, inches)]} of hourly/special METAR precipitation (p01i) for several stations in ONE request to the
+    Iowa Environmental Mesonet. Trace = 0. 'Too many requests' is retried after a wait."""
     import csv
     import datetime as dt
     import io
+    import time as _t
     import requests
     http = session or requests
     a, b = dt.datetime.fromtimestamp(start, dt.timezone.utc), dt.datetime.fromtimestamp(end, dt.timezone.utc)
-    params = [("station", aid), ("data", "p01i"), ("tz", "Etc/UTC"), ("format", "onlycomma"), ("latlon", "no"), ("missing", "M"),
-              ("trace", "T"), ("direct", "no"), ("report_type", "3"), ("report_type", "4"),
-              ("year1", a.year), ("month1", a.month), ("day1", a.day), ("year2", b.year), ("month2", b.month), ("day2", b.day)]
-    r = http.get("https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py", params=params, timeout=180,
-                 headers={"User-Agent": "KalshiDesk (personal research)"})
+    params = [("station", x) for x in aids] + [
+        ("data", "p01i"), ("tz", "Etc/UTC"), ("format", "onlycomma"), ("latlon", "no"), ("missing", "M"),
+        ("trace", "T"), ("direct", "no"), ("report_type", "3"), ("report_type", "4"),
+        ("year1", a.year), ("month1", a.month), ("day1", a.day), ("year2", b.year), ("month2", b.month), ("day2", b.day)]
+    for i in range(len(waits) + 1):
+        r = http.get("https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py", params=params, timeout=180,
+                     headers={"User-Agent": "KalshiDesk (personal research)"})
+        if getattr(r, "status_code", 200) != 429 or i == len(waits):
+            break
+        _t.sleep(waits[i])
     r.raise_for_status()
-    out = []
+    out = {x: [] for x in aids}
     for row in csv.DictReader(io.StringIO(r.text)):
-        v = row.get("p01i")
         try:
-            x = float(v)
+            x = float(row.get("p01i"))
+            ts = dt.datetime.strptime(row.get("valid", ""), "%Y-%m-%d %H:%M").replace(tzinfo=dt.timezone.utc).timestamp()
         except (TypeError, ValueError):
             continue
-        try:
-            ts = dt.datetime.strptime(row.get("valid", ""), "%Y-%m-%d %H:%M").replace(tzinfo=dt.timezone.utc).timestamp()
-        except ValueError:
-            continue
-        out.append((ts, x))
-    return sorted(out)
+        out.setdefault(row.get("station"), []).append((ts, x))
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def iem_precip(aid: str, start: float, end: float, session=None) -> list[tuple]:
+    """[(ts, inches)] for one station (see iem_precip_multi)."""
+    return iem_precip_multi([aid], start, end, session).get(aid, [])
 
 
 def rainlock(conn, flt: dict | None = None, session=None, fetch=None) -> dict:
@@ -1255,7 +1263,7 @@ def rainlock(conn, flt: dict | None = None, session=None, fetch=None) -> dict:
                         done.add(th)
                         add(("first", th), ev, ret, p, t["n"])
         if polite:
-            _t.sleep(1.0)                                    # be polite to the free archive
+            _t.sleep(3.0)                                    # be polite to the free archive (1 s between stations drew "too many requests")
 
     def out(key):
         x = meta.get(key)

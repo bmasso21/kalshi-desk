@@ -1309,6 +1309,22 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
         except Exception as e:
             raise HTTPException(502, f"Mentions check failed: {e}"[:300])
 
+    from .propsmaker import PropsMaker
+    propsm = PropsMaker(lambda: cfg.data.get("props") or {}, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+    if start_engine:
+        propsm.start()
+
+    @app.get("/api/props")
+    def props_view():
+        return propsm.status()
+
+    @app.post("/api/props/scan")
+    def props_scan_now():
+        try:
+            return propsm.scan()
+        except Exception as e:
+            raise HTTPException(502, f"Props check failed: {e}"[:300])
+
     from .polywatch import PolyWatch
     polyw = PolyWatch(lambda: cfg.data.get("poly") or {}, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
     if start_engine:
@@ -1360,6 +1376,15 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
     def final_view():
         return finalw.status()
 
+    from .rainwatch import RainWatch
+    rainw = RainWatch(lambda: cfg.data.get("rain") or {}, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
+    if start_engine:
+        rainw.start()
+
+    @app.get("/api/rain")
+    def rain_view():
+        return rainw.status()
+
     from .rfqlog import RfqLog
     rfql = RfqLog(lambda: cfg.data, wdb, KalshiClient(cfg.data.get("warehouse", {}).get("base_url_override") or BASE_URLS["prod"]))
     if start_engine:
@@ -1376,10 +1401,12 @@ def create_app(cfg: Config | None = None, db: DB | None = None, start_engine: bo
                 ("fed", "Fed decisions", fed.state, "last", bool(fed.opt("fed_enabled", True))),
                 ("gas", "Gas prices", gasw.state, "last", bool(gasw.opt("gas_enabled", True))),
                 ("mentions", "Mentions", mentions.state, "last", bool(mentions.opt("mentions_enabled", True))),
+                ("props", "Player props", propsm.state, "last", bool(propsm.opt("mentions_enabled", True))),
                 ("poly", "Polymarket gap", polyw.state, "last", bool(polyw.opt("poly_enabled", True))),
                 ("arb", "Arbitrage", arb.state, "last_scan", bool(arb.opt("arb_enabled", True))),
                 ("flow", "Early flow", floww.state, "last", bool(floww.opt("flow_enabled", True))),
-                ("final", "Games decided", finalw.state, "last", bool(finalw.opt("final_enabled", True))),
+                ("final", "Games decided", finalw.state, "last", bool(finalw.opt("final_enabled", False))),
+                ("rain", "Rain observed", rainw.state, "last", bool(rainw.opt("rain_enabled", True))),
                 ("rfq", "Combo requests log", rfql.state, "last", bool(rfql.opt("enabled", True))),
                 ("gold", "Gold watch", gapwatch.state, "last_check", bool(gapwatch.enabled))]
         return {"trackers": [{"key": k, "name": n, "on": on, "last": st.get(f), "running": bool(st.get("running")),

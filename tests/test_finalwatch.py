@@ -104,7 +104,7 @@ def main():
           close(F.order_fee(0.99, 100), 0.07) and close(F.order_fee(0.99, 1), 0.01) and close(F.order_fee(0.50, 100), 1.75))
     s, k = Ses(), K()
     wdb = WarehouseDB(Path(tempfile.mkdtemp()) / "w.db")
-    fw = F.FinalWatch(lambda: {}, wdb, k, session=s)
+    fw = F.FinalWatch(lambda: {"final_enabled": True}, wdb, k, session=s)
     start = "2026-11-24T00:00Z"
     s.board = {"events": [espn_game("1", start, "in", False, IND, OKC, 100, 98),                       # still playing: nothing
                           espn_game("2", start, "post", True, LAL, UTA, 99, 99, True)]}               # tied score: never guess
@@ -140,14 +140,14 @@ def main():
     k2.m["KXNBAGAME-26NOV23OKCIND-OKC"]["yes_bid_size_fp"] = "300"
     s2.board = {"events": [espn_game("1", start, "post", True, IND, OKC, 112, 104, True)]}
     db2 = WarehouseDB(Path(tempfile.mkdtemp()) / "b.db")
-    F.FinalWatch(lambda: {}, db2, k2, session=s2).scan(NOW)
+    F.FinalWatch(lambda: {"final_enabled": True}, db2, k2, session=s2).scan(NOW)
     p2 = db2.query("SELECT * FROM final_picks")[0]
     check("the cheaper of the two equal bets is taken: NO on the loser at 98c instead of the winner at 99c",
           p2["ticker"] == "KXNBAGAME-26NOV23OKCIND-OKC" and p2["side"] == "no" and close(p2["price"], .98) and close(p2["fee"], F.order_fee(.98, 100)), p2)
     k3 = K()
     k3.m["KXNBAGAME-26NOV23OKCIND-IND"]["yes_ask_size_fp"] = "40"
     db3 = WarehouseDB(Path(tempfile.mkdtemp()) / "c.db")
-    F.FinalWatch(lambda: {}, db3, k3, session=s2).scan(NOW)
+    F.FinalWatch(lambda: {"final_enabled": True}, db3, k3, session=s2).scan(NOW)
     check("fewer than 100 offered at the price -> recorded as too thin, nothing bought",
           db3.query("SELECT status FROM final_games")[0]["status"] == "too_thin" and not db3.query("SELECT 1 FROM final_picks"))
 

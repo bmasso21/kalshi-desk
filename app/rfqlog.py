@@ -27,7 +27,7 @@ READ_PATH = "/communications/rfqs"
 EVERY = 60
 PAGE = 100
 MAX_LIST = 3000                   # the list holds every OPEN request (over 1,000 at a time); it is read in full each minute
-SAMPLE_PCT = 10                   # a fixed 10% sample, chosen by id, is stored
+SAMPLE_PCT = 1                    # a fixed 1% sample, chosen by id, is stored (10% grew by 280,000 rows in a day)
 MAX_LEGS = 12                     # legs are priced and followed only for combos this size or smaller
 
 SCHEMA = """
