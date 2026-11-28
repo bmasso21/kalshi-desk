@@ -151,10 +151,11 @@ def sources(wdb) -> list[dict]:
                                "Each trade is one filled order (up to 10 contracts)",
                 "rows": [{"pnl": r["pnl"], "cost": r["filled"] * r["price"], "cluster": r["event"], "ts": r["close_ts"]} for r in mo if r["status"] == "filled" and r["pnl"] is not None],
                 "open": sum(1 for r in mo if r["status"] == "resting")})
-    po = q("SELECT event, price, filled, pnl, close_ts, status FROM prop_orders")
+    po = q("SELECT event, price, filled, pnl, close_ts, status FROM prop_orders2")
     out.append({"key": "props_maker", "name": "Player props: resting bids, back of the queue", "market": "NBA and NFL player props",
-                "description": "One resting bid per side at the best bid, 1-24 h before the close, filled only by real trades after the queue ahead; held to settlement. "
-                               "Each trade is one filled order (up to 10 contracts)",
+                "description": "One resting bid per side at the best bid, placed 30 min to 24 h before the game and pulled at the start (ESPN), filled only by real trades "
+                               "after the queue ahead; held to settlement. Each trade is one filled order (up to 10 contracts). (The first version, left up during "
+                               "the game, lost $2,343 and was retired)",
                 "rows": [{"pnl": r["pnl"], "cost": r["filled"] * r["price"], "cluster": r["event"], "ts": r["close_ts"]} for r in po if r["status"] == "filled" and r["pnl"] is not None],
                 "open": sum(1 for r in po if r["status"] == "resting")})
     ar = q("SELECT kind, event, cost, pnl_real, settled_ts, status, locked FROM arb_opps")

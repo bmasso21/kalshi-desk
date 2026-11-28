@@ -131,9 +131,12 @@ class MentionsPaper:
                         ends.append((c, t))
                     if not t or t in have or t in new or (m.get("market_type") or "binary") != "binary" or c is None:
                         continue
-                    if (m.get("status") or "active") not in ("active", "open") or not now + WINDOW_LO_H * 3600 <= c <= now + WINDOW_HI_H * 3600:
+                    if (m.get("status") or "active") not in ("active", "open"):
                         continue
-                    new[t] = ({**m, "event_ticker": m.get("event_ticker") or e.get("event_ticker")}, c)
+                    stop = self.stop_time(m, m.get("event_ticker") or e.get("event_ticker") or "", c, now)
+                    if stop is None:
+                        continue
+                    new[t] = ({**m, "event_ticker": m.get("event_ticker") or e.get("event_ticker")}, c, stop)
             if len(new) >= MAX_NEW_PER_SCAN:
                 break
         if self._series[2]:                                     # that was the full walk of every series: remember which have open markets
@@ -144,7 +147,7 @@ class MentionsPaper:
         placed = 0
         size = float(self.opt("mentions_size", SIZE))
         books = self.k.orderbooks(list(new)) if new else {}
-        for t, (m, c) in new.items():
+        for t, (m, c, stop) in new.items():
             ob = books.get(t) or {}
             for side, raw in (("yes", ob.get("yes_dollars")), ("no", ob.get("no_dollars"))):
                 lv = book_levels(raw)
@@ -155,12 +158,19 @@ class MentionsPaper:
                     continue
                 cur = self.db.execute(f"INSERT OR IGNORE INTO {self.TABLE}(ts, ticker, event, series, side, price, queue_ahead, size, close_ts, cancel_ts) "
                                       "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                                      (now, t, m.get("event_ticker"), t.split("-")[0], side, round(p, 4), q, size, c, c - WINDOW_LO_H * 3600))
+                                      (now, t, m.get("event_ticker"), t.split("-")[0], side, round(p, 4), q, size, c, stop))
                 placed += cur.rowcount if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
         done = self.settle(now)
         self.state.update(last=now, error=None, note=f"{len(live)} {self.CATEGORY} series with open markets ({seen} markets); {len(new)} new ones ending in {WINDOW_LO_H}-{WINDOW_HI_H} h, "
                                                      f"{placed} resting bids placed on paper, {done} settled")
         return {"markets": len(new), "placed": placed, "settled": done}
+
+    def stop_time(self, m: dict, event: str, end: float, now: float) -> float | None:
+        """When the resting bid is pulled, or None to leave the market alone: Mentions markets ending in 1-24 h, pulled
+        one hour before the end."""
+        if not now + WINDOW_LO_H * 3600 <= end <= now + WINDOW_HI_H * 3600:
+            return None
+        return end - WINDOW_LO_H * 3600
 
     def series(self, now: float) -> list[str]:
         """The Mentions series to look at. Every WALK_H hours EVERY series of the category is walked (about 500 requests)
